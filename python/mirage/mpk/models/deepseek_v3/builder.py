@@ -499,15 +499,291 @@ class DeepSeekV3Builder(GraphBuilder):
         )
         self.mlp_out = moe_output
 
+    def _build_mtp_decoder_layer(self, state_dict: dict, prefix: str):
+        """Build one MTP decoder layer (same structure as main model layer).
+
+        The MTP block is a full DeepseekV2DecoderLayer with its own weights.
+        It shares the same architecture: input_layernorm → MLA → post_norm → MLP.
+        """
+        # Input layernorm
+        w_norm = self.mpk.attach_input(
+            torch_tensor=state_dict[f"{prefix}input_layernorm.weight"],
+            name="mtp_block_input_layernorm",
+        )
+        self.mpk.rmsnorm_layer(
+            input=self.mtp_x, weight=w_norm, output=self.rmsnorm_out,
+            grid_dim=(self.max_num_batched_tokens, 1, 1),
+            block_dim=(128, 1, 1),
+        )
+
+        # MLA attention (same structure as main model, own weights)
+        self._build_mla_attention_layer_with_prefix(prefix, state_dict)
+
+        # Residual (attn output is in self.attn_proj_out)
+        self.mtp_x = self.attn_proj_out
+
+        # AllReduce after attention
+        if self.world_size > 1:
+            self.mpk.allreduce_layer(
+                input=self.attn_proj_out, buffer=self.allreduce_buf,
+                output=self.allreduce_out,
+                grid_dim=(self.hidden_size // 64, 1, 1),
+                block_dim=(128, 1, 1),
+            )
+            self.mtp_x = self.allreduce_out
+
+        # Post-attention layernorm
+        w_post_norm = self.mpk.attach_input(
+            torch_tensor=state_dict[f"{prefix}post_attention_layernorm.weight"],
+            name="mtp_block_post_attn_layernorm",
+        )
+        self.mpk.rmsnorm_layer(
+            input=self.mtp_x, weight=w_post_norm, output=self.rmsnorm_out,
+            grid_dim=(self.max_num_batched_tokens, 1, 1),
+            block_dim=(128, 1, 1),
+        )
+
+        # MLP: DeepSeek V3 MTP block uses MoE MLP (same as main layers 3-60)
+        # Check if MoE weights exist, fallback to dense
+        mlp_gate_key = f"{prefix}mlp.gate.weight"
+        if mlp_gate_key in state_dict:
+            self._build_moe_mlp_with_prefix(prefix, state_dict)
+        else:
+            self._build_dense_mlp_with_prefix(prefix, state_dict)
+
+        self.mtp_x = self.mlp_out
+        if self.world_size > 1:
+            self.mpk.allreduce_layer(
+                input=self.mlp_out, buffer=self.allreduce_buf,
+                output=self.allreduce_out,
+                grid_dim=(self.hidden_size // 64, 1, 1),
+                block_dim=(128, 1, 1),
+            )
+            self.mtp_x = self.allreduce_out
+
+    def _build_mla_attention_layer_with_prefix(self, prefix: str, state_dict: dict):
+        """Build MLA attention using a custom weight prefix (for MTP reuse)."""
+        attn_prefix = f"{prefix}self_attn."
+
+        w_q_a = self.mpk.attach_input(
+            torch_tensor=state_dict[f"{attn_prefix}q_a_proj.weight"],
+            name=f"mtp_{attn_prefix}q_a_proj",
+        )
+        self.mpk.linear_layer(
+            input=self.rmsnorm_out, weight=w_q_a, output=self.q_a_out,
+            grid_dim=(grid_for_rmsnorm_linear_layer(w_q_a.dim(0)), 1, 1),
+            block_dim=(128, 1, 1),
+        )
+
+        w_q_a_ln = self.mpk.attach_input(
+            torch_tensor=state_dict[f"{attn_prefix}q_a_layernorm.weight"],
+            name=f"mtp_{attn_prefix}q_a_layernorm",
+        )
+        self.mpk.rmsnorm_layer(
+            input=self.q_a_out, weight=w_q_a_ln, output=self.q_a_out,
+            grid_dim=(self.max_num_batched_tokens, 1, 1),
+            block_dim=(128, 1, 1),
+        )
+
+        w_q_b = self.mpk.attach_input(
+            torch_tensor=state_dict[f"{attn_prefix}q_b_proj.weight"],
+            name=f"mtp_{attn_prefix}q_b_proj",
+        )
+        self.mpk.linear_layer(
+            input=self.q_a_out, weight=w_q_b, output=self.q_nope_pe,
+            grid_dim=(grid_for_rmsnorm_linear_layer(w_q_b.dim(0)), 1, 1),
+            block_dim=(128, 1, 1),
+        )
+
+        kv_a_full = state_dict[f"{attn_prefix}kv_a_proj_with_mqa.weight"]
+        w_kv_a_latent = self.mpk.attach_input(
+            torch_tensor=kv_a_full[:self.kv_lora_rank].contiguous(),
+            name=f"mtp_{attn_prefix}kv_a_latent",
+        )
+        w_kv_a_rope = self.mpk.attach_input(
+            torch_tensor=kv_a_full[self.kv_lora_rank:].contiguous(),
+            name=f"mtp_{attn_prefix}kv_a_rope",
+        )
+        self.mpk.linear_layer(
+            input=self.rmsnorm_out, weight=w_kv_a_latent, output=self.c_latent_out,
+            grid_dim=(grid_for_rmsnorm_linear_layer(w_kv_a_latent.dim(0)), 1, 1),
+            block_dim=(128, 1, 1),
+        )
+        self.mpk.linear_layer(
+            input=self.rmsnorm_out, weight=w_kv_a_rope, output=self.k_pe_out,
+            grid_dim=(grid_for_rmsnorm_linear_layer(w_kv_a_rope.dim(0)), 1, 1),
+            block_dim=(128, 1, 1),
+        )
+
+        w_kv_a_ln = self.mpk.attach_input(
+            torch_tensor=state_dict[f"{attn_prefix}kv_a_layernorm.weight"],
+            name=f"mtp_{attn_prefix}kv_a_layernorm",
+        )
+        self.mpk.rmsnorm_layer(
+            input=self.c_latent_out, weight=w_kv_a_ln, output=self.c_latent_out,
+            grid_dim=(self.max_num_batched_tokens, 1, 1),
+            block_dim=(128, 1, 1),
+        )
+
+        # MTP attention uses its own KV cache
+        self.mpk.paged_mla_layer(
+            q_nope_pe=self.q_nope_pe,
+            ckv_kpe_cache=self.mtp_ckv_kpe_cache_tensor,
+            c_latent_new=self.c_latent_out,
+            k_pe_new=self.k_pe_out,
+            output=self.attn_out,
+            grid_dim=(self.mpk.max_num_batched_requests, 1, 1),
+            block_dim=(128, 1, 1),
+            num_q_heads=self.num_local_q_heads,
+            qk_head_dim=self.qk_head_dim,
+            v_head_dim=self.v_head_dim,
+        )
+
+        w_o = self.mpk.attach_input(
+            torch_tensor=state_dict[f"{attn_prefix}o_proj.weight"],
+            name=f"mtp_{attn_prefix}o_proj",
+        )
+        self.mpk.splitk_linear_layer(
+            input=self.attn_out, weight=w_o, output=self.attn_proj_out,
+            grid_dim=(self.hidden_size // 128, 128 * 128 // self.hidden_size, 1),
+            block_dim=(256, 1, 1),
+        )
+
+    def _build_dense_mlp_with_prefix(self, prefix: str, state_dict: dict):
+        """Build dense MLP using a custom weight prefix (for MTP reuse)."""
+        mlp_prefix = f"{prefix}mlp."
+
+        w_gate_up = self.mpk.attach_input(
+            torch_tensor=state_dict[f"{mlp_prefix}gate_up_proj.weight"],
+            name=f"mtp_{mlp_prefix}gate_up_proj",
+        )
+        self.mpk.linear_layer(
+            input=self.rmsnorm_out, weight=w_gate_up, output=self.mlp_mid,
+            grid_dim=(grid_for_rmsnorm_linear_layer(w_gate_up.dim(0)), 1, 1),
+            block_dim=(128, 1, 1),
+        )
+        self.mpk.silu_mul_layer(
+            input=self.mlp_mid, output=self.silu_mul_out,
+            grid_dim=(self.intermediate_size // 64, 1, 1),
+            block_dim=(128, 1, 1),
+        )
+        w_down = self.mpk.attach_input(
+            torch_tensor=state_dict[f"{mlp_prefix}down_proj.weight"],
+            name=f"mtp_{mlp_prefix}down_proj",
+        )
+        self.mpk.splitk_linear_layer(
+            input=self.silu_mul_out, weight=w_down, output=self.mlp_out,
+            grid_dim=(self.hidden_size // 128, 128 * 128 // self.hidden_size, 1),
+            block_dim=(256, 1, 1),
+        )
+
+    def _build_moe_mlp_with_prefix(self, prefix: str, state_dict: dict):
+        """Build MoE MLP using a custom weight prefix (for MTP reuse)."""
+        mlp_prefix = f"{prefix}mlp."
+
+        w_gate = self.mpk.attach_input(
+            torch_tensor=state_dict[f"{mlp_prefix}gate.weight"],
+            name=f"mtp_{mlp_prefix}gate",
+        )
+        moe_topk_weights = self.mpk.new_tensor(
+            dims=(self.max_num_batched_tokens, NUM_EXPERTS_PER_TOK),
+            dtype=bfloat16, name="mtp_moe_topk_weights", io_category="cuda_tensor",
+        )
+        moe_routing_indices = self.mpk.new_tensor(
+            dims=(NUM_EXPERTS, self.max_num_batched_tokens),
+            dtype=bfloat16, name="mtp_moe_routing_indices", io_category="cuda_tensor",
+        )
+        moe_mask = self.mpk.new_tensor(
+            dims=(NUM_EXPERTS + 1, 1),
+            dtype=bfloat16, name="mtp_moe_mask", io_category="cuda_tensor",
+        )
+        router_logits = self.mpk.new_tensor(
+            dims=(self.max_num_batched_tokens, NUM_EXPERTS),
+            dtype=bfloat16, name="mtp_router_logits", io_category="cuda_tensor",
+        )
+        self.mpk.linear_layer(
+            input=self.rmsnorm_out, weight=w_gate, output=router_logits,
+            grid_dim=(grid_for_rmsnorm_linear_layer(w_gate.dim(0)), 1, 1),
+            block_dim=(128, 1, 1),
+        )
+
+        moe_output = self.mpk.new_tensor(
+            dims=(self.max_num_batched_tokens, self.hidden_size),
+            dtype=bfloat16, name="mtp_moe_output", io_category="cuda_tensor",
+        )
+        self.mpk.tensor_init_layer(
+            input=moe_output, dummy_input=self.rmsnorm_out,
+            dummy_output=self.rmsnorm_out,
+            grid_dim=(self.max_num_batched_tokens, 1, 1), block_dim=(128, 1, 1),
+        )
+        self.mpk.moe_topk_softmax_routing_layer(
+            input=router_logits,
+            output=(moe_topk_weights, moe_routing_indices, moe_mask),
+            grid_dim=(1, 1, 1), block_dim=(128, 1, 1),
+        )
+
+        w_experts_w13 = self.mpk.attach_input(
+            torch_tensor=state_dict[f"{mlp_prefix}experts.w13.weight"],
+            name=f"mtp_{mlp_prefix}experts_w13",
+        )
+        moe_mid = self.mpk.new_tensor(
+            dims=(self.max_num_batched_tokens, NUM_EXPERTS_PER_TOK,
+                  2 * self.intermediate_size),
+            dtype=bfloat16, name="mtp_moe_mid", io_category="cuda_tensor",
+        )
+        self.mpk.moe_w13_linear_layer(
+            input=self.rmsnorm_out, weight=w_experts_w13,
+            moe_routing_indices=moe_routing_indices, moe_mask=moe_mask,
+            output=moe_mid,
+            grid_dim=(NUM_EXPERTS, 1, 1), block_dim=(128, 1, 1),
+        )
+
+        moe_silu_out = self.mpk.new_tensor(
+            dims=(self.max_num_batched_tokens, NUM_EXPERTS_PER_TOK,
+                  self.intermediate_size),
+            dtype=bfloat16, name="mtp_moe_silu", io_category="cuda_tensor",
+        )
+        self.mpk.moe_silu_mul_layer(
+            input=moe_mid, output=moe_silu_out,
+            grid_dim=(self.max_num_batched_tokens * NUM_EXPERTS_PER_TOK, 1, 1),
+            block_dim=(128, 1, 1),
+        )
+
+        w_experts_w2 = self.mpk.attach_input(
+            torch_tensor=state_dict[f"{mlp_prefix}experts.w2.weight"],
+            name=f"mtp_{mlp_prefix}experts_w2",
+        )
+        moe_down_out = self.mpk.new_tensor(
+            dims=(self.max_num_batched_tokens, NUM_EXPERTS_PER_TOK,
+                  self.hidden_size),
+            dtype=bfloat16, name="mtp_moe_down", io_category="cuda_tensor",
+        )
+        self.mpk.moe_w2_linear_layer(
+            input=moe_silu_out, weight=w_experts_w2,
+            moe_routing_indices=moe_routing_indices, moe_mask=moe_mask,
+            output=moe_down_out,
+            grid_dim=(NUM_EXPERTS, 1, 1), block_dim=(128, 1, 1),
+        )
+
+        self.mpk.moe_mul_sum_add_layer(
+            input=moe_down_out, weight=moe_topk_weights,
+            residual=self.mtp_x, output=moe_output,
+            grid_dim=(self.max_num_batched_tokens, 1, 1), block_dim=(128, 1, 1),
+        )
+        self.mlp_out = moe_output
+
     def _build_mtp_layer(self, state_dict: dict):
         """Build MTP predictor layer.
 
         Architecture (from vLLM's DeepSeekMultiTokenPredictorLayer):
-        1. enorm(embed(draft_token))
-        2. hnorm(last_hidden_states)
-        3. eh_proj([enorm_out, hnorm_out])  — via split weight: W1@e + W2@h
-        4. Full decoder layer (MLA attention + MLP)
-        5. Shared LM head → draft logits → argmax
+        1. embed(draft_token) → enorm
+        2. hnorm(previous_hidden_states)
+        3. eh_proj(cat[enorm_out, hnorm_out]) → via split: W1@e + W2@h
+        4. Full decoder layer (MLA attention + dense MLP)
+        5. Shared LM head → draft logits → argmax → draft_token_ids[step]
+
+        Draft steps are statically unrolled at compile time.
+        MTP layer weights recycle via modulo: step_idx % num_mtp_layers.
         """
         if self.mtp_config is None:
             return
@@ -516,9 +792,18 @@ class DeepSeekV3Builder(GraphBuilder):
         if not isinstance(self.mtp_config, MTPConfig):
             return
 
-        mtp_prefix = "model.mtp_predictor.layers.0."
+        num_draft_steps = self.mtp_config.num_speculative_tokens
+        # Checkpoint stores MTP layer at model.layers.{num_hidden_layers}
+        # (e.g., model.layers.61 for DeepSeek V3 with 61 main layers)
+        mtp_layer_idx = self.num_layers  # 61
+        mtp_prefix = f"model.layers.{mtp_layer_idx}."
+        # The transformer block weights use the same prefix (no mtp_block sub-prefix)
+        mtp_block_prefix = mtp_prefix
 
-        # MTP enorm and hnorm weights
+        # ---- Shared weights ----
+        # embed_tokens and lm_head are shared with main model (already attached)
+
+        # MTP-specific weights: enorm, hnorm, eh_proj
         w_enorm = self.mpk.attach_input(
             torch_tensor=state_dict[f"{mtp_prefix}enorm.weight"],
             name="mtp_enorm_weight",
@@ -528,20 +813,28 @@ class DeepSeekV3Builder(GraphBuilder):
             name="mtp_hnorm_weight",
         )
 
-        # Split eh_proj into two halves: W1 for embed, W2 for hidden
+        # eh_proj: [hidden_size, 2*hidden_size] → split into W1 (embed) + W2 (hidden)
         eh_proj_full = state_dict[f"{mtp_prefix}eh_proj.weight"]
-        # eh_proj is [hidden_size, 2*hidden_size]
-        # W1 = eh_proj[:, :hidden_size], W2 = eh_proj[:, hidden_size:]
         w_eh_proj_1 = self.mpk.attach_input(
             torch_tensor=eh_proj_full[:, :self.hidden_size].contiguous(),
-            name="mtp_eh_proj_1",
+            name="mtp_eh_proj_embed",
         )
         w_eh_proj_2 = self.mpk.attach_input(
             torch_tensor=eh_proj_full[:, self.hidden_size:].contiguous(),
-            name="mtp_eh_proj_2",
+            name="mtp_eh_proj_hidden",
         )
 
-        # Intermediate tensors for MTP
+        # ---- MTP KV cache (separate from main model) ----
+        mtp_ckv_kpe_cache = torch.zeros(
+            (self.mpk.max_num_pages, self.mpk.page_size, self.qk_head_dim),
+            dtype=torch.bfloat16, device="cuda",
+        )
+        self.mtp_ckv_kpe_cache_tensor = self.mpk.attach_input(
+            torch_tensor=mtp_ckv_kpe_cache,
+            name="mtp_ckv_kpe_cache",
+        )
+
+        # ---- Intermediate tensors ----
         mbt = self.max_num_batched_tokens
         mtp_embed_out = self.mpk.new_tensor(
             dims=(mbt, self.hidden_size), dtype=bfloat16,
@@ -560,32 +853,50 @@ class DeepSeekV3Builder(GraphBuilder):
             name="mtp_proj_out", io_category="cuda_tensor",
         )
 
-        # For each draft step (statically unrolled)
-        num_draft_steps = self.mtp_config.num_speculative_tokens
-        # Save reference to hidden_states from main model
-        main_hidden_states = self.x  # After all 61 layers
+        # Draft token ID buffers
+        draft_token_ids = self.mpk.new_tensor(
+            dims=(mbt, 1), dtype=int64,
+            name="mtp_draft_token_ids", io_category="cuda_tensor",
+        )
 
+        # Collect all draft token IDs for verification
+        all_draft_ids = self.mpk.new_tensor(
+            dims=(mbt, num_draft_steps), dtype=int64,
+            name="mtp_all_draft_ids", io_category="cuda_tensor",
+        )
+
+        # ---- Shared embed weight reference (saved during build_from_dict) ----
+        w_embed = self.w_embed
+
+        # ---- Save main model state ----
+        main_hidden_states = self.x  # After all 61 layers + final norm
+
+        # ---- Draft generation loop (statically unrolled) ----
         for step in range(num_draft_steps):
-            # 1. Embed draft token (reuse shared embed weight)
-            # For step 0, the draft token comes from main model argmax
-            # For step 1+, it comes from previous MTP step's argmax
-            # The token ID is stored in draft_token_ids buffer
-            # TODO: Connect draft token buffer to embed input
+            # 1. Get draft token: step 0 from main argmax, step 1+ from prev MTP
+            # For step 0, the main model's argmax output is already in output_tokens
+            draft_input = self.output_tokens if step == 0 else draft_token_ids
 
-            # 2. enorm(embed_out)
+            # 2. Embed draft token (shared embed_tokens weight)
+            self.mpk.embed_layer(
+                input=draft_input, weight=w_embed, output=mtp_embed_out,
+                grid_dim=(1, 1, 1), block_dim=(128, 1, 1), input_source=1,
+            )
+
+            # 3. enorm(embed_out)
             self.mpk.rmsnorm_layer(
                 input=mtp_embed_out, weight=w_enorm, output=mtp_enorm_out,
                 grid_dim=(mbt, 1, 1), block_dim=(128, 1, 1),
             )
 
-            # 3. hnorm(hidden_states)
-            hidden_input = main_hidden_states if step == 0 else mtp_proj_out
+            # 4. hnorm(previous_hidden_states)
+            hidden_input = main_hidden_states if step == 0 else self.mtp_x
             self.mpk.rmsnorm_layer(
                 input=hidden_input, weight=w_hnorm, output=mtp_hnorm_out,
                 grid_dim=(mbt, 1, 1), block_dim=(128, 1, 1),
             )
 
-            # 4. eh_proj: W1 @ enorm_out + W2 @ hnorm_out
+            # 5. eh_proj: output = W1 @ enorm_out + W2 @ hnorm_out
             self.mpk.linear_layer(
                 input=mtp_enorm_out, weight=w_eh_proj_1, output=mtp_proj_out,
                 grid_dim=(grid_for_rmsnorm_linear_layer(w_eh_proj_1.dim(0)), 1, 1),
@@ -598,13 +909,138 @@ class DeepSeekV3Builder(GraphBuilder):
                 block_dim=(128, 1, 1),
             )
 
-            # 5. Full decoder layer (MTP block)
-            # For now, reuse the same decoder layer building logic
-            # The MTP block is a full DeepseekV2DecoderLayer
-            # TODO: Build MTP decoder layer with its own weights and KV cache
+            # 6. Full MTP decoder layer (MLA attention + MLP, own weights)
+            self.mtp_x = mtp_proj_out
+            self._build_mtp_decoder_layer(state_dict, mtp_block_prefix)
 
-            # 6. Shared LM head → draft logits
-            # TODO: Connect to argmax → draft_token_ids[step]
+            # 7. Final norm → shared lm_head → argmax → draft_token_ids
+            # shared_head.norm is the MTP's output norm
+            # Checkpoint key: model.layers.61.shared_head.norm.weight
+            w_mtp_norm = self.mpk.attach_input(
+                torch_tensor=state_dict.get(
+                    f"{mtp_prefix}shared_head.norm.weight",
+                    state_dict["model.norm.weight"],  # fallback to main model norm
+                ),
+                name=f"mtp_step{step}_norm",
+            )
+            self.mpk.rmsnorm_layer(
+                input=self.mtp_x, weight=w_mtp_norm, output=self.rmsnorm_out,
+                grid_dim=(mbt, 1, 1), block_dim=(128, 1, 1),
+            )
+
+            # Shared lm_head (saved during build_from_dict)
+            w_lm_head = self.w_lm_head
+            padded_vocab_size = 129280
+            lm_head_out = self.mpk.new_tensor(
+                dims=(mbt, padded_vocab_size), dtype=bfloat16,
+                name=f"mtp_step{step}_logits", io_category="cuda_tensor",
+            )
+            self.mpk.linear_layer(
+                input=self.rmsnorm_out, weight=w_lm_head, output=lm_head_out,
+                grid_dim=(grid_for_rmsnorm_linear_layer(padded_vocab_size), 1, 1),
+                block_dim=(128, 1, 1),
+            )
+
+            # Argmax → draft_token_ids
+            self.mpk.argmax_partial_layer(
+                input=lm_head_out,
+                output=(self.argmax_part_value, self.argmax_part_index),
+                grid_dim=(mbt, 1, 1), block_dim=(128, 1, 1),
+            )
+            self.mpk.argmax_reduce_layer(
+                input=(self.argmax_part_value, self.argmax_part_index),
+                output=draft_token_ids,
+                grid_dim=(mbt, 1, 1), block_dim=(128, 1, 1),
+            )
+
+            # Scatter this step's draft token into the collection buffer
+            self.mpk.mtp_token_scatter_layer(
+                src=draft_token_ids,
+                dst=all_draft_ids,
+                grid_dim=(1, 1, 1),
+                block_dim=(128, 1, 1),
+                batch_size=mbt,
+                num_slots=num_draft_steps,
+                slot_idx=step,
+            )
+
+        # ---- Prepare verify: write draft tokens to sequence buffer ----
+        # This sets up input for the next iteration's verification forward:
+        # tokens[request, step+1] = main_token, tokens[request, step+2..K+1] = drafts
+        tokens_buffer = self.mpk.meta_tensors.get("tokens", None)
+        step_tensor = self.mpk.meta_tensors.get("step", None)
+        num_new_tokens_tensor = self.mpk.meta_tensors.get("num_new_tokens", None)
+        main_model_output = self.output_tokens
+
+        if tokens_buffer is not None and step_tensor is not None:
+            self.mpk.mtp_prepare_verify_layer(
+                main_token=main_model_output,
+                draft_tokens=all_draft_ids,
+                tokens_buffer=tokens_buffer,
+                step=step_tensor,
+                num_new_tokens=num_new_tokens_tensor,
+                grid_dim=(self.mpk.max_num_batched_requests, 1, 1),
+                block_dim=(128, 1, 1),
+                num_draft_tokens=num_draft_steps,
+                max_seq_len=self.mpk.max_seq_length,
+            )
+
+        # ---- Verification + Accept/Commit ----
+        # After target model re-runs on draft tokens (managed by scheduler),
+        # the target token IDs are available. Wire up verification here.
+        target_token_ids = self.mpk.new_tensor(
+            dims=(mbt, num_draft_steps + 1), dtype=int64,
+            name="mtp_target_token_ids", io_category="cuda_tensor",
+        )
+        accepted_count = self.mpk.new_tensor(
+            dims=(mbt, 1), dtype=int64,
+            name="mtp_accepted_count", io_category="cuda_tensor",
+        )
+        verified_output_tokens = self.mpk.new_tensor(
+            dims=(mbt, num_draft_steps + 1), dtype=int64,
+            name="mtp_verified_output", io_category="cuda_tensor",
+        )
+
+        # Select verification method
+        method = self.mtp_config.rejection_sample_method
+        if method == "strict":
+            self.mpk.mtp_verify_strict_layer(
+                draft_token_ids=all_draft_ids,
+                target_token_ids=target_token_ids,
+                accepted_count=accepted_count,
+                output_tokens=verified_output_tokens,
+                grid_dim=(mbt, 1, 1),
+                block_dim=(128, 1, 1),
+                num_draft_tokens=num_draft_steps,
+            )
+        # TODO: add probabilistic and synthetic verify paths
+
+        # Accept/commit: update position and output final tokens
+        current_position = self.mpk.meta_tensors.get("step", None)
+        if current_position is not None:
+            new_position = self.mpk.new_tensor(
+                dims=(mbt, 1), dtype=int64,
+                name="mtp_new_position", io_category="cuda_tensor",
+            )
+            final_output = self.mpk.new_tensor(
+                dims=(mbt, num_draft_steps + 1), dtype=int64,
+                name="mtp_final_output", io_category="cuda_tensor",
+            )
+            num_new = self.mpk.new_tensor(
+                dims=(mbt, 1), dtype=int64,
+                name="mtp_num_new_tokens", io_category="cuda_tensor",
+            )
+            self.mpk.mtp_accept_commit_layer(
+                accepted_count=accepted_count,
+                output_tokens=verified_output_tokens,
+                current_position=current_position,
+                new_position=new_position,
+                final_output=final_output,
+                num_new_tokens=num_new,
+                grid_dim=(mbt, 1, 1),
+                block_dim=(128, 1, 1),
+                num_draft_tokens=num_draft_steps,
+            )
 
     def build_layers(self, state_dict: dict):
         """Build all 61 decoder layers."""
@@ -674,10 +1110,11 @@ class DeepSeekV3Builder(GraphBuilder):
         self.x = self.mpk.attach_input(
             torch_tensor=self.input_tokens, name="input_token"
         )
-        w_embed = self.mpk.attach_input(
+        self.w_embed = self.mpk.attach_input(
             torch_tensor=state_dict["model.embed_tokens.weight"],
             name="embed_tokens",
         )
+        w_embed = self.w_embed
         self.y = self.mpk.new_tensor(
             dims=(self.max_num_batched_tokens, self.hidden_size),
             dtype=bfloat16, name="embed_out", io_category="cuda_tensor",
@@ -714,9 +1151,10 @@ class DeepSeekV3Builder(GraphBuilder):
                                 self.hidden_size, device="cuda"),
                 ], dim=0)
 
-            w_lm_head = self.mpk.attach_input(
+            self.w_lm_head = self.mpk.attach_input(
                 torch_tensor=lm_head_weight, name="lm_head",
             )
+            w_lm_head = self.w_lm_head
             lm_head_out = self.mpk.new_tensor(
                 dims=(self.max_num_batched_tokens, padded_vocab_size),
                 dtype=bfloat16, name="lm_head_out", io_category="cuda_tensor",

@@ -1462,6 +1462,50 @@ class PersistentKernel:
         )
         self.kn_graph.register_task(tb_graph, "mtp_accept_commit", params)
 
+    def mtp_token_scatter_layer(
+        self,
+        src: DTensor,          # [batch, 1] int64 — single draft token
+        dst: DTensor,          # [batch, num_slots] int64 — collection buffer
+        grid_dim: tuple,
+        block_dim: tuple,
+        batch_size: int,
+        num_slots: int,
+        slot_idx: int,
+    ):
+        """Scatter one draft token per batch to a specific column of dst."""
+        params = [batch_size, num_slots, slot_idx]
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(src, (-1, -1, -1), -1, True)
+        tb_graph.new_input(dst, (-1, -1, -1), -1, True)
+        self.kn_graph.customized([src, dst], tb_graph)
+        self.kn_graph.register_task(tb_graph, "mtp_token_scatter", params)
+
+    def mtp_prepare_verify_layer(
+        self,
+        main_token: DTensor,      # [batch, 1] int64
+        draft_tokens: DTensor,    # [batch, num_draft] int64
+        tokens_buffer: DTensor,   # [max_requests, max_seq_len] int64
+        step: DTensor,            # [max_requests] int32
+        num_new_tokens: DTensor,  # [max_requests] int32 output
+        grid_dim: tuple,
+        block_dim: tuple,
+        num_draft_tokens: int,
+        max_seq_len: int,
+    ):
+        """Write main+draft tokens to sequence buffer for verify iteration."""
+        params = [num_draft_tokens, max_seq_len]
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(main_token, (-1, -1, -1), -1, True)
+        tb_graph.new_input(draft_tokens, (-1, -1, -1), -1, True)
+        tb_graph.new_input(tokens_buffer, (-1, -1, -1), -1, True)
+        tb_graph.new_input(step, (-1, -1, -1), -1, True)
+        tb_graph.new_input(num_new_tokens, (-1, -1, -1), -1, True)
+        self.kn_graph.customized(
+            [main_token, draft_tokens, tokens_buffer, step, num_new_tokens],
+            tb_graph,
+        )
+        self.kn_graph.register_task(tb_graph, "mtp_prepare_verify", params)
+
     def prompt_lookup_verify_handler(
         self,
         spec_decode_config: SpecDecodeConfig,

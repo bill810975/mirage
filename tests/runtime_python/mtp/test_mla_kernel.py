@@ -185,8 +185,10 @@ def test_multi_token_causal():
     output_kernel = torch.zeros(num_tokens, NUM_Q_HEADS * V_HEAD_DIM, device=device, dtype=torch.bfloat16)
 
     cache_ref = cache.clone()
+    c_latent_new = kv_new[:, :V_HEAD_DIM].contiguous()
+    k_pe_new = kv_new[:, V_HEAD_DIM:].contiguous()
     test_mla_kernel.mla_attention(
-        q, cache, kv_new, output_kernel,
+        q, cache, c_latent_new, k_pe_new, output_kernel,
         qo_indptr, kv_indptr, kv_indices, kv_last_page_len, 1
     )
 
@@ -241,8 +243,10 @@ def test_small_heads():
     output_kernel = torch.zeros(num_tokens, NUM_Q_HEADS * V_HEAD_DIM, device=device, dtype=torch.bfloat16)
 
     cache_ref = cache.clone()
+    c_latent_new = kv_new[:, :V_HEAD_DIM].contiguous()
+    k_pe_new = kv_new[:, V_HEAD_DIM:].contiguous()
     test_mla_kernel.mla_attention(
-        q, cache, kv_new, output_kernel,
+        q, cache, c_latent_new, k_pe_new, output_kernel,
         qo_indptr, kv_indptr, kv_indices, kv_last_page_len, 1
     )
 
@@ -263,6 +267,78 @@ def test_small_heads():
         raise
 
 
+def benchmark_mla_kernel(
+    batch_sizes=(1, 4, 16),
+    kv_lens=(512, 2048, 8192),
+    num_tokens=1,
+    warmup=20,
+    reps=200,
+):
+    """Benchmark our MLA kernel across batch sizes and KV lengths."""
+    device = torch.device("cuda:0")
+    print("\n" + "=" * 70)
+    print("MLA Kernel Benchmark (DeepSeek V3 config: 16 heads/TP, QK=576, V=512)")
+    print("=" * 70)
+    print(f"{'Batch':>6} {'KV len':>8} {'Latency(us)':>12} {'TFLOPS':>10}")
+    print("-" * 42)
+
+    for bs in batch_sizes:
+        for kv_len in kv_lens:
+            # Allocate tensors
+            q = torch.randn(num_tokens * bs, NUM_Q_HEADS * QK_HEAD_DIM,
+                            device=device, dtype=torch.bfloat16)
+            num_pages = (kv_len + PAGE_SIZE - 1) // PAGE_SIZE
+            cache = torch.randn(num_pages * bs, PAGE_SIZE, QK_HEAD_DIM,
+                                device=device, dtype=torch.bfloat16)
+            kv_new = torch.randn(num_tokens * bs, QK_HEAD_DIM,
+                                 device=device, dtype=torch.bfloat16)
+            c_new = kv_new[:, :V_HEAD_DIM].contiguous()
+            k_pe_new = kv_new[:, V_HEAD_DIM:].contiguous()
+            output = torch.zeros(num_tokens * bs, NUM_Q_HEADS * V_HEAD_DIM,
+                                 device=device, dtype=torch.bfloat16)
+
+            # Build paged KV structures (one request per batch entry)
+            qo_indptr = torch.zeros(bs + 1, device=device, dtype=torch.int32)
+            for i in range(bs):
+                qo_indptr[i + 1] = qo_indptr[i] + num_tokens
+            kv_indptr = torch.zeros(bs + 1, device=device, dtype=torch.int32)
+            for i in range(bs):
+                kv_indptr[i + 1] = kv_indptr[i] + num_pages
+            kv_indices = torch.arange(num_pages * bs, device=device, dtype=torch.int32)
+            last_pg_len = kv_len - (num_pages - 1) * PAGE_SIZE
+            kv_last_page_len = torch.full((bs,), last_pg_len,
+                                          device=device, dtype=torch.int32)
+
+            # Warmup
+            for _ in range(warmup):
+                test_mla_kernel.mla_attention(
+                    q, cache, c_new, k_pe_new, output,
+                    qo_indptr, kv_indptr, kv_indices, kv_last_page_len, bs)
+            torch.cuda.synchronize()
+
+            # Time
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            for _ in range(reps):
+                test_mla_kernel.mla_attention(
+                    q, cache, c_new, k_pe_new, output,
+                    qo_indptr, kv_indptr, kv_indices, kv_last_page_len, bs)
+            end.record()
+            torch.cuda.synchronize()
+
+            ms = start.elapsed_time(end) / reps
+            us = ms * 1000
+
+            # FLOPS: per request: 2 * N_heads * (2*kv_len*QKD + kv_len*VD)
+            # QK matmul: bs * N_heads * kv_len * QKD * 2
+            # PV matmul: bs * N_heads * kv_len * VD * 2
+            flops = bs * NUM_Q_HEADS * kv_len * (2 * QK_HEAD_DIM + 2 * V_HEAD_DIM) * 2
+            tflops = flops / (ms * 1e-3) / 1e12
+
+            print(f"{bs:>6} {kv_len:>8} {us:>12.1f} {tflops:>10.3f}")
+
+
 if __name__ == "__main__":
     if not HAS_KERNEL:
         print("Cannot run GPU tests without compiled kernel. Exiting.")
@@ -279,3 +355,6 @@ if __name__ == "__main__":
     print("\n" + "=" * 60)
     print("All MLA kernel tests PASSED!")
     print("=" * 60)
+
+    # MAX_SEQ_LEN=4096 in compiled kernel, so kv_lens must stay under that
+    benchmark_mla_kernel(batch_sizes=(1, 4, 16), kv_lens=(512, 1024, 2048, 4096))

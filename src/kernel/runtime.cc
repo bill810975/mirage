@@ -1250,6 +1250,8 @@ TaskGraphResult print_task_graph(
       "TASK_MTP_VERIFY_PROBABILISTIC";
   task_type_to_name[TASK_MTP_VERIFY_SYNTHETIC] = "TASK_MTP_VERIFY_SYNTHETIC";
   task_type_to_name[TASK_MTP_ACCEPT_COMMIT] = "TASK_MTP_ACCEPT_COMMIT";
+  task_type_to_name[TASK_MTP_TOKEN_SCATTER] = "TASK_MTP_TOKEN_SCATTER";
+  task_type_to_name[TASK_MTP_PREPARE_VERIFY] = "TASK_MTP_PREPARE_VERIFY";
   // Multi-gpu tasks
   task_type_to_name[TASK_NVSHMEM_ALLGATHER_STRIDED_PUT] =
       "TASK_NVSHMEM_ALLGATHER_STRIDED_PUT";

@@ -2098,6 +2098,40 @@ int TaskRegister::register_mtp_accept_commit_task(
   return register_task_variant(TASK_MTP_ACCEPT_COMMIT, code.to_string());
 }
 
+int TaskRegister::register_mtp_token_scatter_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  // params[0]: batch_size, params[1]: num_slots, params[2]: slot_idx
+  assert(params.size() == 3);
+  int batch_size = params[0];
+  int num_slots = params[1];
+  int slot_idx = params[2];
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e("kernel::mtp_token_scatter_kernel<$, $, $>(", batch_size, num_slots, slot_idx);
+  code.e("    task_desc->input_ptrs[0],");   // src: single draft token
+  code.e("    task_desc->output_ptrs[0]);"); // dst: all_draft_ids buffer
+  return register_task_variant(TASK_MTP_TOKEN_SCATTER, code.to_string());
+}
+
+int TaskRegister::register_mtp_prepare_verify_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  // params[0]: num_draft_tokens, params[1]: max_seq_len
+  assert(params.size() == 2);
+  int num_draft = params[0];
+  int max_seq_len = params[1];
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e("kernel::mtp_prepare_verify_input_kernel<$, $>(", num_draft, max_seq_len);
+  code.e("    task_desc->input_ptrs[0],");   // main_token
+  code.e("    task_desc->input_ptrs[1],");   // draft_tokens
+  code.e("    task_desc->input_ptrs[2],");   // tokens_buffer
+  code.e("    task_desc->input_ptrs[3],");   // step
+  code.e("    task_desc->output_ptrs[0]);"); // num_new_tokens
+  return register_task_variant(TASK_MTP_PREPARE_VERIFY, code.to_string());
+}
+
 int TaskRegister::register_argmax_partial_sm100_task(
     threadblock::Graph const &bgraph, std::vector<int> const &params) {
   // params[0]: num_partial_tasks

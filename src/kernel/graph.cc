@@ -685,6 +685,16 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
         customized->bgraph, params);
     task_config[op] =
         std::make_tuple(3, 3, TASK_MTP_ACCEPT_COMMIT, variant_id);
+  } else if (name == "mtp_token_scatter") {
+    int variant_id = task_register->register_mtp_token_scatter_task(
+        customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(1, 1, TASK_MTP_TOKEN_SCATTER, variant_id);
+  } else if (name == "mtp_prepare_verify") {
+    int variant_id = task_register->register_mtp_prepare_verify_task(
+        customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(4, 1, TASK_MTP_PREPARE_VERIFY, variant_id);
   }
   // Multi-GPU tasks
   else if (name == "nvshmem_allgather_strided_put") {
