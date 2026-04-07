@@ -1974,6 +1974,57 @@ int TaskRegister::register_paged_attention_sm100_task(
   return register_task_variant(TASK_ATTN_SM100, code.to_string());
 }
 
+int TaskRegister::register_paged_mla_sm100_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  // params[0]: num_q_heads (per GPU, e.g., 16 for 8-GPU TP)
+  // params[1]: qk_head_dim (576 = 512 latent + 64 rope)
+  // params[2]: v_head_dim (512 = latent dim only)
+  // params[3]: max_seq_len
+  // params[4]: page_size
+  assert(params.size() == 5);
+
+  std::vector<tb::TBInputOp *> input_ops;
+  std::vector<tb::TBInputOp *> output_ops;
+  int num_inputs = 3;
+  int num_outputs = 1;
+
+  assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops.size() < (size_t)num_inputs) {
+      input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+
+  int num_q_heads = params[0];
+  int qk_head_dim = params[1];
+  int v_head_dim = params[2];
+  int max_seq_len = params[3];
+  int page_size = params[4];
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e("kernel::mla_paged_attention_sm100_task_impl<bfloat16, $, $, $, $, "
+         "$>(",
+         num_q_heads,
+         qk_head_dim,
+         v_head_dim,
+         max_seq_len,
+         page_size);
+  code.e("    task_desc->input_ptrs[0],");
+  code.e("    task_desc->input_ptrs[1],");
+  code.e("    task_desc->input_ptrs[2],");
+  code.e("    task_desc->output_ptrs[0],");
+  code.e("    runtime_config.qo_indptr_buffer,");
+  code.e("    runtime_config.paged_kv_indptr_buffer,");
+  code.e("    runtime_config.paged_kv_indices_buffer,");
+  code.e("    runtime_config.paged_kv_last_page_len_buffer,");
+  code.e("    task_desc->task_metadata.request_id);");
+  return register_task_variant(TASK_PAGED_MLA_SM100, code.to_string());
+}
+
 int TaskRegister::register_argmax_partial_sm100_task(
     threadblock::Graph const &bgraph, std::vector<int> const &params) {
   // params[0]: num_partial_tasks

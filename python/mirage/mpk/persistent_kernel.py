@@ -668,7 +668,58 @@ class PersistentKernel:
         else:
             self.kn_graph.register_task(tb_graph, "paged_attention", params)
 
-    
+    def paged_mla_layer(
+        self,
+        q_nope_pe: DTensor,       # [num_tokens, num_q_heads * qk_head_dim]
+        ckv_kpe_cache: DTensor,   # [num_pages, page_size, qk_head_dim]
+        kv_new: DTensor,          # [num_tokens, qk_head_dim] — new KV to write to cache
+        output: DTensor,          # [num_tokens, num_q_heads * v_head_dim]
+        grid_dim: tuple,
+        block_dim: tuple,
+        num_q_heads: int,         # per GPU (e.g., 16 for 8-GPU TP with 128 total heads)
+        qk_head_dim: int = 576,   # 512 latent + 64 rope
+        v_head_dim: int = 512,    # latent dim only
+    ):
+        # MLA (Multi-head Latent Attention) for DeepSeek V3
+        # Blackwell-only for now
+        assert self.target_cc == 100, (
+            f"paged_mla_layer is only supported on SM100 (Blackwell), "
+            f"but target_cc={self.target_cc}"
+        )
+        assert q_nope_pe.num_dims == 2  # (num_tokens, num_q_heads * qk_head_dim)
+        assert ckv_kpe_cache.num_dims == 3  # (num_pages, page_size, qk_head_dim)
+        assert ckv_kpe_cache.dim(0) == self.max_num_pages
+        assert ckv_kpe_cache.dim(1) == self.page_size
+        assert ckv_kpe_cache.dim(2) == qk_head_dim
+        assert kv_new.num_dims == 2  # (num_tokens, qk_head_dim)
+        assert kv_new.dim(1) == qk_head_dim
+        assert output.num_dims == 2  # (num_tokens, num_q_heads * v_head_dim)
+        assert output.dim(1) == num_q_heads * v_head_dim
+
+        # params[0]: num_q_heads
+        # params[1]: qk_head_dim
+        # params[2]: v_head_dim
+        # params[3]: max_seq_len
+        # params[4]: page_size
+        params = [num_q_heads, qk_head_dim, v_head_dim, self.max_seq_length, self.page_size]
+
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        assert grid_dim[0] == self.max_num_batched_requests
+        tb_graph.new_input(q_nope_pe, (-1, 1, -1), -1, True)
+        tb_graph.new_input(ckv_kpe_cache, (-1, 2, -1), 1, True)
+        tb_graph.new_input(kv_new, (-1, 1, -1), -1, True)
+        tb_graph.new_input(output, (-1, 1, -1), -1, True)
+        self.kn_graph.customized(
+            [
+                q_nope_pe,
+                ckv_kpe_cache,
+                kv_new,
+                output,
+            ],
+            tb_graph,
+        )
+        self.kn_graph.register_task(tb_graph, "paged_mla_sm100", params)
+
     def paged_attention_split_kv_layer(
         self,
         input: DTensor,

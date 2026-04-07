@@ -1244,6 +1244,7 @@ TaskGraphResult print_task_graph(
       "TASK_PAGED_ATTENTION_SPLIT_KV_MERGE_SM100";
   task_type_to_name[TASK_PAGED_ATTENTION_SPLIT_KV_HOPPER] =
       "TASK_PAGED_ATTENTION_SPLIT_KV_HOPPER";
+  task_type_to_name[TASK_PAGED_MLA_SM100] = "TASK_PAGED_MLA_SM100";
   // Multi-gpu tasks
   task_type_to_name[TASK_NVSHMEM_ALLGATHER_STRIDED_PUT] =
       "TASK_NVSHMEM_ALLGATHER_STRIDED_PUT";
