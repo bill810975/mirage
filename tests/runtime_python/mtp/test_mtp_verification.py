@@ -37,16 +37,16 @@ def verify_strict_ref(
 
 def verify_probabilistic_ref(
     draft_token_ids: torch.Tensor,  # [num_draft]
-    target_logits: torch.Tensor,    # [num_draft + 1, vocab_size]
-    draft_logits: torch.Tensor,     # [num_draft, vocab_size]
-    temperature: float,
+    target_token_ids: torch.Tensor, # [num_draft + 1] (argmax of target)
+    target_probs: torch.Tensor,     # [num_draft] P_target(draft_token) pre-computed
+    draft_probs: torch.Tensor,      # [num_draft] P_draft(draft_token) pre-computed
     seed: int,
 ) -> tuple[int, torch.Tensor]:
-    """Probabilistic verification: P_target > u * P_draft."""
-    num_draft = draft_token_ids.shape[0]
-    vocab_size = target_logits.shape[1]
+    """Probabilistic verification: P_target > u * P_draft.
 
-    # LCG RNG matching the CUDA kernel
+    Takes pre-computed probabilities matching vLLM's design.
+    """
+    num_draft = draft_token_ids.shape[0]
     rng_state = seed
     accepted = 0
     still_accepting = True
@@ -55,28 +55,19 @@ def verify_probabilistic_ref(
     for i in range(num_draft):
         if not still_accepting:
             break
-        draft_token = draft_token_ids[i].item()
 
-        if temperature == 0.0:
-            # Greedy: check if draft matches target argmax
-            target_argmax = target_logits[i].argmax().item()
-            if target_argmax != draft_token:
+        p_target = target_probs[i].item()
+        p_draft = draft_probs[i].item()
+
+        if p_draft == 0.0:
+            # Greedy fallback
+            if draft_token_ids[i] != target_token_ids[i]:
                 still_accepting = False
             else:
                 output_tokens[i] = draft_token_ids[i]
                 accepted += 1
         else:
-            # Probabilistic
-            t_logits = target_logits[i].float()
-            d_logits = draft_logits[i].float()
-
-            t_probs = torch.softmax(t_logits / temperature, dim=0)
-            d_probs = torch.softmax(d_logits / temperature, dim=0)
-
-            p_target = t_probs[draft_token].item()
-            p_draft = d_probs[draft_token].item()
-
-            # LCG RNG
+            # Probabilistic: P_target > u * P_draft
             rng_state = (rng_state * 6364136223846793005 + 1442695040888963407) & ((1 << 64) - 1)
             u = (rng_state >> 33) / (1 << 31)
 
@@ -86,10 +77,8 @@ def verify_probabilistic_ref(
             else:
                 still_accepting = False
 
-    # Bonus token: target argmax at rejected position
-    bonus_token = target_logits[accepted].argmax().item()
-    output_tokens[accepted] = bonus_token
-
+    # Bonus token = target model's token at rejected position
+    output_tokens[accepted] = target_token_ids[accepted]
     return accepted + 1, output_tokens[:accepted + 1]
 
 
@@ -187,64 +176,65 @@ class TestStrictVerification:
 
 
 class TestProbabilisticVerification:
-    def test_greedy_all_match(self):
-        """Temperature=0 (greedy), all match target argmax."""
-        num_draft = 3
-        vocab_size = 10
-
+    def test_greedy_fallback_all_match(self):
+        """Draft prob = 0 (greedy fallback), all match target."""
         draft = torch.tensor([5, 3, 7])
-        # Target logits: argmax at positions 5, 3, 7, 2 respectively
-        target_logits = torch.randn(num_draft + 1, vocab_size)
-        for i, token in enumerate([5, 3, 7, 2]):
-            target_logits[i, token] = 100.0  # make this the argmax
+        target = torch.tensor([5, 3, 7, 2])
+        # p_draft=0 triggers greedy fallback
+        t_probs = torch.zeros(3)
+        d_probs = torch.zeros(3)
 
-        draft_logits = torch.randn(num_draft, vocab_size)
-
-        count, tokens = verify_probabilistic_ref(draft, target_logits, draft_logits, 0.0, 42)
+        count, tokens = verify_probabilistic_ref(draft, target, t_probs, d_probs, 42)
         assert count == 4  # all 3 accepted + bonus
-        assert tokens[0] == 5
-        assert tokens[1] == 3
-        assert tokens[2] == 7
-        assert tokens[3] == 2  # bonus = target argmax at position 3
+        assert tokens.tolist() == [5, 3, 7, 2]
 
-    def test_greedy_first_mismatch(self):
-        """Temperature=0, first position doesn't match."""
+    def test_greedy_fallback_mismatch(self):
+        """Draft prob = 0 (greedy fallback), first mismatch."""
         draft = torch.tensor([5, 3, 7])
-        target_logits = torch.randn(4, 10)
-        target_logits[0, 9] = 100.0  # argmax is 9, not 5
+        target = torch.tensor([9, 3, 7, 2])
+        t_probs = torch.zeros(3)
+        d_probs = torch.zeros(3)
 
-        draft_logits = torch.randn(3, 10)
-
-        count, tokens = verify_probabilistic_ref(draft, target_logits, draft_logits, 0.0, 42)
+        count, tokens = verify_probabilistic_ref(draft, target, t_probs, d_probs, 42)
         assert count == 1  # 0 accepted + bonus
-        assert tokens[0] == 9  # bonus = target argmax
+        assert tokens[0] == 9
 
-    def test_high_temp_acceptance(self):
-        """High temperature with matching distributions — should accept most."""
-        torch.manual_seed(123)
-        num_draft = 4
-        vocab_size = 100
+    def test_high_prob_acceptance(self):
+        """High target prob, low draft prob → always accept."""
+        draft = torch.tensor([5, 3, 7])
+        target = torch.tensor([5, 3, 7, 2])
+        # P_target >> P_draft → P_target > u * P_draft always true
+        t_probs = torch.tensor([0.9, 0.9, 0.9])
+        d_probs = torch.tensor([0.1, 0.1, 0.1])
 
-        # Same distribution for target and draft → p_target ≈ p_draft
-        # So acceptance condition p_target > u * p_draft is roughly 50%
-        logits = torch.randn(num_draft + 1, vocab_size)
-        draft = torch.tensor([logits[i].argmax().item() for i in range(num_draft)])
-        draft_logits = logits[:num_draft].clone()
+        count, tokens = verify_probabilistic_ref(draft, target, t_probs, d_probs, 42)
+        assert count == 4  # all accepted
 
-        count, tokens = verify_probabilistic_ref(
-            draft, logits, draft_logits, 1.0, 12345
-        )
-        # With matching distributions and draft = argmax, should accept at least some
-        assert count >= 1
+    def test_low_prob_rejection(self):
+        """Low target prob, high draft prob → likely reject."""
+        draft = torch.tensor([5, 3, 7])
+        target = torch.tensor([5, 3, 7, 2])
+        # P_target << P_draft → P_target > u * P_draft unlikely
+        t_probs = torch.tensor([0.01, 0.01, 0.01])
+        d_probs = torch.tensor([0.99, 0.99, 0.99])
+
+        # Run many seeds, expect most to reject early
+        total_accepted = 0
+        for seed in range(100):
+            c, _ = verify_probabilistic_ref(draft, target, t_probs, d_probs, seed)
+            total_accepted += c - 1  # subtract bonus
+        avg = total_accepted / 100
+        assert avg < 1.0  # should accept very few
 
     def test_deterministic_with_seed(self):
         """Same seed produces same result."""
         draft = torch.tensor([5, 3])
-        target_logits = torch.randn(3, 20)
-        draft_logits = torch.randn(2, 20)
+        target = torch.tensor([5, 3, 2])
+        t_probs = torch.tensor([0.5, 0.5])
+        d_probs = torch.tensor([0.5, 0.5])
 
-        r1 = verify_probabilistic_ref(draft, target_logits, draft_logits, 1.0, 42)
-        r2 = verify_probabilistic_ref(draft, target_logits, draft_logits, 1.0, 42)
+        r1 = verify_probabilistic_ref(draft, target, t_probs, d_probs, 42)
+        r2 = verify_probabilistic_ref(draft, target, t_probs, d_probs, 42)
         assert r1[0] == r2[0]
         assert r1[1].tolist() == r2[1].tolist()
 

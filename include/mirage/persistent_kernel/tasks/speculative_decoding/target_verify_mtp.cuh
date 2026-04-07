@@ -95,35 +95,39 @@ __device__ __forceinline__ void target_verify_strict_kernel(
 // Accept draft token at position i if:
 //   P_target(draft_token_i) > u_i * P_draft(draft_token_i)
 // where u_i ~ U(0,1) (from seeds).
-// For greedy (temperature=0): falls back to strict comparison.
+// For greedy (temperature=0): compare draft vs target_token_ids directly.
+//
+// Follows vLLM's design: takes PRE-COMPUTED probabilities (not logits).
+// Softmax is computed in a separate kernel before calling this.
+// This keeps the verification kernel O(NUM_DRAFT_TOKENS) not O(VOCAB_SIZE).
 //
 // Inputs:
-//   draft_token_ids:  [NUM_DRAFT_TOKENS]
-//   target_logits:    [NUM_DRAFT_TOKENS+1, VOCAB_SIZE] (fp32)
-//   draft_logits:     [NUM_DRAFT_TOKENS, VOCAB_SIZE] (fp32)
-//   temperature:      [1] (fp32)
-//   seed:             [1] (uint64)
+//   draft_token_ids:   [NUM_DRAFT_TOKENS]
+//   target_token_ids:  [NUM_DRAFT_TOKENS+1] (argmax of target model, for greedy path)
+//   target_probs:      [NUM_DRAFT_TOKENS] (fp32, P_target(draft_token) at each pos)
+//   draft_probs:       [NUM_DRAFT_TOKENS] (fp32, P_draft(draft_token) at each pos)
+//   seed:              [1] (uint64)
 // Outputs:
-//   accepted_count:   [1] (int32)
-//   output_tokens:    [NUM_DRAFT_TOKENS+1] (int64)
-template <int NUM_DRAFT_TOKENS, int VOCAB_SIZE>
+//   accepted_count:    [1] (int32)
+//   output_tokens:     [NUM_DRAFT_TOKENS+1] (int64)
+template <int NUM_DRAFT_TOKENS>
 __device__ __forceinline__ void target_verify_probabilistic_kernel(
     void const *__restrict__ draft_token_ids_ptr,
-    void const *__restrict__ target_logits_ptr,
-    void const *__restrict__ draft_logits_ptr,
-    void const *__restrict__ temperature_ptr,
+    void const *__restrict__ target_token_ids_ptr,
+    void const *__restrict__ target_probs_ptr,
+    void const *__restrict__ draft_probs_ptr,
     void const *__restrict__ seed_ptr,
     void *__restrict__ accepted_count_ptr,
     void *__restrict__ output_tokens_ptr) {
 
   long long const *__restrict__ draft_ids =
       static_cast<long long const *>(draft_token_ids_ptr);
-  float const *__restrict__ target_logits =
-      static_cast<float const *>(target_logits_ptr);
-  float const *__restrict__ draft_logits =
-      static_cast<float const *>(draft_logits_ptr);
-  float const *__restrict__ temp_ptr =
-      static_cast<float const *>(temperature_ptr);
+  long long const *__restrict__ target_ids =
+      static_cast<long long const *>(target_token_ids_ptr);
+  float const *__restrict__ target_probs =
+      static_cast<float const *>(target_probs_ptr);
+  float const *__restrict__ draft_probs =
+      static_cast<float const *>(draft_probs_ptr);
   unsigned long long const *__restrict__ seed =
       static_cast<unsigned long long const *>(seed_ptr);
   int *__restrict__ accepted_count =
@@ -134,60 +138,24 @@ __device__ __forceinline__ void target_verify_probabilistic_kernel(
   int t_id = threadIdx.x;
 
   if (t_id == 0) {
-    float temperature = temp_ptr[0];
     unsigned long long rng_state = seed[0];
     int accepted = 0;
     bool still_accepting = true;
 
     for (int i = 0; i < NUM_DRAFT_TOKENS && still_accepting; i++) {
-      int draft_token = static_cast<int>(draft_ids[i]);
+      float p_target = target_probs[i];
+      float p_draft = draft_probs[i];
 
-      if (temperature == 0.0f) {
-        // Greedy: find target argmax and compare
-        float max_val = -1e30f;
-        int argmax_idx = 0;
-        for (int v = 0; v < VOCAB_SIZE; v++) {
-          float val = target_logits[i * VOCAB_SIZE + v];
-          if (val > max_val) {
-            max_val = val;
-            argmax_idx = v;
-          }
-        }
-        if (argmax_idx != draft_token) {
+      if (p_draft == 0.0f) {
+        // Draft probability is zero — greedy fallback: check if tokens match
+        if (draft_ids[i] != target_ids[i]) {
           still_accepting = false;
         } else {
           output_tokens[i] = draft_ids[i];
           accepted++;
         }
       } else {
-        // Probabilistic: compute softmax probabilities for the draft token
-        // P_target and P_draft for the specific draft_token
-        float target_max = -1e30f, draft_max = -1e30f;
-        for (int v = 0; v < VOCAB_SIZE; v++) {
-          target_max = max(target_max, target_logits[i * VOCAB_SIZE + v]);
-          draft_max = max(draft_max, draft_logits[i * VOCAB_SIZE + v]);
-        }
-
-        float target_sum = 0.f, draft_sum = 0.f;
-        for (int v = 0; v < VOCAB_SIZE; v++) {
-          target_sum +=
-              expf((target_logits[i * VOCAB_SIZE + v] - target_max) /
-                   temperature);
-          draft_sum +=
-              expf((draft_logits[i * VOCAB_SIZE + v] - draft_max) /
-                   temperature);
-        }
-
-        float p_target =
-            expf((target_logits[i * VOCAB_SIZE + draft_token] - target_max) /
-                 temperature) /
-            target_sum;
-        float p_draft =
-            expf((draft_logits[i * VOCAB_SIZE + draft_token] - draft_max) /
-                 temperature) /
-            draft_sum;
-
-        // Simple LCG RNG
+        // Probabilistic: P_target > u * P_draft
         rng_state = rng_state * 6364136223846793005ULL + 1442695040888963407ULL;
         float u = static_cast<float>(rng_state >> 33) /
                   static_cast<float>(1ULL << 31);
@@ -201,18 +169,8 @@ __device__ __forceinline__ void target_verify_probabilistic_kernel(
       }
     }
 
-    // Bonus token: target model's prediction at the first rejected position
-    // For the bonus token, we use target argmax at position `accepted`
-    float max_val = -1e30f;
-    int bonus_token = 0;
-    for (int v = 0; v < VOCAB_SIZE; v++) {
-      float val = target_logits[accepted * VOCAB_SIZE + v];
-      if (val > max_val) {
-        max_val = val;
-        bonus_token = v;
-      }
-    }
-    output_tokens[accepted] = bonus_token;
+    // Bonus token = target model's token at the rejected position
+    output_tokens[accepted] = target_ids[accepted];
     accepted_count[0] = accepted + 1;
   }
 }

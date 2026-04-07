@@ -1372,30 +1372,33 @@ class PersistentKernel:
 
     def mtp_verify_probabilistic_layer(
         self,
-        draft_token_ids: DTensor,  # [batch, num_draft_tokens]
-        target_logits: DTensor,    # [batch, (num_draft+1) * vocab_size]
-        draft_logits: DTensor,     # [batch, num_draft * vocab_size]
-        temperature: DTensor,      # [batch, 1]
-        seed: DTensor,             # [batch, 1]
-        accepted_count: DTensor,   # [batch, 1] output
-        output_tokens: DTensor,    # [batch, num_draft_tokens + 1] output
+        draft_token_ids: DTensor,   # [batch, num_draft_tokens]
+        target_token_ids: DTensor,  # [batch, num_draft_tokens + 1]
+        target_probs: DTensor,      # [batch, num_draft_tokens] — P_target(draft_token) pre-computed
+        draft_probs: DTensor,       # [batch, num_draft_tokens] — P_draft(draft_token) pre-computed
+        seed: DTensor,              # [batch, 1]
+        accepted_count: DTensor,    # [batch, 1] output
+        output_tokens: DTensor,     # [batch, num_draft_tokens + 1] output
         grid_dim: tuple,
         block_dim: tuple,
         num_draft_tokens: int,
-        vocab_size: int,
     ):
-        """Probabilistic MTP verification: P_target > u * P_draft."""
-        params = [num_draft_tokens, vocab_size]
+        """Probabilistic MTP verification: P_target > u * P_draft.
+
+        Takes PRE-COMPUTED probabilities (not logits). The softmax/gather
+        should be done before calling this layer. This matches vLLM's design.
+        """
+        params = [num_draft_tokens]
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         tb_graph.new_input(draft_token_ids, (-1, -1, -1), -1, True)
-        tb_graph.new_input(target_logits, (-1, -1, -1), -1, True)
-        tb_graph.new_input(draft_logits, (-1, -1, -1), -1, True)
-        tb_graph.new_input(temperature, (-1, -1, -1), -1, True)
+        tb_graph.new_input(target_token_ids, (-1, -1, -1), -1, True)
+        tb_graph.new_input(target_probs, (-1, -1, -1), -1, True)
+        tb_graph.new_input(draft_probs, (-1, -1, -1), -1, True)
         tb_graph.new_input(seed, (-1, -1, -1), -1, True)
         tb_graph.new_input(accepted_count, (-1, -1, -1), -1, True)
         tb_graph.new_input(output_tokens, (-1, -1, -1), -1, True)
         self.kn_graph.customized(
-            [draft_token_ids, target_logits, draft_logits, temperature, seed,
+            [draft_token_ids, target_token_ids, target_probs, draft_probs, seed,
              accepted_count, output_tokens],
             tb_graph,
         )

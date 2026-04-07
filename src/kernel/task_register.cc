@@ -2045,19 +2045,16 @@ int TaskRegister::register_mtp_verify_strict_task(
 int TaskRegister::register_mtp_verify_probabilistic_task(
     threadblock::Graph const &bgraph, std::vector<int> const &params) {
   // params[0]: num_draft_tokens (1-7)
-  // params[1]: vocab_size
-  assert(params.size() == 2);
+  assert(params.size() == 1);
   int num_draft = params[0];
-  int vocab_size = params[1];
 
   mirage::transpiler::CodeKeeper code;
   code.inc_indent();
-  code.e("kernel::target_verify_probabilistic_kernel<$, $>(",
-         num_draft, vocab_size);
+  code.e("kernel::target_verify_probabilistic_kernel<$>(", num_draft);
   code.e("    task_desc->input_ptrs[0],");   // draft_token_ids
-  code.e("    task_desc->input_ptrs[1],");   // target_logits
-  code.e("    task_desc->input_ptrs[2],");   // draft_logits
-  code.e("    task_desc->input_ptrs[3],");   // temperature
+  code.e("    task_desc->input_ptrs[1],");   // target_token_ids
+  code.e("    task_desc->input_ptrs[2],");   // target_probs (pre-computed)
+  code.e("    task_desc->input_ptrs[3],");   // draft_probs (pre-computed)
   code.e("    task_desc->input_ptrs[4],");   // seed
   code.e("    task_desc->output_ptrs[0],");  // accepted_count
   code.e("    task_desc->output_ptrs[1]);"); // output_tokens
