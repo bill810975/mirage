@@ -2025,6 +2025,81 @@ int TaskRegister::register_paged_mla_sm100_task(
   return register_task_variant(TASK_PAGED_MLA_SM100, code.to_string());
 }
 
+int TaskRegister::register_mtp_verify_strict_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  // params[0]: num_draft_tokens (1-7)
+  assert(params.size() == 1);
+  int num_draft = params[0];
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e("kernel::target_verify_strict_kernel<$>(", num_draft);
+  code.e("    task_desc->input_ptrs[0],");   // draft_token_ids
+  code.e("    task_desc->input_ptrs[1],");   // target_token_ids
+  code.e("    task_desc->output_ptrs[0],");  // accepted_count
+  code.e("    task_desc->output_ptrs[1]);"); // output_tokens
+  return register_task_variant(TASK_MTP_VERIFY_STRICT, code.to_string());
+}
+
+int TaskRegister::register_mtp_verify_probabilistic_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  // params[0]: num_draft_tokens (1-7)
+  // params[1]: vocab_size
+  assert(params.size() == 2);
+  int num_draft = params[0];
+  int vocab_size = params[1];
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e("kernel::target_verify_probabilistic_kernel<$, $>(",
+         num_draft, vocab_size);
+  code.e("    task_desc->input_ptrs[0],");   // draft_token_ids
+  code.e("    task_desc->input_ptrs[1],");   // target_logits
+  code.e("    task_desc->input_ptrs[2],");   // draft_logits
+  code.e("    task_desc->input_ptrs[3],");   // temperature
+  code.e("    task_desc->input_ptrs[4],");   // seed
+  code.e("    task_desc->output_ptrs[0],");  // accepted_count
+  code.e("    task_desc->output_ptrs[1]);"); // output_tokens
+  return register_task_variant(TASK_MTP_VERIFY_PROBABILISTIC, code.to_string());
+}
+
+int TaskRegister::register_mtp_verify_synthetic_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  // params[0]: num_draft_tokens (1-7)
+  assert(params.size() == 1);
+  int num_draft = params[0];
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e("kernel::target_verify_synthetic_kernel<$>(", num_draft);
+  code.e("    task_desc->input_ptrs[0],");   // draft_token_ids
+  code.e("    task_desc->input_ptrs[1],");   // target_token_ids
+  code.e("    task_desc->input_ptrs[2],");   // base_rate
+  code.e("    task_desc->input_ptrs[3],");   // decay
+  code.e("    task_desc->input_ptrs[4],");   // seed
+  code.e("    task_desc->output_ptrs[0],");  // accepted_count
+  code.e("    task_desc->output_ptrs[1]);"); // output_tokens
+  return register_task_variant(TASK_MTP_VERIFY_SYNTHETIC, code.to_string());
+}
+
+int TaskRegister::register_mtp_accept_commit_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  // params[0]: num_draft_tokens (1-7)
+  assert(params.size() == 1);
+  int num_draft = params[0];
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e("kernel::mtp_accept_commit_kernel<$>(", num_draft);
+  code.e("    task_desc->input_ptrs[0],");   // accepted_count
+  code.e("    task_desc->input_ptrs[1],");   // output_tokens
+  code.e("    task_desc->input_ptrs[2],");   // current_position
+  code.e("    task_desc->output_ptrs[0],");  // new_position
+  code.e("    task_desc->output_ptrs[1],");  // final_output
+  code.e("    task_desc->output_ptrs[2]);"); // num_new_tokens
+  return register_task_variant(TASK_MTP_ACCEPT_COMMIT, code.to_string());
+}
+
 int TaskRegister::register_argmax_partial_sm100_task(
     threadblock::Graph const &bgraph, std::vector<int> const &params) {
   // params[0]: num_partial_tasks

@@ -665,6 +665,26 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
         customized->bgraph, params);
     task_config[op] =
         std::make_tuple(3, 1, TASK_PAGED_MLA_SM100, variant_id);
+  } else if (name == "mtp_verify_strict") {
+    int variant_id = task_register->register_mtp_verify_strict_task(
+        customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(2, 2, TASK_MTP_VERIFY_STRICT, variant_id);
+  } else if (name == "mtp_verify_probabilistic") {
+    int variant_id = task_register->register_mtp_verify_probabilistic_task(
+        customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(5, 2, TASK_MTP_VERIFY_PROBABILISTIC, variant_id);
+  } else if (name == "mtp_verify_synthetic") {
+    int variant_id = task_register->register_mtp_verify_synthetic_task(
+        customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(5, 2, TASK_MTP_VERIFY_SYNTHETIC, variant_id);
+  } else if (name == "mtp_accept_commit") {
+    int variant_id = task_register->register_mtp_accept_commit_task(
+        customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(3, 3, TASK_MTP_ACCEPT_COMMIT, variant_id);
   }
   // Multi-GPU tasks
   else if (name == "nvshmem_allgather_strided_put") {

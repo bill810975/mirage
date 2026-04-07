@@ -120,6 +120,15 @@ public:
       threadblock::Graph const &bgraph, std::vector<int> const &params);
   int register_paged_mla_sm100_task(threadblock::Graph const &bgraph,
                                     std::vector<int> const &params);
+  // MTP verification tasks
+  int register_mtp_verify_strict_task(threadblock::Graph const &bgraph,
+                                      std::vector<int> const &params);
+  int register_mtp_verify_probabilistic_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
+  int register_mtp_verify_synthetic_task(threadblock::Graph const &bgraph,
+                                         std::vector<int> const &params);
+  int register_mtp_accept_commit_task(threadblock::Graph const &bgraph,
+                                      std::vector<int> const &params);
   // SM100 tasks end
   // Multi-GPU tasks
   int register_nvshmem_allgather_strided_put_task(
