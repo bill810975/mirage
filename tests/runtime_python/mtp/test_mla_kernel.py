@@ -127,12 +127,15 @@ def test_single_request_single_token():
     # Run kernel
     # Make copies for reference (since cache is modified in-place)
     cache_ref = cache.clone()
+    # Split kv_new into c_latent (512) and k_pe (64) for the kernel
+    c_latent_new = kv_new[:, :V_HEAD_DIM].contiguous()
+    k_pe_new = kv_new[:, V_HEAD_DIM:].contiguous()
     test_mla_kernel.mla_attention(
-        q, cache, kv_new, output_kernel,
+        q, cache, c_latent_new, k_pe_new, output_kernel,
         qo_indptr, kv_indptr, kv_indices, kv_last_page_len, 1
     )
 
-    # Run reference
+    # Run reference (still uses combined kv_new)
     output_ref = paged_mla_attention_ref(
         q, cache_ref, kv_new,
         qo_indptr.cpu(), kv_indptr.cpu(), kv_indices.cpu(), kv_last_page_len.cpu()
