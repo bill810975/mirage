@@ -45,7 +45,8 @@ template <typename T,
 __device__ __forceinline__ void mla_paged_attention_sm100_task_impl(
     void const *q_nope_pe_ptr,
     void *ckv_kpe_cache_ptr,
-    void const *kv_new_ptr,
+    void const *c_latent_new_ptr,
+    void const *k_pe_new_ptr,
     void *output_ptr,
     int const *qo_indptr_buffer_ptr,
     int const *paged_kv_indptr_buffer_ptr,
@@ -54,6 +55,7 @@ __device__ __forceinline__ void mla_paged_attention_sm100_task_impl(
     int16_t request_id) {
 
   constexpr int BARRIER_ID = 6;
+  constexpr int ROPE_DIM = QK_HEAD_DIM - V_HEAD_DIM;
   cutlass::arch::NamedBarrier barrier(NUM_THREADS, BARRIER_ID);
 
   if (threadIdx.x >= NUM_THREADS) {
@@ -88,14 +90,18 @@ __device__ __forceinline__ void mla_paged_attention_sm100_task_impl(
   // Pointers
   T const *__restrict__ d_q =
       reinterpret_cast<T const *>(q_nope_pe_ptr) + first_token * Q_STRIDE;
-  T const *__restrict__ d_kv_new =
-      reinterpret_cast<T const *>(kv_new_ptr) + first_token * QK_HEAD_DIM;
+  T const *__restrict__ d_c_latent_new =
+      reinterpret_cast<T const *>(c_latent_new_ptr) + first_token * V_HEAD_DIM;
+  T const *__restrict__ d_k_pe_new =
+      reinterpret_cast<T const *>(k_pe_new_ptr) + first_token * ROPE_DIM;
   T *__restrict__ d_cache = reinterpret_cast<T *>(ckv_kpe_cache_ptr);
   T *__restrict__ d_output =
       reinterpret_cast<T *>(output_ptr) + first_token * O_STRIDE;
 
   // Phase 1: Write new KV entries to cache
-  // New tokens go to positions [seq_len - num_tokens, seq_len)
+  // Combine c_latent (V_HEAD_DIM=512) and k_pe (ROPE_DIM=64) into cache
+  // Cache layout: [page_idx * PAGE_SIZE + page_off, QK_HEAD_DIM]
+  //   = [c_latent(0..V_HEAD_DIM-1), k_pe(V_HEAD_DIM..QK_HEAD_DIM-1)]
   for (int idx = threadIdx.x; idx < num_tokens * QK_HEAD_DIM;
        idx += NUM_THREADS) {
     int t = idx / QK_HEAD_DIM;
@@ -103,8 +109,13 @@ __device__ __forceinline__ void mla_paged_attention_sm100_task_impl(
     int cache_pos = seq_len - num_tokens + t;
     int page_idx = s_page_indices[cache_pos / PAGE_SIZE];
     int page_off = cache_pos % PAGE_SIZE;
-    d_cache[(page_idx * PAGE_SIZE + page_off) * QK_HEAD_DIM + d] =
-        d_kv_new[t * QK_HEAD_DIM + d];
+    T val;
+    if (d < V_HEAD_DIM) {
+      val = d_c_latent_new[t * V_HEAD_DIM + d];
+    } else {
+      val = d_k_pe_new[t * ROPE_DIM + (d - V_HEAD_DIM)];
+    }
+    d_cache[(page_idx * PAGE_SIZE + page_off) * QK_HEAD_DIM + d] = val;
   }
   barrier.arrive_and_wait();
 

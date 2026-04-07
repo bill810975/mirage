@@ -672,50 +672,50 @@ class PersistentKernel:
         self,
         q_nope_pe: DTensor,       # [num_tokens, num_q_heads * qk_head_dim]
         ckv_kpe_cache: DTensor,   # [num_pages, page_size, qk_head_dim]
-        kv_new: DTensor,          # [num_tokens, qk_head_dim] — new KV to write to cache
+        c_latent_new: DTensor,    # [num_tokens, kv_lora_rank] — new c_latent (512d, normed)
+        k_pe_new: DTensor,        # [num_tokens, rope_dim] — new k_pe (64d)
         output: DTensor,          # [num_tokens, num_q_heads * v_head_dim]
         grid_dim: tuple,
         block_dim: tuple,
         num_q_heads: int,         # per GPU (e.g., 16 for 8-GPU TP with 128 total heads)
         qk_head_dim: int = 576,   # 512 latent + 64 rope
-        v_head_dim: int = 512,    # latent dim only
+        v_head_dim: int = 512,    # latent dim only (= kv_lora_rank)
     ):
-        # MLA (Multi-head Latent Attention) for DeepSeek V3
-        # Blackwell-only for now
+        """MLA (Multi-head Latent Attention) for DeepSeek V3.
+
+        Takes separate c_latent and k_pe inputs (to allow kv_a_layernorm
+        on c_latent only). The kernel combines them into a 576-dim entry
+        and writes to the paged KV cache before computing attention.
+        """
         assert self.target_cc == 100, (
             f"paged_mla_layer is only supported on SM100 (Blackwell), "
             f"but target_cc={self.target_cc}"
         )
-        assert q_nope_pe.num_dims == 2  # (num_tokens, num_q_heads * qk_head_dim)
-        assert ckv_kpe_cache.num_dims == 3  # (num_pages, page_size, qk_head_dim)
+        rope_dim = qk_head_dim - v_head_dim
+        assert q_nope_pe.num_dims == 2
+        assert ckv_kpe_cache.num_dims == 3
         assert ckv_kpe_cache.dim(0) == self.max_num_pages
         assert ckv_kpe_cache.dim(1) == self.page_size
         assert ckv_kpe_cache.dim(2) == qk_head_dim
-        assert kv_new.num_dims == 2  # (num_tokens, qk_head_dim)
-        assert kv_new.dim(1) == qk_head_dim
-        assert output.num_dims == 2  # (num_tokens, num_q_heads * v_head_dim)
+        assert c_latent_new.num_dims == 2
+        assert c_latent_new.dim(1) == v_head_dim
+        assert k_pe_new.num_dims == 2
+        assert k_pe_new.dim(1) == rope_dim
+        assert output.num_dims == 2
         assert output.dim(1) == num_q_heads * v_head_dim
 
-        # params[0]: num_q_heads
-        # params[1]: qk_head_dim
-        # params[2]: v_head_dim
-        # params[3]: max_seq_len
-        # params[4]: page_size
+        # params: num_q_heads, qk_head_dim, v_head_dim, max_seq_len, page_size
         params = [num_q_heads, qk_head_dim, v_head_dim, self.max_seq_length, self.page_size]
 
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         assert grid_dim[0] == self.max_num_batched_requests
         tb_graph.new_input(q_nope_pe, (-1, 1, -1), -1, True)
         tb_graph.new_input(ckv_kpe_cache, (-1, 2, -1), 1, True)
-        tb_graph.new_input(kv_new, (-1, 1, -1), -1, True)
+        tb_graph.new_input(c_latent_new, (-1, 1, -1), -1, True)
+        tb_graph.new_input(k_pe_new, (-1, 1, -1), -1, True)
         tb_graph.new_input(output, (-1, 1, -1), -1, True)
         self.kn_graph.customized(
-            [
-                q_nope_pe,
-                ckv_kpe_cache,
-                kv_new,
-                output,
-            ],
+            [q_nope_pe, ckv_kpe_cache, c_latent_new, k_pe_new, output],
             tb_graph,
         )
         self.kn_graph.register_task(tb_graph, "paged_mla_sm100", params)
@@ -1347,6 +1347,118 @@ class PersistentKernel:
         self.kn_graph.customized([spec_tokens, target_tokens, output], tb_graph)
         self.kn_graph.register_task(tb_graph, "target_verify_greedy")
         
+    def mtp_verify_strict_layer(
+        self,
+        draft_token_ids: DTensor,   # [batch, num_draft_tokens]
+        target_token_ids: DTensor,  # [batch, num_draft_tokens + 1]
+        accepted_count: DTensor,    # [batch, 1] int32 output
+        output_tokens: DTensor,     # [batch, num_draft_tokens + 1] int64 output
+        grid_dim: tuple,
+        block_dim: tuple,
+        num_draft_tokens: int,
+    ):
+        """Strict MTP verification: accept while draft == target argmax."""
+        params = [num_draft_tokens]
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(draft_token_ids, (-1, -1, -1), -1, True)
+        tb_graph.new_input(target_token_ids, (-1, -1, -1), -1, True)
+        tb_graph.new_input(accepted_count, (-1, -1, -1), -1, True)
+        tb_graph.new_input(output_tokens, (-1, -1, -1), -1, True)
+        self.kn_graph.customized(
+            [draft_token_ids, target_token_ids, accepted_count, output_tokens],
+            tb_graph,
+        )
+        self.kn_graph.register_task(tb_graph, "mtp_verify_strict", params)
+
+    def mtp_verify_probabilistic_layer(
+        self,
+        draft_token_ids: DTensor,  # [batch, num_draft_tokens]
+        target_logits: DTensor,    # [batch, (num_draft+1) * vocab_size]
+        draft_logits: DTensor,     # [batch, num_draft * vocab_size]
+        temperature: DTensor,      # [batch, 1]
+        seed: DTensor,             # [batch, 1]
+        accepted_count: DTensor,   # [batch, 1] output
+        output_tokens: DTensor,    # [batch, num_draft_tokens + 1] output
+        grid_dim: tuple,
+        block_dim: tuple,
+        num_draft_tokens: int,
+        vocab_size: int,
+    ):
+        """Probabilistic MTP verification: P_target > u * P_draft."""
+        params = [num_draft_tokens, vocab_size]
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(draft_token_ids, (-1, -1, -1), -1, True)
+        tb_graph.new_input(target_logits, (-1, -1, -1), -1, True)
+        tb_graph.new_input(draft_logits, (-1, -1, -1), -1, True)
+        tb_graph.new_input(temperature, (-1, -1, -1), -1, True)
+        tb_graph.new_input(seed, (-1, -1, -1), -1, True)
+        tb_graph.new_input(accepted_count, (-1, -1, -1), -1, True)
+        tb_graph.new_input(output_tokens, (-1, -1, -1), -1, True)
+        self.kn_graph.customized(
+            [draft_token_ids, target_logits, draft_logits, temperature, seed,
+             accepted_count, output_tokens],
+            tb_graph,
+        )
+        self.kn_graph.register_task(tb_graph, "mtp_verify_probabilistic", params)
+
+    def mtp_verify_synthetic_layer(
+        self,
+        draft_token_ids: DTensor,   # [batch, num_draft_tokens]
+        target_token_ids: DTensor,  # [batch, num_draft_tokens + 1]
+        base_rate: DTensor,         # [1]
+        decay: DTensor,             # [1]
+        seed: DTensor,              # [batch, 1]
+        accepted_count: DTensor,    # [batch, 1] output
+        output_tokens: DTensor,     # [batch, num_draft_tokens + 1] output
+        grid_dim: tuple,
+        block_dim: tuple,
+        num_draft_tokens: int,
+    ):
+        """Synthetic MTP verification: position-dependent decay acceptance."""
+        params = [num_draft_tokens]
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(draft_token_ids, (-1, -1, -1), -1, True)
+        tb_graph.new_input(target_token_ids, (-1, -1, -1), -1, True)
+        tb_graph.new_input(base_rate, (-1, -1, -1), -1, True)
+        tb_graph.new_input(decay, (-1, -1, -1), -1, True)
+        tb_graph.new_input(seed, (-1, -1, -1), -1, True)
+        tb_graph.new_input(accepted_count, (-1, -1, -1), -1, True)
+        tb_graph.new_input(output_tokens, (-1, -1, -1), -1, True)
+        self.kn_graph.customized(
+            [draft_token_ids, target_token_ids, base_rate, decay, seed,
+             accepted_count, output_tokens],
+            tb_graph,
+        )
+        self.kn_graph.register_task(tb_graph, "mtp_verify_synthetic", params)
+
+    def mtp_accept_commit_layer(
+        self,
+        accepted_count: DTensor,     # [batch, 1]
+        output_tokens: DTensor,      # [batch, num_draft_tokens + 1]
+        current_position: DTensor,   # [batch, 1]
+        new_position: DTensor,       # [batch, 1] output
+        final_output: DTensor,       # [batch, num_draft_tokens + 1] output
+        num_new_tokens: DTensor,     # [batch, 1] output
+        grid_dim: tuple,
+        block_dim: tuple,
+        num_draft_tokens: int,
+    ):
+        """Accept/commit after MTP verification."""
+        params = [num_draft_tokens]
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(accepted_count, (-1, -1, -1), -1, True)
+        tb_graph.new_input(output_tokens, (-1, -1, -1), -1, True)
+        tb_graph.new_input(current_position, (-1, -1, -1), -1, True)
+        tb_graph.new_input(new_position, (-1, -1, -1), -1, True)
+        tb_graph.new_input(final_output, (-1, -1, -1), -1, True)
+        tb_graph.new_input(num_new_tokens, (-1, -1, -1), -1, True)
+        self.kn_graph.customized(
+            [accepted_count, output_tokens, current_position,
+             new_position, final_output, num_new_tokens],
+            tb_graph,
+        )
+        self.kn_graph.register_task(tb_graph, "mtp_accept_commit", params)
+
     def prompt_lookup_verify_handler(
         self,
         spec_decode_config: SpecDecodeConfig,

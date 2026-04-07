@@ -109,11 +109,26 @@ class DeepSeekV3Builder(GraphBuilder):
             name="q_nope_pe",
             io_category="cuda_tensor",
         )
-        # kv_a output: [batch, kv_lora_rank + qk_rope_dim] = [batch, 576]
-        self.kv_a_out = self.mpk.new_tensor(
-            dims=(mbt, self.qk_head_dim),
+        # kv_a output split: c_latent [batch, 512] and k_pe [batch, 64]
+        # We use two separate linear layers instead of one 576-dim output,
+        # so we can apply kv_a_layernorm to c_latent only.
+        self.c_latent_out = self.mpk.new_tensor(
+            dims=(mbt, self.kv_lora_rank),  # [batch, 512]
             dtype=bfloat16,
-            name="kv_a_out",
+            name="c_latent_out",
+            io_category="cuda_tensor",
+        )
+        self.k_pe_out = self.mpk.new_tensor(
+            dims=(mbt, QK_ROPE_HEAD_DIM),  # [batch, 64]
+            dtype=bfloat16,
+            name="k_pe_out",
+            io_category="cuda_tensor",
+        )
+        # Combined KV entry after layernorm: [batch, 576]
+        self.kv_combined = self.mpk.new_tensor(
+            dims=(mbt, self.qk_head_dim),  # [batch, 576]
+            dtype=bfloat16,
+            name="kv_combined",
             io_category="cuda_tensor",
         )
         # Attention output: [batch, num_local_q_heads * v_head_dim]
@@ -233,32 +248,52 @@ class DeepSeekV3Builder(GraphBuilder):
             block_dim=(128, 1, 1),
         )
 
-        # Step 4: kv_a_proj_with_mqa (produces compressed KV + rope)
-        # Output: [batch, 576] = [c_latent(512), k_pe(64)]
-        w_kv_a = self.mpk.attach_input(
-            torch_tensor=state_dict[f"{prefix}self_attn.kv_a_proj_with_mqa.weight"],
-            name=f"layer_{layer_idx}_kv_a_proj",
+        # Step 4: kv_a_proj split into c_latent and k_pe
+        # The HF weight kv_a_proj_with_mqa has shape [576, hidden_size].
+        # We split it: first 512 rows → c_latent, last 64 rows → k_pe.
+        # This allows applying kv_a_layernorm to c_latent only.
+        kv_a_full_weight = state_dict[f"{prefix}self_attn.kv_a_proj_with_mqa.weight"]
+        w_kv_a_latent = self.mpk.attach_input(
+            torch_tensor=kv_a_full_weight[:self.kv_lora_rank].contiguous(),
+            name=f"layer_{layer_idx}_kv_a_latent_proj",
         )
+        w_kv_a_rope = self.mpk.attach_input(
+            torch_tensor=kv_a_full_weight[self.kv_lora_rank:].contiguous(),
+            name=f"layer_{layer_idx}_kv_a_rope_proj",
+        )
+        # c_latent = rmsnorm_out @ w_kv_a_latent^T → [batch, 512]
         self.mpk.linear_layer(
             input=self.rmsnorm_out,
-            weight=w_kv_a,
-            output=self.kv_a_out,
-            grid_dim=(grid_for_rmsnorm_linear_layer(w_kv_a.dim(0)), 1, 1),
+            weight=w_kv_a_latent,
+            output=self.c_latent_out,
+            grid_dim=(grid_for_rmsnorm_linear_layer(w_kv_a_latent.dim(0)), 1, 1),
+            block_dim=(128, 1, 1),
+        )
+        # k_pe = rmsnorm_out @ w_kv_a_rope^T → [batch, 64]
+        self.mpk.linear_layer(
+            input=self.rmsnorm_out,
+            weight=w_kv_a_rope,
+            output=self.k_pe_out,
+            grid_dim=(grid_for_rmsnorm_linear_layer(w_kv_a_rope.dim(0)), 1, 1),
             block_dim=(128, 1, 1),
         )
 
-        # Step 5: kv_a_layernorm on c_latent part
-        # NOTE: In DeepSeek V3, layernorm is applied only to the c_latent (512) part,
-        # not the k_pe (64) part. For simplicity in the initial implementation,
-        # we apply it to the full 576-dim output. This may need refinement.
+        # Step 5: kv_a_layernorm on c_latent ONLY (512 dims)
         w_kv_a_ln = self.mpk.attach_input(
             torch_tensor=state_dict[f"{prefix}self_attn.kv_a_layernorm.weight"],
             name=f"layer_{layer_idx}_kv_a_layernorm",
         )
-        # TODO: Apply layernorm only to first 512 dims. For now, skip or apply to all.
-        # This is a known simplification.
+        self.mpk.rmsnorm_layer(
+            input=self.c_latent_out,
+            weight=w_kv_a_ln,
+            output=self.c_latent_out,  # in-place
+            grid_dim=(self.max_num_batched_tokens, 1, 1),
+            block_dim=(128, 1, 1),
+        )
 
         # Step 6: MLA paged attention
+        # Pass c_latent and k_pe as separate inputs.
+        # The kernel combines them into a 576-dim entry and writes to cache.
         cache = self.mpk.attach_input(
             torch_tensor=self.ckv_kpe_cache[layer_idx],
             name=f"layer_{layer_idx}_ckv_kpe_cache",
@@ -266,7 +301,8 @@ class DeepSeekV3Builder(GraphBuilder):
         self.mpk.paged_mla_layer(
             q_nope_pe=self.q_nope_pe,
             ckv_kpe_cache=cache,
-            kv_new=self.kv_a_out,
+            c_latent_new=self.c_latent_out,
+            k_pe_new=self.k_pe_out,
             output=self.attn_out,
             grid_dim=(self.mpk.max_num_batched_requests, 1, 1),
             block_dim=(128, 1, 1),

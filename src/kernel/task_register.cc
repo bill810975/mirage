@@ -1985,7 +1985,7 @@ int TaskRegister::register_paged_mla_sm100_task(
 
   std::vector<tb::TBInputOp *> input_ops;
   std::vector<tb::TBInputOp *> output_ops;
-  int num_inputs = 3;
+  int num_inputs = 4;
   int num_outputs = 1;
 
   assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
@@ -2013,10 +2013,11 @@ int TaskRegister::register_paged_mla_sm100_task(
          v_head_dim,
          max_seq_len,
          page_size);
-  code.e("    task_desc->input_ptrs[0],");
-  code.e("    task_desc->input_ptrs[1],");
-  code.e("    task_desc->input_ptrs[2],");
-  code.e("    task_desc->output_ptrs[0],");
+  code.e("    task_desc->input_ptrs[0],");   // q_nope_pe
+  code.e("    task_desc->input_ptrs[1],");   // ckv_kpe_cache
+  code.e("    task_desc->input_ptrs[2],");   // c_latent_new
+  code.e("    task_desc->input_ptrs[3],");   // k_pe_new
+  code.e("    task_desc->output_ptrs[0],");  // output
   code.e("    runtime_config.qo_indptr_buffer,");
   code.e("    runtime_config.paged_kv_indptr_buffer,");
   code.e("    runtime_config.paged_kv_indices_buffer,");
