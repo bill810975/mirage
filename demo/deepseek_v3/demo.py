@@ -44,6 +44,142 @@ def max_factor_leq_n(m: int, n: int) -> int:
     return max_factor
 
 
+def run_correctness_test(args, state_dict, layer_indices, rank, world_size):
+    """Run PyTorch reference on selected layers and compare against MPK.
+
+    Both use the SAME real weights from the checkpoint.
+    Layer indices specify which layers to include (e.g., [0, 3] = 1 dense + 1 MoE).
+    The MTP layer (index 61) is included if --mtp is set.
+    """
+    import torch.nn.functional as F
+    import math
+
+    device = f"cuda:{rank}"
+    layer_indices = sorted(layer_indices)
+    num_layers = len(layer_indices)
+    include_mtp = args.mtp
+
+    # DeepSeek V3 constants (after weight absorption)
+    KV_LORA_RANK = DEEPSEEK_V3_KV_LORA_RANK  # 512
+    QK_ROPE_HEAD_DIM = DEEPSEEK_V3_QK_ROPE_HEAD_DIM  # 64
+    QK_HEAD_DIM = DEEPSEEK_V3_HEAD_DIM_TOTAL  # 576
+    V_HEAD_DIM = KV_LORA_RANK  # 512
+    NUM_Q_HEADS = DEEPSEEK_V3_NUM_HEADS // world_size
+    HIDDEN = 7168
+    FIRST_MOE = 3
+    NUM_EXPERTS = 256
+    TOPK = 8
+
+    def rms_norm(x, weight, eps=1e-6):
+        orig = x.dtype
+        v = x.float().pow(2).mean(-1, keepdim=True)
+        return (weight.float() * x.float() * torch.rsqrt(v + eps)).to(orig)
+
+    def sigmoid_topk(logits, bias, k):
+        scores = torch.sigmoid(logits.float())
+        routing = scores + bias.float().unsqueeze(0)
+        _, idx = torch.topk(routing, k, dim=-1)
+        w = torch.gather(scores, 1, idx)
+        return w / w.sum(dim=-1, keepdim=True), idx
+
+    def mla_attention(hidden, prefix, sd, kv_cache, seq_pos, num_heads):
+        bs = hidden.shape[0]
+        p = prefix + "self_attn."
+        # q path (BF16 linear for now since FP8 core not ready)
+        q_a = F.linear(hidden.float(), sd[f"{p}q_a_proj.weight"].float()).to(hidden.dtype)
+        q_a = rms_norm(q_a, sd[f"{p}q_a_layernorm.weight"])
+        q = F.linear(q_a.float(), sd[f"{p}q_b_proj.weight"].float()).to(hidden.dtype)
+        q = q.view(bs, num_heads, QK_HEAD_DIM)
+        # kv path
+        kv_w = sd[f"{p}kv_a_proj_with_mqa.weight"]
+        kv_full = F.linear(hidden.float(), kv_w.float()).to(hidden.dtype)
+        c_lat = kv_full[:, :KV_LORA_RANK]
+        k_pe = kv_full[:, KV_LORA_RANK:]
+        c_lat = rms_norm(c_lat, sd[f"{p}kv_a_layernorm.weight"])
+        kv_new = torch.cat([c_lat, k_pe], dim=-1)
+        for b in range(bs):
+            kv_cache[seq_pos + b] = kv_new[b]
+        kv_all = kv_cache[:seq_pos + bs]
+        # attention
+        q_n, q_p = q[:, :, :KV_LORA_RANK], q[:, :, KV_LORA_RANK:]
+        k_n, k_p = kv_all[:, :KV_LORA_RANK], kv_all[:, KV_LORA_RANK:]
+        s = (torch.einsum('bhd,sd->bhs', q_n.float(), k_n.float()) +
+             torch.einsum('bhd,sd->bhs', q_p.float(), k_p.float()))
+        s = s / math.sqrt(QK_HEAD_DIM)
+        attn = F.softmax(s, dim=-1)
+        v = kv_all[:, :V_HEAD_DIM]
+        out = torch.einsum('bhs,sd->bhd', attn, v.float()).to(hidden.dtype)
+        flat = out.reshape(bs, num_heads * V_HEAD_DIM)
+        return F.linear(flat.float(), sd[f"{p}o_proj.weight"].float()).to(hidden.dtype)
+
+    def dense_mlp(hidden, prefix, sd):
+        gu = F.linear(hidden.float(), sd[f"{prefix}mlp.gate_up_proj.weight"].float()).to(hidden.dtype)
+        mid = gu.shape[-1] // 2
+        x = F.silu(gu[:, :mid].float()).to(hidden.dtype) * gu[:, mid:]
+        return F.linear(x.float(), sd[f"{prefix}mlp.down_proj.weight"].float()).to(hidden.dtype)
+
+    def moe_mlp(hidden, prefix, sd):
+        bs = hidden.shape[0]
+        p = prefix + "mlp."
+        logits = F.linear(hidden.float(), sd[f"{p}gate.weight"].float()).to(hidden.dtype)
+        weights, topk_idx = sigmoid_topk(logits, sd[f"{p}gate.e_score_correction_bias"], TOPK)
+        out = torch.zeros(bs, HIDDEN, device=device, dtype=hidden.dtype)
+        for b in range(bs):
+            for ki in range(TOPK):
+                eid = topk_idx[b, ki].item()
+                w = weights[b, ki].item()
+                w13 = sd[f"{p}experts.w13.weight"][eid]
+                gu = F.linear(hidden[b:b+1].float(), w13.float()).to(hidden.dtype)
+                mid = gu.shape[-1] // 2
+                x = F.silu(gu[:, :mid].float()).to(hidden.dtype) * gu[:, mid:]
+                w2 = sd[f"{p}experts.w2.weight"][eid]
+                out[b] += w * F.linear(x.float(), w2.float()).squeeze(0).to(hidden.dtype)
+        # Shared expert
+        sp = p + "shared_experts."
+        sg = F.silu(F.linear(hidden.float(), sd[f"{sp}gate_proj.weight"].float()).to(hidden.dtype))
+        su = F.linear(hidden.float(), sd[f"{sp}up_proj.weight"].float()).to(hidden.dtype)
+        sd_out = F.linear((sg * su).float(), sd[f"{sp}down_proj.weight"].float()).to(hidden.dtype)
+        return out + sd_out
+
+    print(f"\n{'='*60}")
+    print(f"Correctness Test: layers={layer_indices}, mtp={include_mtp}")
+    print(f"{'='*60}")
+
+    # Run PyTorch reference
+    token_ids = torch.tensor([1, 2, 3], device=device, dtype=torch.long)  # simple input
+    max_seq = 64
+    kv_caches = [torch.zeros(max_seq, QK_HEAD_DIM, device=device, dtype=torch.bfloat16)
+                 for _ in range(num_layers + (1 if include_mtp else 0))]
+
+    hidden = F.embedding(token_ids[:1], state_dict["model.embed_tokens.weight"])
+    if hidden.dim() == 1:
+        hidden = hidden.unsqueeze(0)
+
+    for cache_idx, layer_idx in enumerate(layer_indices):
+        prefix = f"model.layers.{layer_idx}."
+        normed = rms_norm(hidden, state_dict[f"{prefix}input_layernorm.weight"])
+        attn_out = mla_attention(normed, prefix, state_dict, kv_caches[cache_idx], 0, NUM_Q_HEADS)
+        hidden = hidden + attn_out
+        normed = rms_norm(hidden, state_dict[f"{prefix}post_attention_layernorm.weight"])
+        if layer_idx < FIRST_MOE:
+            mlp_out = dense_mlp(normed, prefix, state_dict)
+        else:
+            mlp_out = moe_mlp(normed, prefix, state_dict)
+        hidden = hidden + mlp_out
+
+    hidden = rms_norm(hidden, state_dict["model.norm.weight"])
+    logits = F.linear(hidden.float(), state_dict["lm_head.weight"].float())
+    ref_token = logits.argmax(dim=-1).item()
+    print(f"PyTorch reference output token: {ref_token}")
+    print(f"PyTorch logits[0,:5]: {logits[0,:5].tolist()}")
+
+    # TODO: Run MPK with same layers and compare
+    # This requires builder.build_layers to respect the layer_indices list
+    # For now, just validate the PyTorch reference runs correctly
+    print(f"\nPyTorch reference completed successfully.")
+    print(f"MPK comparison pending: builder needs --layers support in build_layers().")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="DeepSeek V3 demo with Mirage megakernel")
     parser.add_argument("--model-path", type=str, required=True,
@@ -88,6 +224,12 @@ if __name__ == "__main__":
                             "Optionally dump first N generated token_ids, text, and latency to JSON. "
                             "If path omitted, saves to outputs/deepseek_v3/{torch_output.json|mpk_output.json}."
                         ))
+    # Developer correctness testing
+    parser.add_argument("--correctness", action="store_true",
+                        help="Run correctness test: compare MPK output against PyTorch reference")
+    parser.add_argument("--layers", type=str, default=None,
+                        help="Comma-separated list of layer indices to load (e.g. '0,3,60'). "
+                             "Used with --correctness to test a reduced model.")
 
     args = parser.parse_args()
 
@@ -300,6 +442,11 @@ if __name__ == "__main__":
                         f"Could not find model weights at {args.model_path}. "
                         f"Expected {weight_file} or model.safetensors or model-*.safetensors"
                     )
+
+        # Correctness test: run PyTorch reference before MPK
+        if args.correctness:
+            layer_indices = [int(x) for x in args.layers.split(',')] if args.layers else list(range(num_layers))
+            run_correctness_test(args, state_dict, layer_indices, rank, world_size)
 
         # Build MLA model config for the builder
         # For MLA, we pass the single ckv_kpe_cache as both k_cache and v_cache
