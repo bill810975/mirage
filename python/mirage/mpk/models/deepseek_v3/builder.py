@@ -255,166 +255,122 @@ class DeepSeekV3Builder(GraphBuilder):
             io_category="cuda_tensor",
         )
 
+    def _attach_fp8_weight(self, state_dict, key, name):
+        """Attach FP8 weight + its packed UE8M0 scale_inv."""
+        w = self.mpk.attach_input(
+            torch_tensor=state_dict[key], name=name)
+        s = self.mpk.attach_input(
+            torch_tensor=state_dict[f"{key}_scale_inv"], name=f"{name}_scale")
+        return w, s
+
     def _build_mla_attention_layer(self, layer_idx: int, state_dict: dict):
-        """Build MLA attention for one decoder layer.
-
-        After weight absorption, the MLA attention uses:
-        - q_a_proj: [hidden, q_lora_rank] → compress Q
-        - q_a_layernorm: [q_lora_rank] → normalize
-        - q_b_proj_absorbed: [q_lora_rank, num_q_heads * qk_head_dim] → Q with absorbed KV
-        - kv_a_proj_with_mqa: [hidden, 576] → compressed KV + rope
-        - kv_a_layernorm: [kv_lora_rank] → normalize c_latent part
-        """
+        """Build MLA attention for one decoder layer (FP8 weights)."""
         prefix = f"model.layers.{layer_idx}."
+        attn = f"{prefix}self_attn."
 
-        # Step 1: q_a_proj
-        w_q_a = self.mpk.attach_input(
-            torch_tensor=state_dict[f"{prefix}self_attn.q_a_proj.weight"],
-            name=f"layer_{layer_idx}_q_a_proj",
-        )
-        self.mpk.linear_layer(
-            input=self.rmsnorm_out,
-            weight=w_q_a,
-            output=self.q_a_out,
-            grid_dim=(grid_for_rmsnorm_linear_layer(w_q_a.dim(0)), 1, 1),
-            block_dim=(128, 1, 1),
-        )
+        # Step 1: q_a_proj (FP8)
+        w_q_a, s_q_a = self._attach_fp8_weight(
+            state_dict, f"{attn}q_a_proj.weight", f"layer_{layer_idx}_q_a_proj")
+        self._fp8_linear(self.rmsnorm_out, w_q_a, s_q_a, self.q_a_out,
+                         grid_dim=(grid_for_rmsnorm_linear_layer(w_q_a.dim(0)), 1, 1),
+                         block_dim=(128, 1, 1))
 
-        # Step 2: q_a_layernorm
+        # Step 2: q_a_layernorm (BF16 norm weight)
         w_q_a_ln = self.mpk.attach_input(
-            torch_tensor=state_dict[f"{prefix}self_attn.q_a_layernorm.weight"],
-            name=f"layer_{layer_idx}_q_a_layernorm",
-        )
+            torch_tensor=state_dict[f"{attn}q_a_layernorm.weight"],
+            name=f"layer_{layer_idx}_q_a_layernorm")
         self.mpk.rmsnorm_layer(
-            input=self.q_a_out,
-            weight=w_q_a_ln,
-            output=self.q_a_out,  # in-place
-            grid_dim=(self.max_num_batched_tokens, 1, 1),
-            block_dim=(128, 1, 1),
+            input=self.q_a_out, weight=w_q_a_ln, output=self.q_a_out,
+            grid_dim=(self.max_num_batched_tokens, 1, 1), block_dim=(128, 1, 1))
+
+        # Step 3: q_b_proj absorbed (FP8)
+        w_q_b, s_q_b = self._attach_fp8_weight(
+            state_dict, f"{attn}q_b_proj.weight", f"layer_{layer_idx}_q_b_proj")
+        self._fp8_linear(self.q_a_out, w_q_b, s_q_b, self.q_nope_pe,
+                         grid_dim=(grid_for_rmsnorm_linear_layer(w_q_b.dim(0)), 1, 1),
+                         block_dim=(128, 1, 1))
+
+        # Step 4: kv_a_proj split into c_latent and k_pe (FP8)
+        # Split the [576, hidden] weight into [512, hidden] and [64, hidden]
+        # Also split the scale_inv accordingly
+        kv_a_w = state_dict[f"{attn}kv_a_proj_with_mqa.weight"]
+        kv_a_s = state_dict[f"{attn}kv_a_proj_with_mqa.weight_scale_inv"]
+        # Determine scale row split based on output dim ratio
+        scale_rows_total = kv_a_s.shape[0]
+        latent_ratio = self.kv_lora_rank / (self.kv_lora_rank + QK_ROPE_HEAD_DIM)
+        scale_rows_latent = round(scale_rows_total * latent_ratio)
+
+        w_kv_latent, s_kv_latent = (
+            self.mpk.attach_input(
+                torch_tensor=kv_a_w[:self.kv_lora_rank].contiguous(),
+                name=f"layer_{layer_idx}_kv_a_latent"),
+            self.mpk.attach_input(
+                torch_tensor=kv_a_s[:scale_rows_latent].contiguous(),
+                name=f"layer_{layer_idx}_kv_a_latent_scale"),
+        )
+        w_kv_rope, s_kv_rope = (
+            self.mpk.attach_input(
+                torch_tensor=kv_a_w[self.kv_lora_rank:].contiguous(),
+                name=f"layer_{layer_idx}_kv_a_rope"),
+            self.mpk.attach_input(
+                torch_tensor=kv_a_s[scale_rows_latent:].contiguous(),
+                name=f"layer_{layer_idx}_kv_a_rope_scale"),
         )
 
-        # Step 3: q_b_proj (absorbed — includes kv_b_proj weight absorption)
-        # Output: [batch, num_local_q_heads * qk_head_dim]
-        w_q_b = self.mpk.attach_input(
-            torch_tensor=state_dict[f"{prefix}self_attn.q_b_proj.weight"],
-            name=f"layer_{layer_idx}_q_b_proj",
-        )
-        self.mpk.linear_layer(
-            input=self.q_a_out,
-            weight=w_q_b,
-            output=self.q_nope_pe,
-            grid_dim=(grid_for_rmsnorm_linear_layer(w_q_b.dim(0)), 1, 1),
-            block_dim=(128, 1, 1),
-        )
+        self._fp8_linear(self.rmsnorm_out, w_kv_latent, s_kv_latent, self.c_latent_out,
+                         grid_dim=(grid_for_rmsnorm_linear_layer(self.kv_lora_rank), 1, 1),
+                         block_dim=(128, 1, 1))
+        self._fp8_linear(self.rmsnorm_out, w_kv_rope, s_kv_rope, self.k_pe_out,
+                         grid_dim=(grid_for_rmsnorm_linear_layer(QK_ROPE_HEAD_DIM), 1, 1),
+                         block_dim=(128, 1, 1))
 
-        # Step 4: kv_a_proj split into c_latent and k_pe
-        # The HF weight kv_a_proj_with_mqa has shape [576, hidden_size].
-        # We split it: first 512 rows → c_latent, last 64 rows → k_pe.
-        # This allows applying kv_a_layernorm to c_latent only.
-        kv_a_full_weight = state_dict[f"{prefix}self_attn.kv_a_proj_with_mqa.weight"]
-        w_kv_a_latent = self.mpk.attach_input(
-            torch_tensor=kv_a_full_weight[:self.kv_lora_rank].contiguous(),
-            name=f"layer_{layer_idx}_kv_a_latent_proj",
-        )
-        w_kv_a_rope = self.mpk.attach_input(
-            torch_tensor=kv_a_full_weight[self.kv_lora_rank:].contiguous(),
-            name=f"layer_{layer_idx}_kv_a_rope_proj",
-        )
-        # c_latent = rmsnorm_out @ w_kv_a_latent^T → [batch, 512]
-        self.mpk.linear_layer(
-            input=self.rmsnorm_out,
-            weight=w_kv_a_latent,
-            output=self.c_latent_out,
-            grid_dim=(grid_for_rmsnorm_linear_layer(w_kv_a_latent.dim(0)), 1, 1),
-            block_dim=(128, 1, 1),
-        )
-        # k_pe = rmsnorm_out @ w_kv_a_rope^T → [batch, 64]
-        self.mpk.linear_layer(
-            input=self.rmsnorm_out,
-            weight=w_kv_a_rope,
-            output=self.k_pe_out,
-            grid_dim=(grid_for_rmsnorm_linear_layer(w_kv_a_rope.dim(0)), 1, 1),
-            block_dim=(128, 1, 1),
-        )
-
-        # Step 5: kv_a_layernorm on c_latent ONLY (512 dims)
+        # Step 5: kv_a_layernorm on c_latent ONLY
         w_kv_a_ln = self.mpk.attach_input(
-            torch_tensor=state_dict[f"{prefix}self_attn.kv_a_layernorm.weight"],
-            name=f"layer_{layer_idx}_kv_a_layernorm",
-        )
+            torch_tensor=state_dict[f"{attn}kv_a_layernorm.weight"],
+            name=f"layer_{layer_idx}_kv_a_layernorm")
         self.mpk.rmsnorm_layer(
-            input=self.c_latent_out,
-            weight=w_kv_a_ln,
-            output=self.c_latent_out,  # in-place
-            grid_dim=(self.max_num_batched_tokens, 1, 1),
-            block_dim=(128, 1, 1),
-        )
+            input=self.c_latent_out, weight=w_kv_a_ln, output=self.c_latent_out,
+            grid_dim=(self.max_num_batched_tokens, 1, 1), block_dim=(128, 1, 1))
 
         # Step 6: MLA paged attention
-        # Pass c_latent and k_pe as separate inputs.
-        # The kernel combines them into a 576-dim entry and writes to cache.
         cache = self.mpk.attach_input(
             torch_tensor=self.ckv_kpe_cache[layer_idx],
-            name=f"layer_{layer_idx}_ckv_kpe_cache",
-        )
+            name=f"layer_{layer_idx}_ckv_kpe_cache")
         self.mpk.paged_mla_layer(
-            q_nope_pe=self.q_nope_pe,
-            ckv_kpe_cache=cache,
-            c_latent_new=self.c_latent_out,
-            k_pe_new=self.k_pe_out,
+            q_nope_pe=self.q_nope_pe, ckv_kpe_cache=cache,
+            c_latent_new=self.c_latent_out, k_pe_new=self.k_pe_out,
             output=self.attn_out,
             grid_dim=(self.mpk.max_num_batched_requests, 1, 1),
             block_dim=(128, 1, 1),
             num_q_heads=self.num_local_q_heads,
-            qk_head_dim=self.qk_head_dim,
-            v_head_dim=self.v_head_dim,
-        )
+            qk_head_dim=self.qk_head_dim, v_head_dim=self.v_head_dim)
 
-        # Step 7: O projection + residual
-        w_o = self.mpk.attach_input(
-            torch_tensor=state_dict[f"{prefix}self_attn.o_proj.weight"],
-            name=f"layer_{layer_idx}_o_proj",
-        )
-        self.mpk.splitk_linear_layer(
-            input=self.attn_out,
-            weight=w_o,
-            output=self.attn_proj_out,
-            grid_dim=(self.hidden_size // 128, 128 * 128 // self.hidden_size, 1),
-            block_dim=(256, 1, 1),
-        )
+        # Step 7: O projection (FP8)
+        w_o, s_o = self._attach_fp8_weight(
+            state_dict, f"{attn}o_proj.weight", f"layer_{layer_idx}_o_proj")
+        self._fp8_linear(self.attn_out, w_o, s_o, self.attn_proj_out,
+                         grid_dim=(self.hidden_size // 128, 128 * 128 // self.hidden_size, 1),
+                         block_dim=(256, 1, 1))
 
     def _build_dense_mlp(self, layer_idx: int, state_dict: dict):
-        """Build dense MLP for layers 0-2."""
+        """Build dense MLP for layers 0-2 (FP8 weights)."""
         prefix = f"model.layers.{layer_idx}."
 
-        w_gate_up = self.mpk.attach_input(
-            torch_tensor=state_dict[f"{prefix}mlp.gate_up_proj.weight"],
-            name=f"layer_{layer_idx}_gate_up_proj",
-        )
-        self.mpk.linear_layer(
-            input=self.rmsnorm_out,
-            weight=w_gate_up,
-            output=self.mlp_mid,
-            grid_dim=(grid_for_rmsnorm_linear_layer(w_gate_up.dim(0)), 1, 1),
-            block_dim=(128, 1, 1),
-        )
+        w_gate_up, s_gate_up = self._attach_fp8_weight(
+            state_dict, f"{prefix}mlp.gate_up_proj.weight",
+            f"layer_{layer_idx}_gate_up_proj")
+        self._fp8_linear(self.rmsnorm_out, w_gate_up, s_gate_up, self.mlp_mid,
+                         grid_dim=(grid_for_rmsnorm_linear_layer(w_gate_up.dim(0)), 1, 1),
+                         block_dim=(128, 1, 1))
         self.mpk.silu_mul_layer(
-            input=self.mlp_mid,
-            output=self.silu_mul_out,
-            grid_dim=(self.intermediate_size // 64, 1, 1),
-            block_dim=(128, 1, 1),
-        )
-        w_down = self.mpk.attach_input(
-            torch_tensor=state_dict[f"{prefix}mlp.down_proj.weight"],
-            name=f"layer_{layer_idx}_down_proj",
-        )
-        self.mpk.splitk_linear_layer(
-            input=self.silu_mul_out,
-            weight=w_down,
-            output=self.mlp_out,
-            grid_dim=(self.hidden_size // 128, 128 * 128 // self.hidden_size, 1),
-            block_dim=(256, 1, 1),
-        )
+            input=self.mlp_mid, output=self.silu_mul_out,
+            grid_dim=(self.intermediate_size // 64, 1, 1), block_dim=(128, 1, 1))
+        w_down, s_down = self._attach_fp8_weight(
+            state_dict, f"{prefix}mlp.down_proj.weight",
+            f"layer_{layer_idx}_down_proj")
+        self._fp8_linear(self.silu_mul_out, w_down, s_down, self.mlp_out,
+                         grid_dim=(self.hidden_size // 128, 128 * 128 // self.hidden_size, 1),
+                         block_dim=(256, 1, 1))
 
     def _build_moe_mlp(self, layer_idx: int, state_dict: dict):
         """Build MoE MLP for layers 3-60.
@@ -495,21 +451,43 @@ class DeepSeekV3Builder(GraphBuilder):
             block_dim=(256, 1, 1),  # 8 warps required by topk kernel
         )
 
-        # Expert W1+W3 (gate + up projection)
+        # Expert W1+W3 (gate + up projection) — FP8
         w_experts_w13 = self.mpk.attach_input(
             torch_tensor=state_dict[f"{prefix}experts.w13.weight"],
             name=f"layer_{layer_idx}_experts_w13",
         )
+        s_experts_w13 = self.mpk.attach_input(
+            torch_tensor=state_dict[f"{prefix}experts.w13.weight_scale_inv"],
+            name=f"layer_{layer_idx}_experts_w13_scale",
+        )
+        # Quantize input for MoE FP8
+        mbt = self.max_num_batched_tokens
+        moe_input_fp8 = self.mpk.new_tensor(
+            dims=(mbt, self.hidden_size), dtype=bfloat16,
+            name=f"layer_{layer_idx}_moe_input_fp8", io_category="cuda_tensor",
+        )
+        moe_input_scale = self.mpk.new_tensor(
+            dims=(mbt, self.hidden_size // 128), dtype=bfloat16,
+            name=f"layer_{layer_idx}_moe_input_scale", io_category="cuda_tensor",
+        )
+        self.mpk.quantize_fp8_layer(
+            input=self.rmsnorm_out,
+            output_fp8=moe_input_fp8,
+            output_scale=moe_input_scale,
+            grid_dim=(mbt, 1, 1), block_dim=(128, 1, 1),
+        )
+
         moe_mid = self.mpk.new_tensor(
-            dims=(self.max_num_batched_tokens, NUM_EXPERTS_PER_TOK,
-                  2 * self.intermediate_size),
+            dims=(mbt, NUM_EXPERTS_PER_TOK, 2 * self.moe_intermediate_size),
             dtype=bfloat16,
             name=f"layer_{layer_idx}_moe_mid",
             io_category="cuda_tensor",
         )
-        self.mpk.moe_w13_linear_layer(
-            input=self.rmsnorm_out,
-            weight=w_experts_w13,
+        self.mpk.moe_w13_fp8_layer(
+            input_fp8=moe_input_fp8,
+            input_scale=moe_input_scale,
+            weight_fp8=w_experts_w13,
+            weight_scale=s_experts_w13,
             moe_routing_indices=moe_routing_indices,
             moe_mask=moe_mask,
             output=moe_mid,
@@ -519,34 +497,40 @@ class DeepSeekV3Builder(GraphBuilder):
 
         # SiLU activation
         moe_silu_out = self.mpk.new_tensor(
-            dims=(self.max_num_batched_tokens, NUM_EXPERTS_PER_TOK,
-                  self.intermediate_size),
+            dims=(mbt, NUM_EXPERTS_PER_TOK, self.moe_intermediate_size),
             dtype=bfloat16,
             name=f"layer_{layer_idx}_moe_silu",
             io_category="cuda_tensor",
         )
         self.mpk.moe_silu_mul_layer(
-            input=moe_mid,
-            output=moe_silu_out,
-            grid_dim=(self.max_num_batched_tokens * NUM_EXPERTS_PER_TOK, 1, 1),
+            input=moe_mid, output=moe_silu_out,
+            grid_dim=(mbt * NUM_EXPERTS_PER_TOK, 1, 1),
             block_dim=(128, 1, 1),
         )
 
-        # Expert W2 (down projection)
+        # Expert W2 (down projection) — FP8
+        # Need to quantize silu output for FP8 W2
         w_experts_w2 = self.mpk.attach_input(
             torch_tensor=state_dict[f"{prefix}experts.w2.weight"],
             name=f"layer_{layer_idx}_experts_w2",
         )
+        s_experts_w2 = self.mpk.attach_input(
+            torch_tensor=state_dict[f"{prefix}experts.w2.weight_scale_inv"],
+            name=f"layer_{layer_idx}_experts_w2_scale",
+        )
+        # TODO: quantize silu_out for FP8 W2 (need per-token-group quantize on 3D tensor)
+        # For now, use BF16 W2 as fallback since 3D quantize not yet supported
         moe_down_out = self.mpk.new_tensor(
-            dims=(self.max_num_batched_tokens, NUM_EXPERTS_PER_TOK,
-                  self.hidden_size),
+            dims=(mbt, NUM_EXPERTS_PER_TOK, self.hidden_size),
             dtype=bfloat16,
             name=f"layer_{layer_idx}_moe_down",
             io_category="cuda_tensor",
         )
-        self.mpk.moe_w2_linear_layer(
-            input=moe_silu_out,
-            weight=w_experts_w2,
+        self.mpk.moe_w2_fp8_layer(
+            input_fp8=moe_silu_out,  # TODO: should be quantized FP8
+            input_scale=moe_input_scale,  # placeholder
+            weight_fp8=w_experts_w2,
+            weight_scale=s_experts_w2,
             moe_routing_indices=moe_routing_indices,
             moe_mask=moe_mask,
             output=moe_down_out,
@@ -560,13 +544,19 @@ class DeepSeekV3Builder(GraphBuilder):
         #   final = sum(routed * weights) + (residual + shared_expert_out)
         shared_prefix = f"{prefix}shared_experts."
 
-        # gate_proj + up_proj fused
+        # gate_proj + up_proj fused (FP8)
+        # Concatenate gate and up FP8 weights + scales
+        shared_gate_w = state_dict[f"{shared_prefix}gate_proj.weight"]
+        shared_up_w = state_dict[f"{shared_prefix}up_proj.weight"]
+        shared_gate_s = state_dict[f"{shared_prefix}gate_proj.weight_scale_inv"]
+        shared_up_s = state_dict[f"{shared_prefix}up_proj.weight_scale_inv"]
         w_shared_gate_up = self.mpk.attach_input(
-            torch_tensor=torch.cat([
-                state_dict[f"{shared_prefix}gate_proj.weight"],
-                state_dict[f"{shared_prefix}up_proj.weight"],
-            ], dim=0),
+            torch_tensor=torch.cat([shared_gate_w, shared_up_w], dim=0),
             name=f"layer_{layer_idx}_shared_expert_gate_up",
+        )
+        s_shared_gate_up = self.mpk.attach_input(
+            torch_tensor=torch.cat([shared_gate_s, shared_up_s], dim=0),
+            name=f"layer_{layer_idx}_shared_expert_gate_up_scale",
         )
         shared_mid = self.mpk.new_tensor(
             dims=(self.max_num_batched_tokens, 2 * self.moe_intermediate_size),
@@ -574,13 +564,11 @@ class DeepSeekV3Builder(GraphBuilder):
             name=f"layer_{layer_idx}_shared_mid",
             io_category="cuda_tensor",
         )
-        self.mpk.linear_layer(
-            input=self.rmsnorm_out,
-            weight=w_shared_gate_up,
-            output=shared_mid,
-            grid_dim=(grid_for_rmsnorm_linear_layer(w_shared_gate_up.dim(0)), 1, 1),
-            block_dim=(128, 1, 1),
-        )
+        self._fp8_linear(self.rmsnorm_out, w_shared_gate_up, s_shared_gate_up,
+                         shared_mid,
+                         grid_dim=(grid_for_rmsnorm_linear_layer(
+                             w_shared_gate_up.dim(0)), 1, 1),
+                         block_dim=(128, 1, 1))
 
         # silu_mul
         shared_silu_out = self.mpk.new_tensor(
@@ -590,32 +578,25 @@ class DeepSeekV3Builder(GraphBuilder):
             io_category="cuda_tensor",
         )
         self.mpk.silu_mul_layer(
-            input=shared_mid,
-            output=shared_silu_out,
+            input=shared_mid, output=shared_silu_out,
             grid_dim=(self.moe_intermediate_size // 64, 1, 1),
-            block_dim=(128, 1, 1),
-        )
+            block_dim=(128, 1, 1))
 
-        # down_proj with residual: shared_residual = self.x + shared_down(shared_silu)
-        # This fuses the shared expert output with the skip connection.
-        w_shared_down = self.mpk.attach_input(
-            torch_tensor=state_dict[f"{shared_prefix}down_proj.weight"],
-            name=f"layer_{layer_idx}_shared_expert_down",
-        )
+        # down_proj with residual (FP8): shared_residual = self.x + shared_down(shared_silu)
+        w_shared_down, s_shared_down = self._attach_fp8_weight(
+            state_dict, f"{shared_prefix}down_proj.weight",
+            f"layer_{layer_idx}_shared_expert_down")
         shared_residual = self.mpk.new_tensor(
             dims=(self.max_num_batched_tokens, self.hidden_size),
             dtype=bfloat16,
             name=f"layer_{layer_idx}_shared_residual",
             io_category="cuda_tensor",
         )
-        self.mpk.linear_with_residual_layer(
-            input=shared_silu_out,
-            weight=w_shared_down,
-            residual=self.x,
-            output=shared_residual,
-            grid_dim=(self.hidden_size // 64, 1, 1),
-            block_dim=(128, 1, 1),
-        )
+        self._fp8_linear(shared_silu_out, w_shared_down, s_shared_down,
+                         shared_residual,
+                         grid_dim=(self.hidden_size // 64, 1, 1),
+                         block_dim=(128, 1, 1),
+                         residual=self.x)
 
         # Final: moe_output = sum(routed_experts * weights) + shared_residual
         # where shared_residual = original_hidden + shared_expert_output
@@ -692,219 +673,224 @@ class DeepSeekV3Builder(GraphBuilder):
             self.mtp_x = self.allreduce_out
 
     def _build_mla_attention_layer_with_prefix(self, prefix: str, state_dict: dict):
-        """Build MLA attention using a custom weight prefix (for MTP reuse)."""
-        attn_prefix = f"{prefix}self_attn."
+        """Build MLA attention using a custom weight prefix (FP8, for MTP reuse)."""
+        attn = f"{prefix}self_attn."
 
-        w_q_a = self.mpk.attach_input(
-            torch_tensor=state_dict[f"{attn_prefix}q_a_proj.weight"],
-            name=f"mtp_{attn_prefix}q_a_proj",
-        )
-        self.mpk.linear_layer(
-            input=self.rmsnorm_out, weight=w_q_a, output=self.q_a_out,
-            grid_dim=(grid_for_rmsnorm_linear_layer(w_q_a.dim(0)), 1, 1),
-            block_dim=(128, 1, 1),
-        )
+        # q_a_proj (FP8)
+        w_q_a, s_q_a = self._attach_fp8_weight(
+            state_dict, f"{attn}q_a_proj.weight", f"mtp_{attn}q_a_proj")
+        self._fp8_linear(self.rmsnorm_out, w_q_a, s_q_a, self.q_a_out,
+                         grid_dim=(grid_for_rmsnorm_linear_layer(w_q_a.dim(0)), 1, 1),
+                         block_dim=(128, 1, 1))
 
         w_q_a_ln = self.mpk.attach_input(
-            torch_tensor=state_dict[f"{attn_prefix}q_a_layernorm.weight"],
-            name=f"mtp_{attn_prefix}q_a_layernorm",
-        )
+            torch_tensor=state_dict[f"{attn}q_a_layernorm.weight"],
+            name=f"mtp_{attn}q_a_layernorm")
         self.mpk.rmsnorm_layer(
             input=self.q_a_out, weight=w_q_a_ln, output=self.q_a_out,
-            grid_dim=(self.max_num_batched_tokens, 1, 1),
-            block_dim=(128, 1, 1),
-        )
+            grid_dim=(self.max_num_batched_tokens, 1, 1), block_dim=(128, 1, 1))
 
-        w_q_b = self.mpk.attach_input(
-            torch_tensor=state_dict[f"{attn_prefix}q_b_proj.weight"],
-            name=f"mtp_{attn_prefix}q_b_proj",
-        )
-        self.mpk.linear_layer(
-            input=self.q_a_out, weight=w_q_b, output=self.q_nope_pe,
-            grid_dim=(grid_for_rmsnorm_linear_layer(w_q_b.dim(0)), 1, 1),
-            block_dim=(128, 1, 1),
-        )
+        # q_b_proj (FP8)
+        w_q_b, s_q_b = self._attach_fp8_weight(
+            state_dict, f"{attn}q_b_proj.weight", f"mtp_{attn}q_b_proj")
+        self._fp8_linear(self.q_a_out, w_q_b, s_q_b, self.q_nope_pe,
+                         grid_dim=(grid_for_rmsnorm_linear_layer(w_q_b.dim(0)), 1, 1),
+                         block_dim=(128, 1, 1))
 
-        kv_a_full = state_dict[f"{attn_prefix}kv_a_proj_with_mqa.weight"]
-        w_kv_a_latent = self.mpk.attach_input(
-            torch_tensor=kv_a_full[:self.kv_lora_rank].contiguous(),
-            name=f"mtp_{attn_prefix}kv_a_latent",
-        )
-        w_kv_a_rope = self.mpk.attach_input(
-            torch_tensor=kv_a_full[self.kv_lora_rank:].contiguous(),
-            name=f"mtp_{attn_prefix}kv_a_rope",
-        )
-        self.mpk.linear_layer(
-            input=self.rmsnorm_out, weight=w_kv_a_latent, output=self.c_latent_out,
-            grid_dim=(grid_for_rmsnorm_linear_layer(w_kv_a_latent.dim(0)), 1, 1),
-            block_dim=(128, 1, 1),
-        )
-        self.mpk.linear_layer(
-            input=self.rmsnorm_out, weight=w_kv_a_rope, output=self.k_pe_out,
-            grid_dim=(grid_for_rmsnorm_linear_layer(w_kv_a_rope.dim(0)), 1, 1),
-            block_dim=(128, 1, 1),
-        )
+        # kv_a_proj split (FP8)
+        kv_a_w = state_dict[f"{attn}kv_a_proj_with_mqa.weight"]
+        kv_a_s = state_dict[f"{attn}kv_a_proj_with_mqa.weight_scale_inv"]
+        scale_rows_total = kv_a_s.shape[0]
+        latent_ratio = self.kv_lora_rank / (self.kv_lora_rank + QK_ROPE_HEAD_DIM)
+        scale_rows_latent = round(scale_rows_total * latent_ratio)
+
+        w_kv_latent = self.mpk.attach_input(
+            torch_tensor=kv_a_w[:self.kv_lora_rank].contiguous(),
+            name=f"mtp_{attn}kv_a_latent")
+        s_kv_latent = self.mpk.attach_input(
+            torch_tensor=kv_a_s[:scale_rows_latent].contiguous(),
+            name=f"mtp_{attn}kv_a_latent_scale")
+        w_kv_rope = self.mpk.attach_input(
+            torch_tensor=kv_a_w[self.kv_lora_rank:].contiguous(),
+            name=f"mtp_{attn}kv_a_rope")
+        s_kv_rope = self.mpk.attach_input(
+            torch_tensor=kv_a_s[scale_rows_latent:].contiguous(),
+            name=f"mtp_{attn}kv_a_rope_scale")
+
+        self._fp8_linear(self.rmsnorm_out, w_kv_latent, s_kv_latent, self.c_latent_out,
+                         grid_dim=(grid_for_rmsnorm_linear_layer(self.kv_lora_rank), 1, 1),
+                         block_dim=(128, 1, 1))
+        self._fp8_linear(self.rmsnorm_out, w_kv_rope, s_kv_rope, self.k_pe_out,
+                         grid_dim=(grid_for_rmsnorm_linear_layer(QK_ROPE_HEAD_DIM), 1, 1),
+                         block_dim=(128, 1, 1))
 
         w_kv_a_ln = self.mpk.attach_input(
-            torch_tensor=state_dict[f"{attn_prefix}kv_a_layernorm.weight"],
-            name=f"mtp_{attn_prefix}kv_a_layernorm",
-        )
+            torch_tensor=state_dict[f"{attn}kv_a_layernorm.weight"],
+            name=f"mtp_{attn}kv_a_layernorm")
         self.mpk.rmsnorm_layer(
             input=self.c_latent_out, weight=w_kv_a_ln, output=self.c_latent_out,
-            grid_dim=(self.max_num_batched_tokens, 1, 1),
-            block_dim=(128, 1, 1),
-        )
+            grid_dim=(self.max_num_batched_tokens, 1, 1), block_dim=(128, 1, 1))
 
         # MTP attention uses its own KV cache
         self.mpk.paged_mla_layer(
-            q_nope_pe=self.q_nope_pe,
-            ckv_kpe_cache=self.mtp_ckv_kpe_cache_tensor,
-            c_latent_new=self.c_latent_out,
-            k_pe_new=self.k_pe_out,
+            q_nope_pe=self.q_nope_pe, ckv_kpe_cache=self.mtp_ckv_kpe_cache_tensor,
+            c_latent_new=self.c_latent_out, k_pe_new=self.k_pe_out,
             output=self.attn_out,
             grid_dim=(self.mpk.max_num_batched_requests, 1, 1),
             block_dim=(128, 1, 1),
             num_q_heads=self.num_local_q_heads,
-            qk_head_dim=self.qk_head_dim,
-            v_head_dim=self.v_head_dim,
-        )
+            qk_head_dim=self.qk_head_dim, v_head_dim=self.v_head_dim)
 
-        w_o = self.mpk.attach_input(
-            torch_tensor=state_dict[f"{attn_prefix}o_proj.weight"],
-            name=f"mtp_{attn_prefix}o_proj",
-        )
-        self.mpk.splitk_linear_layer(
-            input=self.attn_out, weight=w_o, output=self.attn_proj_out,
-            grid_dim=(self.hidden_size // 128, 128 * 128 // self.hidden_size, 1),
-            block_dim=(256, 1, 1),
-        )
+        # o_proj (FP8)
+        w_o, s_o = self._attach_fp8_weight(
+            state_dict, f"{attn}o_proj.weight", f"mtp_{attn}o_proj")
+        self._fp8_linear(self.attn_out, w_o, s_o, self.attn_proj_out,
+                         grid_dim=(self.hidden_size // 128, 128 * 128 // self.hidden_size, 1),
+                         block_dim=(256, 1, 1))
 
     def _build_dense_mlp_with_prefix(self, prefix: str, state_dict: dict):
-        """Build dense MLP using a custom weight prefix (for MTP reuse)."""
+        """Build dense MLP using a custom weight prefix (FP8, for MTP reuse)."""
         mlp_prefix = f"{prefix}mlp."
 
-        w_gate_up = self.mpk.attach_input(
-            torch_tensor=state_dict[f"{mlp_prefix}gate_up_proj.weight"],
-            name=f"mtp_{mlp_prefix}gate_up_proj",
-        )
-        self.mpk.linear_layer(
-            input=self.rmsnorm_out, weight=w_gate_up, output=self.mlp_mid,
-            grid_dim=(grid_for_rmsnorm_linear_layer(w_gate_up.dim(0)), 1, 1),
-            block_dim=(128, 1, 1),
-        )
+        w_gate_up, s_gate_up = self._attach_fp8_weight(
+            state_dict, f"{mlp_prefix}gate_up_proj.weight",
+            f"mtp_{mlp_prefix}gate_up_proj")
+        self._fp8_linear(self.rmsnorm_out, w_gate_up, s_gate_up, self.mlp_mid,
+                         grid_dim=(grid_for_rmsnorm_linear_layer(w_gate_up.dim(0)), 1, 1),
+                         block_dim=(128, 1, 1))
         self.mpk.silu_mul_layer(
             input=self.mlp_mid, output=self.silu_mul_out,
-            grid_dim=(self.intermediate_size // 64, 1, 1),
-            block_dim=(128, 1, 1),
-        )
-        w_down = self.mpk.attach_input(
-            torch_tensor=state_dict[f"{mlp_prefix}down_proj.weight"],
-            name=f"mtp_{mlp_prefix}down_proj",
-        )
-        self.mpk.splitk_linear_layer(
-            input=self.silu_mul_out, weight=w_down, output=self.mlp_out,
-            grid_dim=(self.hidden_size // 128, 128 * 128 // self.hidden_size, 1),
-            block_dim=(256, 1, 1),
-        )
+            grid_dim=(self.intermediate_size // 64, 1, 1), block_dim=(128, 1, 1))
+        w_down, s_down = self._attach_fp8_weight(
+            state_dict, f"{mlp_prefix}down_proj.weight",
+            f"mtp_{mlp_prefix}down_proj")
+        self._fp8_linear(self.silu_mul_out, w_down, s_down, self.mlp_out,
+                         grid_dim=(self.hidden_size // 128, 128 * 128 // self.hidden_size, 1),
+                         block_dim=(256, 1, 1))
 
     def _build_moe_mlp_with_prefix(self, prefix: str, state_dict: dict):
-        """Build MoE MLP using a custom weight prefix (for MTP reuse)."""
+        """Build MoE MLP using a custom weight prefix (FP8, for MTP reuse)."""
         mlp_prefix = f"{prefix}mlp."
+        mbt = self.max_num_batched_tokens
 
+        # Router (BF16 — gate.weight is BF16)
         w_gate = self.mpk.attach_input(
             torch_tensor=state_dict[f"{mlp_prefix}gate.weight"],
-            name=f"mtp_{mlp_prefix}gate",
-        )
+            name=f"mtp_{mlp_prefix}gate")
         moe_topk_weights = self.mpk.new_tensor(
-            dims=(self.max_num_batched_tokens, NUM_EXPERTS_PER_TOK),
-            dtype=bfloat16, name="mtp_moe_topk_weights", io_category="cuda_tensor",
-        )
+            dims=(mbt, NUM_EXPERTS_PER_TOK), dtype=bfloat16,
+            name="mtp_moe_topk_weights", io_category="cuda_tensor")
         moe_routing_indices = self.mpk.new_tensor(
-            dims=(NUM_EXPERTS, self.max_num_batched_tokens),
-            dtype=bfloat16, name="mtp_moe_routing_indices", io_category="cuda_tensor",
-        )
+            dims=(NUM_EXPERTS, mbt), dtype=bfloat16,
+            name="mtp_moe_routing_indices", io_category="cuda_tensor")
         moe_mask = self.mpk.new_tensor(
-            dims=(NUM_EXPERTS + 1, 1),
-            dtype=bfloat16, name="mtp_moe_mask", io_category="cuda_tensor",
-        )
+            dims=(NUM_EXPERTS + 1, 1), dtype=bfloat16,
+            name="mtp_moe_mask", io_category="cuda_tensor")
         router_logits = self.mpk.new_tensor(
-            dims=(self.max_num_batched_tokens, NUM_EXPERTS),
-            dtype=bfloat16, name="mtp_router_logits", io_category="cuda_tensor",
-        )
+            dims=(mbt, NUM_EXPERTS), dtype=bfloat16,
+            name="mtp_router_logits", io_category="cuda_tensor")
         self.mpk.linear_layer(
             input=self.rmsnorm_out, weight=w_gate, output=router_logits,
             grid_dim=(grid_for_rmsnorm_linear_layer(w_gate.dim(0)), 1, 1),
-            block_dim=(128, 1, 1),
-        )
+            block_dim=(128, 1, 1))
 
         moe_output = self.mpk.new_tensor(
-            dims=(self.max_num_batched_tokens, self.hidden_size),
-            dtype=bfloat16, name="mtp_moe_output", io_category="cuda_tensor",
-        )
+            dims=(mbt, self.hidden_size), dtype=bfloat16,
+            name="mtp_moe_output", io_category="cuda_tensor")
         self.mpk.tensor_init_layer(
             input=moe_output, dummy_input=self.rmsnorm_out,
             dummy_output=self.rmsnorm_out,
-            grid_dim=(self.max_num_batched_tokens, 1, 1), block_dim=(128, 1, 1),
-        )
+            grid_dim=(mbt, 1, 1), block_dim=(128, 1, 1))
+
         w_gate_bias = self.mpk.attach_input(
             torch_tensor=state_dict[f"{mlp_prefix}gate.e_score_correction_bias"],
-            name=f"mtp_{mlp_prefix}gate_bias",
-        )
+            name=f"mtp_{mlp_prefix}gate_bias")
         self.mpk.moe_topk_sigmoid_routing_layer(
-            input=router_logits,
-            bias=w_gate_bias,
+            input=router_logits, bias=w_gate_bias,
             output=(moe_topk_weights, moe_routing_indices, moe_mask),
-            grid_dim=(1, 1, 1), block_dim=(256, 1, 1),
-        )
+            grid_dim=(1, 1, 1), block_dim=(256, 1, 1))
 
-        w_experts_w13 = self.mpk.attach_input(
-            torch_tensor=state_dict[f"{mlp_prefix}experts.w13.weight"],
-            name=f"mtp_{mlp_prefix}experts_w13",
-        )
+        # Expert W13 (FP8)
+        w_w13, s_w13 = self._attach_fp8_weight(
+            state_dict, f"{mlp_prefix}experts.w13.weight",
+            f"mtp_{mlp_prefix}experts_w13")
+        moe_input_fp8 = self.mpk.new_tensor(
+            dims=(mbt, self.hidden_size), dtype=bfloat16,
+            name="mtp_moe_input_fp8", io_category="cuda_tensor")
+        moe_input_scale = self.mpk.new_tensor(
+            dims=(mbt, self.hidden_size // 128), dtype=bfloat16,
+            name="mtp_moe_input_scale", io_category="cuda_tensor")
+        self.mpk.quantize_fp8_layer(
+            input=self.rmsnorm_out, output_fp8=moe_input_fp8,
+            output_scale=moe_input_scale,
+            grid_dim=(mbt, 1, 1), block_dim=(128, 1, 1))
+
         moe_mid = self.mpk.new_tensor(
-            dims=(self.max_num_batched_tokens, NUM_EXPERTS_PER_TOK,
-                  2 * self.intermediate_size),
-            dtype=bfloat16, name="mtp_moe_mid", io_category="cuda_tensor",
-        )
-        self.mpk.moe_w13_linear_layer(
-            input=self.rmsnorm_out, weight=w_experts_w13,
+            dims=(mbt, NUM_EXPERTS_PER_TOK, 2 * self.moe_intermediate_size),
+            dtype=bfloat16, name="mtp_moe_mid", io_category="cuda_tensor")
+        self.mpk.moe_w13_fp8_layer(
+            input_fp8=moe_input_fp8, input_scale=moe_input_scale,
+            weight_fp8=w_w13, weight_scale=s_w13,
             moe_routing_indices=moe_routing_indices, moe_mask=moe_mask,
-            output=moe_mid,
-            grid_dim=(NUM_EXPERTS, 1, 1), block_dim=(128, 1, 1),
-        )
+            output=moe_mid, grid_dim=(NUM_EXPERTS, 1, 1), block_dim=(128, 1, 1))
 
         moe_silu_out = self.mpk.new_tensor(
-            dims=(self.max_num_batched_tokens, NUM_EXPERTS_PER_TOK,
-                  self.intermediate_size),
-            dtype=bfloat16, name="mtp_moe_silu", io_category="cuda_tensor",
-        )
+            dims=(mbt, NUM_EXPERTS_PER_TOK, self.moe_intermediate_size),
+            dtype=bfloat16, name="mtp_moe_silu", io_category="cuda_tensor")
         self.mpk.moe_silu_mul_layer(
             input=moe_mid, output=moe_silu_out,
-            grid_dim=(self.max_num_batched_tokens * NUM_EXPERTS_PER_TOK, 1, 1),
-            block_dim=(128, 1, 1),
-        )
+            grid_dim=(mbt * NUM_EXPERTS_PER_TOK, 1, 1), block_dim=(128, 1, 1))
 
-        w_experts_w2 = self.mpk.attach_input(
-            torch_tensor=state_dict[f"{mlp_prefix}experts.w2.weight"],
-            name=f"mtp_{mlp_prefix}experts_w2",
-        )
+        # Expert W2 (FP8)
+        w_w2, s_w2 = self._attach_fp8_weight(
+            state_dict, f"{mlp_prefix}experts.w2.weight",
+            f"mtp_{mlp_prefix}experts_w2")
         moe_down_out = self.mpk.new_tensor(
-            dims=(self.max_num_batched_tokens, NUM_EXPERTS_PER_TOK,
-                  self.hidden_size),
-            dtype=bfloat16, name="mtp_moe_down", io_category="cuda_tensor",
-        )
-        self.mpk.moe_w2_linear_layer(
-            input=moe_silu_out, weight=w_experts_w2,
+            dims=(mbt, NUM_EXPERTS_PER_TOK, self.hidden_size),
+            dtype=bfloat16, name="mtp_moe_down", io_category="cuda_tensor")
+        self.mpk.moe_w2_fp8_layer(
+            input_fp8=moe_silu_out, input_scale=moe_input_scale,
+            weight_fp8=w_w2, weight_scale=s_w2,
             moe_routing_indices=moe_routing_indices, moe_mask=moe_mask,
-            output=moe_down_out,
-            grid_dim=(NUM_EXPERTS, 1, 1), block_dim=(128, 1, 1),
-        )
+            output=moe_down_out, grid_dim=(NUM_EXPERTS, 1, 1), block_dim=(128, 1, 1))
+
+        # Shared expert (FP8)
+        sp = f"{mlp_prefix}shared_experts."
+        shared_gate_w = state_dict[f"{sp}gate_proj.weight"]
+        shared_up_w = state_dict[f"{sp}up_proj.weight"]
+        shared_gate_s = state_dict[f"{sp}gate_proj.weight_scale_inv"]
+        shared_up_s = state_dict[f"{sp}up_proj.weight_scale_inv"]
+        w_s_gu = self.mpk.attach_input(
+            torch_tensor=torch.cat([shared_gate_w, shared_up_w], dim=0),
+            name=f"mtp_{sp}gate_up")
+        s_s_gu = self.mpk.attach_input(
+            torch_tensor=torch.cat([shared_gate_s, shared_up_s], dim=0),
+            name=f"mtp_{sp}gate_up_scale")
+        shared_mid = self.mpk.new_tensor(
+            dims=(mbt, 2 * self.moe_intermediate_size), dtype=bfloat16,
+            name="mtp_shared_mid", io_category="cuda_tensor")
+        self._fp8_linear(self.rmsnorm_out, w_s_gu, s_s_gu, shared_mid,
+                         grid_dim=(grid_for_rmsnorm_linear_layer(w_s_gu.dim(0)), 1, 1),
+                         block_dim=(128, 1, 1))
+        shared_silu = self.mpk.new_tensor(
+            dims=(mbt, self.moe_intermediate_size), dtype=bfloat16,
+            name="mtp_shared_silu", io_category="cuda_tensor")
+        self.mpk.silu_mul_layer(
+            input=shared_mid, output=shared_silu,
+            grid_dim=(self.moe_intermediate_size // 64, 1, 1), block_dim=(128, 1, 1))
+        w_s_down, s_s_down = self._attach_fp8_weight(
+            state_dict, f"{sp}down_proj.weight", f"mtp_{sp}down_proj")
+        shared_residual = self.mpk.new_tensor(
+            dims=(mbt, self.hidden_size), dtype=bfloat16,
+            name="mtp_shared_residual", io_category="cuda_tensor")
+        self._fp8_linear(shared_silu, w_s_down, s_s_down, shared_residual,
+                         grid_dim=(self.hidden_size // 64, 1, 1),
+                         block_dim=(128, 1, 1), residual=self.mtp_x)
 
         self.mpk.moe_mul_sum_add_layer(
             input=moe_down_out, weight=moe_topk_weights,
-            residual=self.mtp_x, output=moe_output,
-            grid_dim=(self.max_num_batched_tokens, 1, 1), block_dim=(128, 1, 1),
-        )
+            residual=shared_residual, output=moe_output,
+            grid_dim=(mbt, 1, 1), block_dim=(128, 1, 1))
         self.mlp_out = moe_output
 
     def _build_mtp_layer(self, state_dict: dict):
