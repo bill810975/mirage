@@ -693,8 +693,9 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
   } else if (name == "paged_mla_sm100") {
     int variant_id = task_register->register_paged_mla_sm100_task(
         customized->bgraph, params);
+    int num_mla_inputs = customized->bgraph.operators.size() - 1;  // all ops minus 1 output
     task_config[op] =
-        std::make_tuple(4, 1, TASK_PAGED_MLA_SM100, variant_id);
+        std::make_tuple(num_mla_inputs, 1, TASK_PAGED_MLA_SM100, variant_id);
   } else if (name == "mtp_verify_strict") {
     int variant_id = task_register->register_mtp_verify_strict_task(
         customized->bgraph, params);

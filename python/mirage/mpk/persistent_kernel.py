@@ -680,6 +680,8 @@ class PersistentKernel:
         num_q_heads: int,         # per GPU (e.g., 16 for 8-GPU TP with 128 total heads)
         qk_head_dim: int = 576,   # 512 latent + 64 rope
         v_head_dim: int = 512,    # latent dim only (= kv_lora_rank)
+        cos_pos_embed: DTensor = None,  # [max_seq_len, rope_dim] for RoPE
+        sin_pos_embed: DTensor = None,  # [max_seq_len, rope_dim] for RoPE
     ):
         """MLA (Multi-head Latent Attention) for DeepSeek V3.
 
@@ -714,10 +716,13 @@ class PersistentKernel:
         tb_graph.new_input(c_latent_new, (-1, 1, -1), -1, True)
         tb_graph.new_input(k_pe_new, (-1, 1, -1), -1, True)
         tb_graph.new_input(output, (-1, 1, -1), -1, True)
-        self.kn_graph.customized(
-            [q_nope_pe, ckv_kpe_cache, c_latent_new, k_pe_new, output],
-            tb_graph,
-        )
+        tensors = [q_nope_pe, ckv_kpe_cache, c_latent_new, k_pe_new, output]
+        has_rope = cos_pos_embed is not None and sin_pos_embed is not None
+        if has_rope:
+            tb_graph.new_input(cos_pos_embed, (-1, -1, -1), -1, True)
+            tb_graph.new_input(sin_pos_embed, (-1, -1, -1), -1, True)
+            tensors.extend([cos_pos_embed, sin_pos_embed])
+        self.kn_graph.customized(tensors, tb_graph)
         self.kn_graph.register_task(tb_graph, "paged_mla_sm100", params)
 
     def paged_attention_split_kv_layer(

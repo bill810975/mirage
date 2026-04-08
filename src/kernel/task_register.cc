@@ -1985,10 +1985,12 @@ int TaskRegister::register_paged_mla_sm100_task(
 
   std::vector<tb::TBInputOp *> input_ops;
   std::vector<tb::TBInputOp *> output_ops;
-  int num_inputs = 4;
+  // Input count: 4 base (q, cache, c_new, k_pe) + optional 2 (cos, sin) for RoPE
   int num_outputs = 1;
+  int total_ops = bgraph.operators.size();
+  int num_inputs = total_ops - num_outputs;  // 4 or 6
+  bool has_rope = (num_inputs == 6);
 
-  assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
   for (auto const &op : bgraph.operators) {
     assert(op->op_type == mirage::type::TB_INPUT_OP);
     if (input_ops.size() < (size_t)num_inputs) {
@@ -2022,6 +2024,13 @@ int TaskRegister::register_paged_mla_sm100_task(
   code.e("    runtime_config.paged_kv_indptr_buffer,");
   code.e("    runtime_config.paged_kv_indices_buffer,");
   code.e("    runtime_config.paged_kv_last_page_len_buffer,");
+  if (has_rope) {
+    code.e("    task_desc->input_ptrs[4],");   // cos_pos_embed
+    code.e("    task_desc->input_ptrs[5],");   // sin_pos_embed
+  } else {
+    code.e("    nullptr,");                     // no RoPE
+    code.e("    nullptr,");
+  }
   code.e("    task_desc->task_metadata.request_id);");
   return register_task_variant(TASK_PAGED_MLA_SM100, code.to_string());
 }

@@ -146,6 +146,27 @@ class DeepSeekV3Builder(GraphBuilder):
                 block_dim=block_dim,
             )
 
+    def _precompute_rope_embeddings(self):
+        """Precompute cos/sin RoPE embeddings for DeepSeek V3."""
+        rope_dim = QK_ROPE_HEAD_DIM  # 64
+        max_seq = self.mpk.max_seq_length
+        # DeepSeek V3 uses standard RoPE with theta=10000
+        theta = 10000.0
+        half = rope_dim // 2
+        freqs = 1.0 / (theta ** (torch.arange(0, half, dtype=torch.float32) / half))
+        positions = torch.arange(max_seq, dtype=torch.float32)
+        angles = torch.outer(positions, freqs)  # [max_seq, half]
+        # Expand to full rope_dim: [max_seq, rope_dim] = [cos_half, cos_half]
+        cos_embed = torch.cat([angles.cos(), angles.cos()], dim=-1).to(
+            dtype=torch.bfloat16, device="cuda")
+        sin_embed = torch.cat([-angles.sin(), angles.sin()], dim=-1).to(
+            dtype=torch.bfloat16, device="cuda")
+        # Attach as DTensors
+        self.cos_pos_embed = self.mpk.attach_input(
+            torch_tensor=cos_embed, name="rope_cos")
+        self.sin_pos_embed = self.mpk.attach_input(
+            torch_tensor=sin_embed, name="rope_sin")
+
     def _new_intermediate_tensors(self):
         """Allocate intermediate computation buffers."""
         mbt = self.max_num_batched_tokens
@@ -351,7 +372,9 @@ class DeepSeekV3Builder(GraphBuilder):
             grid_dim=(self.mpk.max_num_batched_requests, 1, 1),
             block_dim=(128, 1, 1),
             num_q_heads=self.num_local_q_heads,
-            qk_head_dim=self.qk_head_dim, v_head_dim=self.v_head_dim)
+            qk_head_dim=self.qk_head_dim, v_head_dim=self.v_head_dim,
+            cos_pos_embed=self.cos_pos_embed,
+            sin_pos_embed=self.sin_pos_embed)
 
         # Step 7: O projection (FP8)
         w_o, s_o = self._attach_fp8_weight(
@@ -759,7 +782,9 @@ class DeepSeekV3Builder(GraphBuilder):
             grid_dim=(self.mpk.max_num_batched_requests, 1, 1),
             block_dim=(128, 1, 1),
             num_q_heads=self.num_local_q_heads,
-            qk_head_dim=self.qk_head_dim, v_head_dim=self.v_head_dim)
+            qk_head_dim=self.qk_head_dim, v_head_dim=self.v_head_dim,
+            cos_pos_embed=self.cos_pos_embed,
+            sin_pos_embed=self.sin_pos_embed)
 
         # o_proj (FP8)
         w_o, s_o = self._attach_fp8_weight(
@@ -1295,6 +1320,7 @@ class DeepSeekV3Builder(GraphBuilder):
 
         # Intermediate tensors
         self._new_intermediate_tensors()
+        self._precompute_rope_embeddings()
 
         # Build all decoder layers
         self.build_layers(state_dict, layer_indices=layer_indices)

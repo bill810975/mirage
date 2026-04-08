@@ -35,12 +35,14 @@ template <typename T, int NQH, int QKD, int VD, int MSL, int PS, int MT>
 __global__ void mla_attention_test_kernel(
     void const *q_ptr, void *cache_ptr, void const *c_new_ptr,
     void const *k_pe_new_ptr, void *output_ptr, int const *qo_indptr,
-    int const *kv_indptr, int const *kv_indices, int const *kv_last_page_len) {
+    int const *kv_indptr, int const *kv_indices, int const *kv_last_page_len,
+    void const *cos_ptr, void const *sin_ptr) {
   int16_t req_id = static_cast<int16_t>(blockIdx.x);
   int qh_idx = static_cast<int>(blockIdx.y);
   kernel::mla_paged_attention_sm100_task_impl<T, NQH, QKD, VD, MSL, PS, MT>(
       q_ptr, cache_ptr, c_new_ptr, k_pe_new_ptr, output_ptr, qo_indptr,
-      kv_indptr, kv_indices, kv_last_page_len, req_id, qh_idx);
+      kv_indptr, kv_indices, kv_last_page_len, cos_ptr, sin_ptr,
+      req_id, qh_idx);
 }
 
 void mla_attention(torch::Tensor q_nope_pe, torch::Tensor ckv_kpe_cache,
@@ -75,7 +77,8 @@ void mla_attention(torch::Tensor q_nope_pe, torch::Tensor ckv_kpe_cache,
           q_nope_pe.data_ptr(), ckv_kpe_cache.data_ptr(),
           c_latent_new.data_ptr(), k_pe_new.data_ptr(), output.data_ptr(),
           qo_indptr.data_ptr<int>(), kv_indptr.data_ptr<int>(),
-          kv_indices.data_ptr<int>(), kv_last_page_len.data_ptr<int>());
+          kv_indices.data_ptr<int>(), kv_last_page_len.data_ptr<int>(),
+          nullptr, nullptr);  // cos/sin = nullptr → no RoPE (for backward compat)
 
   cudaError_t err = cudaDeviceSynchronize();
   TORCH_CHECK(err == cudaSuccess, "MLA kernel failed: ",

@@ -41,12 +41,20 @@
 
 namespace kernel {
 
-// float_to_T: works even with __CUDA_NO_BFLOAT16_CONVERSIONS__
+// T_to_float / float_to_T: work even with __CUDA_NO_BFLOAT16_CONVERSIONS__
+template <typename T>
+__device__ __forceinline__ float T_to_float(T v) {
+  return static_cast<float>(v);
+}
 template <typename T>
 __device__ __forceinline__ T float_to_T(float v) {
   return static_cast<T>(v);
 }
 #if defined(__CUDA_NO_BFLOAT16_CONVERSIONS__)
+template <>
+__device__ __forceinline__ float T_to_float<__nv_bfloat16>(__nv_bfloat16 v) {
+  return __bfloat162float(v);
+}
 template <>
 __device__ __forceinline__ __nv_bfloat16 float_to_T<__nv_bfloat16>(float v) {
   return __float2bfloat16(v);
@@ -71,6 +79,8 @@ __device__ __forceinline__ void mla_paged_attention_sm100_task_impl(
     int const *paged_kv_indptr_buffer_ptr,
     int const *paged_kv_indices_buffer_ptr,
     int const *paged_kv_last_page_len_buffer_ptr,
+    void const *cos_ptr,    // [max_seq_len, ROPE_DIM] cos position embeddings
+    void const *sin_ptr,    // [max_seq_len, ROPE_DIM] sin position embeddings
     int16_t request_id,
     int qh_idx) {
 
@@ -153,9 +163,16 @@ __device__ __forceinline__ void mla_paged_attention_sm100_task_impl(
   T *__restrict__ d_output =
       reinterpret_cast<T *>(output_ptr) + first_token * O_STRIDE;
 
-  // ---- Phase 0: Write new KV to cache (head-0 block only) ----
+  // ---- RoPE cos/sin pointers ----
+  constexpr int ROPE_DIM = QK_HEAD_DIM - V_HEAD_DIM;
+  constexpr int ROPE_HALF = ROPE_DIM / 2;
+  T const *__restrict__ d_cos = (cos_ptr != nullptr)
+      ? reinterpret_cast<T const *>(cos_ptr) : nullptr;
+  T const *__restrict__ d_sin = (sin_ptr != nullptr)
+      ? reinterpret_cast<T const *>(sin_ptr) : nullptr;
+
+  // ---- Phase 0: Write new KV to cache with RoPE on k_pe (head-0 block only) ----
   if (qh_idx == 0) {
-    constexpr int ROPE_DIM = QK_HEAD_DIM - V_HEAD_DIM;
     for (int idx = threadIdx.x; idx < num_tokens * QK_HEAD_DIM;
          idx += NUM_THREADS) {
       int t = idx / QK_HEAD_DIM;
@@ -163,9 +180,28 @@ __device__ __forceinline__ void mla_paged_attention_sm100_task_impl(
       int cache_pos = seq_len - num_tokens + t;
       int pi = s_page_indices[cache_pos / PAGE_SIZE];
       int po = cache_pos % PAGE_SIZE;
-      T val = (d < V_HEAD_DIM)
-                  ? d_c_new[t * V_HEAD_DIM + d]
-                  : d_k_pe_new[t * ROPE_DIM + (d - V_HEAD_DIM)];
+      T val;
+      if (d < V_HEAD_DIM) {
+        val = d_c_new[t * V_HEAD_DIM + d];
+      } else {
+        // Apply RoPE to k_pe before writing to cache
+        int pe_idx = d - V_HEAD_DIM;  // 0..ROPE_DIM-1
+        float k_val = T_to_float<T>(d_k_pe_new[t * ROPE_DIM + pe_idx]);
+        if (d_cos != nullptr) {
+          int pair_idx = pe_idx % ROPE_HALF;
+          float cos_v = T_to_float<T>(d_cos[cache_pos * ROPE_DIM + pe_idx]);
+          float sin_v = T_to_float<T>(d_sin[cache_pos * ROPE_DIM + pe_idx]);
+          float k_pair;
+          if (pe_idx < ROPE_HALF) {
+            k_pair = T_to_float<T>(d_k_pe_new[t * ROPE_DIM + pe_idx + ROPE_HALF]);
+            k_val = k_val * cos_v - k_pair * sin_v;
+          } else {
+            k_pair = T_to_float<T>(d_k_pe_new[t * ROPE_DIM + pe_idx - ROPE_HALF]);
+            k_val = k_pair * sin_v + k_val * cos_v;
+          }
+        }
+        val = float_to_T<T>(k_val);
+      }
       d_cache[(pi * PAGE_SIZE + po) * QK_HEAD_DIM + d] = val;
     }
   }
@@ -180,6 +216,29 @@ __device__ __forceinline__ void mla_paged_attention_sm100_task_impl(
             d_q + t * Q_STRIDE + qh_idx * QK_HEAD_DIM)[vc];
   }
   wg_barrier.arrive_and_wait();
+
+  // ---- Phase 1b: Apply RoPE to q_pe (last ROPE_DIM dims in smem) ----
+  if (d_cos != nullptr) {
+    for (int idx = threadIdx.x; idx < num_tokens * ROPE_DIM;
+         idx += NUM_THREADS) {
+      int t = idx / ROPE_DIM;
+      int pe_idx = idx % ROPE_DIM;
+      int smem_offset = t * QK_HEAD_DIM + V_HEAD_DIM + pe_idx;
+      float q_val = T_to_float<T>(s_q[smem_offset]);
+      int seq_pos = seq_len - num_tokens + t;
+      float cos_v = T_to_float<T>(d_cos[seq_pos * ROPE_DIM + pe_idx]);
+      float sin_v = T_to_float<T>(d_sin[seq_pos * ROPE_DIM + pe_idx]);
+      float q_pair;
+      if (pe_idx < ROPE_HALF) {
+        q_pair = T_to_float<T>(s_q[smem_offset + ROPE_HALF]);
+        s_q[smem_offset] = float_to_T<T>(q_val * cos_v - q_pair * sin_v);
+      } else {
+        q_pair = T_to_float<T>(s_q[smem_offset - ROPE_HALF]);
+        s_q[smem_offset] = float_to_T<T>(q_pair * sin_v + q_val * cos_v);
+      }
+    }
+    wg_barrier.arrive_and_wait();
+  }
 
   // ---- Accumulators (warp 0 only, but declared for all to avoid divergence) ----
   float m_local[MMA_M][2];
