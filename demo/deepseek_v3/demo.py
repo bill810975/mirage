@@ -443,14 +443,17 @@ if __name__ == "__main__":
                         f"Expected {weight_file} or model.safetensors or model-*.safetensors"
                     )
 
-        # Correctness test: run PyTorch reference before MPK
+        # Parse layer indices for correctness mode
+        layer_indices_arg = None
+        if args.correctness and args.layers:
+            layer_indices_arg = [int(x) for x in args.layers.split(',')]
+
+        # Correctness test: run PyTorch reference first
         if args.correctness:
-            layer_indices = [int(x) for x in args.layers.split(',')] if args.layers else list(range(num_layers))
-            run_correctness_test(args, state_dict, layer_indices, rank, world_size)
+            test_layers = layer_indices_arg if layer_indices_arg else list(range(num_layers))
+            run_correctness_test(args, state_dict, test_layers, rank, world_size)
 
         # Build MLA model config for the builder
-        # For MLA, we pass the single ckv_kpe_cache as both k_cache and v_cache
-        # The builder will handle the MLA-specific cache layout
         model_config = MirageModelConfig(
             hidden_size=hidden_size,
             intermediate_size=getattr(config, "intermediate_size", None) or getattr(config, "moe_intermediate_size", 18432),
@@ -461,14 +464,14 @@ if __name__ == "__main__":
             num_layers=num_layers,
             k_cache=[ckv_kpe_cache[i] for i in range(num_layers)],
             v_cache=[ckv_kpe_cache[i] for i in range(num_layers)],
-            position_embeddings=None,  # MLA handles position embeddings differently
+            position_embeddings=None,
             state_dict=state_dict,
             with_lm_head=True,
         )
 
         # Build the computation graph using the DeepSeek V3 builder
         builder = DeepSeekV3Builder(mpk)
-        builder.build_from_config(model_config)
+        builder.build_from_config(model_config, layer_indices=layer_indices_arg)
 
         results = mpk.kn_graph.generate_task_graph(
             num_gpus=world_size, my_gpu_id=rank

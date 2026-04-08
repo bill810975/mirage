@@ -74,14 +74,19 @@ class DeepSeekV3Builder(GraphBuilder):
             "Use build_from_config() with pre-converted weights."
         )
 
-    def build_from_config(self, model_config: MirageModelConfig):
-        """Build from pre-processed config with absorbed weights."""
+    def build_from_config(self, model_config: MirageModelConfig, layer_indices: list = None):
+        """Build from pre-processed config with absorbed weights.
+
+        Args:
+            layer_indices: If provided, only build these specific layer indices.
+        """
         self.ckv_kpe_cache = model_config.k_cache  # [num_layers, num_pages, page_size, 576]
         self.position_embeddings = model_config.position_embeddings
 
         self.build_from_dict(
             model_config.state_dict,
             model_config.with_lm_head,
+            layer_indices=layer_indices,
         )
 
     def _fp8_linear(self, input_bf16, weight_fp8, weight_scale, output,
@@ -1161,9 +1166,16 @@ class DeepSeekV3Builder(GraphBuilder):
                 num_draft_tokens=num_draft_steps,
             )
 
-    def build_layers(self, state_dict: dict):
-        """Build all 61 decoder layers."""
-        for i in range(self.num_layers):
+    def build_layers(self, state_dict: dict, layer_indices: list = None):
+        """Build decoder layers.
+
+        Args:
+            layer_indices: If provided, only build these specific layer indices
+                          (e.g., [0, 3] for 1 dense + 1 MoE). If None, build all.
+        """
+        if layer_indices is None:
+            layer_indices = list(range(self.num_layers))
+        for i in layer_indices:
             prefix = f"model.layers.{i}."
 
             # Input layernorm
@@ -1221,8 +1233,13 @@ class DeepSeekV3Builder(GraphBuilder):
                 )
                 self.x = self.allreduce_out
 
-    def build_from_dict(self, state_dict: dict, with_lm_head: bool):
-        """Build the full DeepSeek V3 computation graph."""
+    def build_from_dict(self, state_dict: dict, with_lm_head: bool,
+                        layer_indices: list = None):
+        """Build the DeepSeek V3 computation graph.
+
+        Args:
+            layer_indices: If provided, only build these layers (for correctness testing).
+        """
         padded_vocab_size = 129280  # DeepSeek V3 vocab size (already aligned)
 
         # Embed layer
@@ -1248,7 +1265,7 @@ class DeepSeekV3Builder(GraphBuilder):
         self._new_intermediate_tensors()
 
         # Build all decoder layers
-        self.build_layers(state_dict)
+        self.build_layers(state_dict, layer_indices=layer_indices)
 
         # Final norm + LM head
         w_final_norm = self.mpk.attach_input(
