@@ -313,19 +313,24 @@ class DeepSeekV3Builder(GraphBuilder):
         s_kv_latent = self._safe_attach(
             kv_a_s[:scale_rows_latent].contiguous(),
             f"layer_{layer_idx}_kv_a_latent_scale")
-        w_kv_rope = self._safe_attach(
-            kv_a_w[self.kv_lora_rank:].contiguous(),
-            f"layer_{layer_idx}_kv_a_rope")
-        s_kv_rope = self._safe_attach(
-            kv_a_s[scale_rows_latent:].contiguous(),
-            f"layer_{layer_idx}_kv_a_rope_scale")
+        # kv_a_rope: output=64, not 128-aligned for FP8 GEMM. Use BF16 dequant.
+        kv_rope_w_fp8 = kv_a_w[self.kv_lora_rank:].contiguous()
+        kv_rope_s = kv_a_s[scale_rows_latent:].contiguous()
+        # Dequantize FP8 weight to BF16 for this small projection
+        kv_rope_w_bf16 = (kv_rope_w_fp8.float() * kv_rope_s.float().repeat_interleave(
+            128, dim=-1)[:, :kv_rope_w_fp8.shape[-1]]).to(torch.bfloat16)
+        w_kv_rope = self.mpk.attach_input(
+            torch_tensor=kv_rope_w_bf16,
+            name=f"layer_{layer_idx}_kv_a_rope")
 
         self._fp8_linear(self.rmsnorm_out, w_kv_latent, s_kv_latent, self.c_latent_out,
                          grid_dim=(grid_for_rmsnorm_linear_layer(self.kv_lora_rank), 1, 1),
                          block_dim=(128, 1, 1))
-        self._fp8_linear(self.rmsnorm_out, w_kv_rope, s_kv_rope, self.k_pe_out,
-                         grid_dim=(grid_for_rmsnorm_linear_layer(QK_ROPE_HEAD_DIM), 1, 1),
-                         block_dim=(128, 1, 1))
+        # BF16 linear for rope projection (64 output dims, not FP8-aligned)
+        self.mpk.linear_layer(
+            input=self.rmsnorm_out, weight=w_kv_rope, output=self.k_pe_out,
+            grid_dim=(grid_for_rmsnorm_linear_layer(QK_ROPE_HEAD_DIM), 1, 1),
+            block_dim=(128, 1, 1))
 
         # Step 5: kv_a_layernorm on c_latent ONLY
         w_kv_a_ln = self.mpk.attach_input(
@@ -705,17 +710,21 @@ class DeepSeekV3Builder(GraphBuilder):
             kv_a_w[:self.kv_lora_rank].contiguous(), f"mtp_{attn}kv_a_latent")
         s_kv_latent = self._safe_attach(
             kv_a_s[:scale_rows_latent].contiguous(), f"mtp_{attn}kv_a_latent_scale")
-        w_kv_rope = self._safe_attach(
-            kv_a_w[self.kv_lora_rank:].contiguous(), f"mtp_{attn}kv_a_rope")
-        s_kv_rope = self._safe_attach(
-            kv_a_s[scale_rows_latent:].contiguous(), f"mtp_{attn}kv_a_rope_scale")
+        # kv_a_rope: dequant to BF16 (output=64, not 128-aligned for FP8)
+        kv_rope_w_fp8 = kv_a_w[self.kv_lora_rank:].contiguous()
+        kv_rope_s = kv_a_s[scale_rows_latent:].contiguous()
+        kv_rope_w_bf16 = (kv_rope_w_fp8.float() * kv_rope_s.float().repeat_interleave(
+            128, dim=-1)[:, :kv_rope_w_fp8.shape[-1]]).to(torch.bfloat16)
+        w_kv_rope = self.mpk.attach_input(
+            torch_tensor=kv_rope_w_bf16, name=f"mtp_{attn}kv_a_rope")
 
         self._fp8_linear(self.rmsnorm_out, w_kv_latent, s_kv_latent, self.c_latent_out,
                          grid_dim=(grid_for_rmsnorm_linear_layer(self.kv_lora_rank), 1, 1),
                          block_dim=(128, 1, 1))
-        self._fp8_linear(self.rmsnorm_out, w_kv_rope, s_kv_rope, self.k_pe_out,
-                         grid_dim=(grid_for_rmsnorm_linear_layer(QK_ROPE_HEAD_DIM), 1, 1),
-                         block_dim=(128, 1, 1))
+        self.mpk.linear_layer(
+            input=self.rmsnorm_out, weight=w_kv_rope, output=self.k_pe_out,
+            grid_dim=(grid_for_rmsnorm_linear_layer(QK_ROPE_HEAD_DIM), 1, 1),
+            block_dim=(128, 1, 1))
 
         w_kv_a_ln = self.mpk.attach_input(
             torch_tensor=state_dict[f"{attn}kv_a_layernorm.weight"],
