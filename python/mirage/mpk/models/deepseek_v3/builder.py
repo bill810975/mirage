@@ -423,12 +423,19 @@ class DeepSeekV3Builder(GraphBuilder):
             block_dim=(128, 1, 1),
         )
 
-        # TopK softmax routing
-        self.mpk.moe_topk_softmax_routing_layer(
+        # TopK sigmoid routing (DeepSeek V3: scoring_func=sigmoid)
+        # e_score_correction_bias is added to sigmoid scores for routing selection
+        bias_key = f"{prefix}gate.e_score_correction_bias"
+        w_bias = self.mpk.attach_input(
+            torch_tensor=state_dict[bias_key],
+            name=f"layer_{layer_idx}_moe_gate_bias",
+        )
+        self.mpk.moe_topk_sigmoid_routing_layer(
             input=router_logits,
+            bias=w_bias,
             output=(moe_topk_weights, moe_routing_indices, moe_mask),
             grid_dim=(1, 1, 1),
-            block_dim=(128, 1, 1),
+            block_dim=(256, 1, 1),  # 8 warps required by topk kernel
         )
 
         # Expert W1+W3 (gate + up projection)

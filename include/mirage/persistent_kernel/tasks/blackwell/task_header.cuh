@@ -33,4 +33,5 @@
 #include "tasks/speculative_decoding/mtp_token_ops.cuh"
 #include "tasks/common/sampling.cuh"
 #include "tensor_init.cuh"
+#include "topk_sigmoid_sm100.cuh"
 #include "topk_softmax_sm100.cuh"
