@@ -84,6 +84,63 @@ class DeepSeekV3Builder(GraphBuilder):
             model_config.with_lm_head,
         )
 
+    def _fp8_linear(self, input_bf16, weight_fp8, weight_scale, output,
+                     grid_dim, block_dim, residual=None):
+        """Quantize BF16 input → FP8, then run FP8 GEMM.
+
+        If weight is BF16 (no scale), falls back to BF16 linear.
+        Handles the quantize → gemm pipeline automatically.
+        """
+        mbt = self.max_num_batched_tokens
+        reduction_size = weight_fp8.dim(1) if weight_fp8.num_dims == 2 else weight_fp8.dim(-1)
+        group_size = 128
+        num_groups = (reduction_size + group_size - 1) // group_size
+
+        # Allocate quantize output buffers (reusable)
+        if not hasattr(self, '_fp8_input_buf') or self._fp8_input_buf.dim(1) != reduction_size:
+            self._fp8_input_buf = self.mpk.new_tensor(
+                dims=(mbt, reduction_size), dtype=bfloat16,  # placeholder dtype, actual is fp8
+                name=f"fp8_input_{reduction_size}",
+                io_category="cuda_tensor",
+            )
+            self._fp8_scale_buf = self.mpk.new_tensor(
+                dims=(mbt, num_groups), dtype=bfloat16,  # placeholder, actual is uint32
+                name=f"fp8_scale_{reduction_size}",
+                io_category="cuda_tensor",
+            )
+
+        # Step 1: Quantize input BF16 → FP8
+        self.mpk.quantize_fp8_layer(
+            input=input_bf16,
+            output_fp8=self._fp8_input_buf,
+            output_scale=self._fp8_scale_buf,
+            grid_dim=(mbt, 1, 1),
+            block_dim=(128, 1, 1),
+        )
+
+        # Step 2: FP8 GEMM
+        if residual is not None:
+            self.mpk.linear_fp8_with_residual_layer(
+                input_fp8=self._fp8_input_buf,
+                input_scale=self._fp8_scale_buf,
+                weight_fp8=weight_fp8,
+                weight_scale=weight_scale,
+                residual=residual,
+                output=output,
+                grid_dim=grid_dim,
+                block_dim=block_dim,
+            )
+        else:
+            self.mpk.linear_fp8_layer(
+                input_fp8=self._fp8_input_buf,
+                input_scale=self._fp8_scale_buf,
+                weight_fp8=weight_fp8,
+                weight_scale=weight_scale,
+                output=output,
+                grid_dim=grid_dim,
+                block_dim=block_dim,
+            )
+
     def _new_intermediate_tensors(self):
         """Allocate intermediate computation buffers."""
         mbt = self.max_num_batched_tokens

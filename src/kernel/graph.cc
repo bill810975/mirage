@@ -634,6 +634,21 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
         customized->bgraph, params);
     task_config[op] =
         std::make_tuple(2, 3, TASK_TOPK_SIGMOID_SM100, variant_id);
+  } else if (name == "quantize_fp8_sm100") {
+    int variant_id = task_register->register_quantize_fp8_sm100_task(
+        customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(1, 2, TASK_QUANTIZE_FP8_SM100, variant_id);
+  } else if (name == "linear_fp8_sm100") {
+    int variant_id = task_register->register_linear_fp8_sm100_task(
+        customized->bgraph, params, false);
+    task_config[op] =
+        std::make_tuple(4, 1, TASK_LINEAR_FP8_SM100, variant_id);
+  } else if (name == "linear_fp8_with_residual_sm100") {
+    int variant_id = task_register->register_linear_fp8_sm100_task(
+        customized->bgraph, params, true);
+    task_config[op] =
+        std::make_tuple(5, 1, TASK_LINEAR_FP8_WITH_RESIDUAL_SM100, variant_id);
   } else if (name == "moe_w13_linear_sm100") {
     int variant_id = task_register->register_moe_linear_sm100_task(
         customized->bgraph, params, true /*w13_linear*/);

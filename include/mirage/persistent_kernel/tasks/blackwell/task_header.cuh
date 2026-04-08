@@ -24,7 +24,9 @@
 #include "argmax_sm100.cuh"
 #include "attention_sm100.cuh"
 #include "mla_attention_sm100.cuh"
+#include "linear_fp8_1d2d_sm100.cuh"
 #include "linear_sm100_mpk.cuh"
+#include "per_token_group_quantize_fp8.cuh"
 #include "moe_linear_sm100.cuh"
 #include "mul_sum_add_sm100.cuh"
 // Speculative decoding / MTP tasks

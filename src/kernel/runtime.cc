@@ -1257,6 +1257,10 @@ TaskGraphResult print_task_graph(
   task_type_to_name[TASK_MTP_TOKEN_SCATTER] = "TASK_MTP_TOKEN_SCATTER";
   task_type_to_name[TASK_MTP_PREPARE_VERIFY] = "TASK_MTP_PREPARE_VERIFY";
   task_type_to_name[TASK_TOPK_SIGMOID_SM100] = "TASK_TOPK_SIGMOID_SM100";
+  task_type_to_name[TASK_QUANTIZE_FP8_SM100] = "TASK_QUANTIZE_FP8_SM100";
+  task_type_to_name[TASK_LINEAR_FP8_SM100] = "TASK_LINEAR_FP8_SM100";
+  task_type_to_name[TASK_LINEAR_FP8_WITH_RESIDUAL_SM100] =
+      "TASK_LINEAR_FP8_WITH_RESIDUAL_SM100";
   // Multi-gpu tasks
   task_type_to_name[TASK_NVSHMEM_ALLGATHER_STRIDED_PUT] =
       "TASK_NVSHMEM_ALLGATHER_STRIDED_PUT";

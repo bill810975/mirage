@@ -893,6 +893,80 @@ class PersistentKernel:
 
         self.kn_graph.register_task(tb_graph, "moe_topk_softmax_sm100")
 
+    def quantize_fp8_layer(
+        self,
+        input: DTensor,         # [batch, hidden] bf16
+        output_fp8: DTensor,    # [batch, hidden] fp8_e4m3
+        output_scale: DTensor,  # [batch, hidden/group_size] uint32 (packed ue8m0)
+        grid_dim: tuple,
+        block_dim: tuple,
+    ):
+        """Per-token-group quantize BF16 → FP8 E4M3 with packed UE8M0 scales."""
+        assert input.num_dims == 2
+        assert output_fp8.num_dims == 2
+        assert output_scale.num_dims == 2
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(input, (0, -1, -1), -1, True)
+        tb_graph.new_input(output_fp8, (0, -1, -1), -1, True)
+        tb_graph.new_input(output_scale, (0, -1, -1), -1, True)
+        self.kn_graph.customized([input, output_fp8, output_scale], tb_graph)
+        self.kn_graph.register_task(tb_graph, "quantize_fp8_sm100")
+
+    def linear_fp8_layer(
+        self,
+        input_fp8: DTensor,     # [batch, reduction] fp8
+        input_scale: DTensor,   # [batch, reduction/128] uint32
+        weight_fp8: DTensor,    # [output, reduction] fp8
+        weight_scale: DTensor,  # [output, reduction/128] uint32
+        output: DTensor,        # [batch, output] bf16
+        grid_dim: tuple,
+        block_dim: tuple,
+    ):
+        """FP8 E4M3 dense GEMM with packed UE8M0 scales, BF16 output."""
+        assert input_fp8.num_dims == 2
+        assert weight_fp8.num_dims == 2
+        assert output.num_dims == 2
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(input_fp8, (-1, -1, -1), -1, True)
+        tb_graph.new_input(input_scale, (-1, -1, -1), -1, True)
+        tb_graph.new_input(weight_fp8, (-1, 1, -1), -1, True)
+        tb_graph.new_input(weight_scale, (-1, -1, -1), -1, True)
+        tb_graph.new_input(output, (-1, 1, -1), -1, True)
+        self.kn_graph.customized(
+            [input_fp8, input_scale, weight_fp8, weight_scale, output], tb_graph)
+        assert self.target_cc == 100
+        self.kn_graph.register_task(tb_graph, "linear_fp8_sm100")
+
+    def linear_fp8_with_residual_layer(
+        self,
+        input_fp8: DTensor,     # [batch, reduction] fp8
+        input_scale: DTensor,   # [batch, reduction/128] uint32
+        weight_fp8: DTensor,    # [output, reduction] fp8
+        weight_scale: DTensor,  # [output, reduction/128] uint32
+        residual: DTensor,      # [batch, output] bf16
+        output: DTensor,        # [batch, output] bf16
+        grid_dim: tuple,
+        block_dim: tuple,
+    ):
+        """FP8 dense GEMM + residual add, BF16 output."""
+        assert input_fp8.num_dims == 2
+        assert weight_fp8.num_dims == 2
+        assert residual.num_dims == 2
+        assert output.num_dims == 2
+        params = [1]  # rank_with_residual
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(input_fp8, (-1, -1, -1), -1, True)
+        tb_graph.new_input(input_scale, (-1, -1, -1), -1, True)
+        tb_graph.new_input(weight_fp8, (-1, 1, -1), -1, True)
+        tb_graph.new_input(weight_scale, (-1, -1, -1), -1, True)
+        tb_graph.new_input(residual, (-1, -1, -1), -1, True)
+        tb_graph.new_input(output, (-1, 1, -1), -1, True)
+        self.kn_graph.customized(
+            [input_fp8, input_scale, weight_fp8, weight_scale,
+             residual, output], tb_graph)
+        assert self.target_cc == 100
+        self.kn_graph.register_task(tb_graph, "linear_fp8_with_residual_sm100", params)
+
     def moe_topk_sigmoid_routing_layer(
         self,
         input: DTensor,         # [batch_size, num_experts] router logits
