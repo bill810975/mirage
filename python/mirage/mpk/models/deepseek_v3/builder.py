@@ -17,7 +17,7 @@ from ..utils import grid_for_rmsnorm_linear_layer
 from ..graph_builder import GraphBuilder, MirageModelConfig
 from ...persistent_kernel import PersistentKernel
 from ...model_registry import register_model_builder
-from ....core import bfloat16, int64
+from ....core import bfloat16, float8_e4m3, float32, int64
 
 
 # DeepSeek V3 architecture constants
@@ -515,15 +515,33 @@ class DeepSeekV3Builder(GraphBuilder):
         )
 
         # Expert W2 (down projection) — FP8
-        # Need to quantize silu output for FP8 W2
+        # Quantize 3D silu_out [batch, topk, intermediate] — quantize kernel
+        # flattens to [batch*topk, intermediate] internally
         w_experts_w2 = self._safe_attach(
             state_dict[f"{prefix}experts.w2.weight"],
             f"layer_{layer_idx}_experts_w2")
         s_experts_w2 = self._safe_attach(
             state_dict[f"{prefix}experts.w2.weight_scale_inv"],
             f"layer_{layer_idx}_experts_w2_scale")
-        # TODO: quantize silu_out for FP8 W2 (need per-token-group quantize on 3D tensor)
-        # For now, use BF16 W2 as fallback since 3D quantize not yet supported
+        moe_silu_fp8 = self.mpk.new_tensor(
+            dims=(mbt, NUM_EXPERTS_PER_TOK, self.moe_intermediate_size),
+            dtype=float8_e4m3,
+            name=f"layer_{layer_idx}_moe_silu_fp8",
+            io_category="cuda_tensor",
+        )
+        moe_silu_scale = self.mpk.new_tensor(
+            dims=(mbt, NUM_EXPERTS_PER_TOK, self.moe_intermediate_size // 128),
+            dtype=float32,
+            name=f"layer_{layer_idx}_moe_silu_scale",
+            io_category="cuda_tensor",
+        )
+        self.mpk.quantize_fp8_layer(
+            input=moe_silu_out,
+            output_fp8=moe_silu_fp8,
+            output_scale=moe_silu_scale,
+            grid_dim=(mbt * NUM_EXPERTS_PER_TOK, 1, 1),
+            block_dim=(128, 1, 1),
+        )
         moe_down_out = self.mpk.new_tensor(
             dims=(mbt, NUM_EXPERTS_PER_TOK, self.hidden_size),
             dtype=bfloat16,
@@ -531,8 +549,8 @@ class DeepSeekV3Builder(GraphBuilder):
             io_category="cuda_tensor",
         )
         self.mpk.moe_w2_fp8_layer(
-            input_fp8=moe_silu_out,  # TODO: should be quantized FP8
-            input_scale=moe_input_scale,  # placeholder
+            input_fp8=moe_silu_fp8,
+            input_scale=moe_silu_scale,
             weight_fp8=w_experts_w2,
             weight_scale=s_experts_w2,
             moe_routing_indices=moe_routing_indices,
@@ -843,15 +861,25 @@ class DeepSeekV3Builder(GraphBuilder):
             input=moe_mid, output=moe_silu_out,
             grid_dim=(mbt * NUM_EXPERTS_PER_TOK, 1, 1), block_dim=(128, 1, 1))
 
-        # Expert W2 (FP8)
+        # Expert W2 (FP8) — quantize 3D silu_out first
         w_w2, s_w2 = self._attach_fp8_weight(
             state_dict, f"{mlp_prefix}experts.w2.weight",
             f"mtp_{mlp_prefix}experts_w2")
+        mtp_silu_fp8 = self.mpk.new_tensor(
+            dims=(mbt, NUM_EXPERTS_PER_TOK, self.moe_intermediate_size),
+            dtype=float8_e4m3, name="mtp_moe_silu_fp8", io_category="cuda_tensor")
+        mtp_silu_scale = self.mpk.new_tensor(
+            dims=(mbt, NUM_EXPERTS_PER_TOK, self.moe_intermediate_size // 128),
+            dtype=float32, name="mtp_moe_silu_scale", io_category="cuda_tensor")
+        self.mpk.quantize_fp8_layer(
+            input=moe_silu_out, output_fp8=mtp_silu_fp8,
+            output_scale=mtp_silu_scale,
+            grid_dim=(mbt * NUM_EXPERTS_PER_TOK, 1, 1), block_dim=(128, 1, 1))
         moe_down_out = self.mpk.new_tensor(
             dims=(mbt, NUM_EXPERTS_PER_TOK, self.hidden_size),
             dtype=bfloat16, name="mtp_moe_down", io_category="cuda_tensor")
         self.mpk.moe_w2_fp8_layer(
-            input_fp8=moe_silu_out, input_scale=moe_input_scale,
+            input_fp8=mtp_silu_fp8, input_scale=mtp_silu_scale,
             weight_fp8=w_w2, weight_scale=s_w2,
             moe_routing_indices=moe_routing_indices, moe_mask=moe_mask,
             output=moe_down_out, grid_dim=(NUM_EXPERTS, 1, 1), block_dim=(128, 1, 1))

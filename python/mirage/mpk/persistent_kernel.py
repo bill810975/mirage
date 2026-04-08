@@ -901,10 +901,14 @@ class PersistentKernel:
         grid_dim: tuple,
         block_dim: tuple,
     ):
-        """Per-token-group quantize BF16 → FP8 E4M3 with packed UE8M0 scales."""
-        assert input.num_dims == 2
-        assert output_fp8.num_dims == 2
-        assert output_scale.num_dims == 2
+        """Per-token-group quantize BF16 → FP8 E4M3 with packed UE8M0 scales.
+
+        Supports 2D [batch, hidden] or 3D [batch, topk, hidden] inputs.
+        For 3D, the kernel flattens to [batch*topk, hidden] internally.
+        """
+        assert input.num_dims in (2, 3)
+        assert output_fp8.num_dims == input.num_dims
+        assert output_scale.num_dims == input.num_dims
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         tb_graph.new_input(input, (0, -1, -1), -1, True)
         tb_graph.new_input(output_fp8, (0, -1, -1), -1, True)

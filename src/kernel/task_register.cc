@@ -2253,8 +2253,8 @@ int TaskRegister::register_linear_fp8_sm100_task(
 
 int TaskRegister::register_quantize_fp8_sm100_task(
     threadblock::Graph const &bgraph, std::vector<int> const &params) {
-  // Input: bf16 [batch, hidden]
-  // Output: fp8 [batch, hidden], scale [batch, hidden/group_size]
+  // Input: bf16 [batch, hidden] or [batch, topk, hidden] (3D flattened)
+  // Output: fp8 same shape, scale [..., hidden/group_size]
   assert(params.size() == 0);
   int batch_size = 0, hidden_size = 0;
   std::vector<tb::TBInputOp *> input_ops;
@@ -2270,9 +2270,17 @@ int TaskRegister::register_quantize_fp8_sm100_task(
       output_ops.push_back(static_cast<tb::TBInputOp *>(op));
     }
   }
-  assert(input_ops[0]->dtensor.num_dims == 2);
-  batch_size = input_ops[0]->output_tensors[0].dim[0];
-  hidden_size = input_ops[0]->output_tensors[0].dim[1];
+  int ndims = input_ops[0]->dtensor.num_dims;
+  assert(ndims == 2 || ndims == 3);
+  if (ndims == 3) {
+    // Flatten first two dims: [batch, topk, hidden] → batch_size = batch*topk
+    batch_size = input_ops[0]->output_tensors[0].dim[0] *
+                 input_ops[0]->output_tensors[0].dim[1];
+    hidden_size = input_ops[0]->output_tensors[0].dim[2];
+  } else {
+    batch_size = input_ops[0]->output_tensors[0].dim[0];
+    hidden_size = input_ops[0]->output_tensors[0].dim[1];
+  }
   int input_stride = input_ops[0]->dtensor.dim[1];
   constexpr int GROUP_SIZE = 128;
 
