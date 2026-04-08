@@ -31,7 +31,8 @@ QK_ROPE_HEAD_DIM = 64     # per-head rope dim
 V_HEAD_DIM = 128          # per-head value dim (before absorption)
 QK_HEAD_DIM_TOTAL = 576   # 512 latent + 64 rope (after absorption)
 V_HEAD_DIM_TOTAL = 512    # latent dim only (after absorption)
-INTERMEDIATE_SIZE = 18432  # MLP intermediate
+INTERMEDIATE_SIZE = 18432       # Dense MLP intermediate (layers 0-2)
+MOE_INTERMEDIATE_SIZE = 2048    # Per-expert intermediate (routed + shared)
 NUM_EXPERTS = 256
 NUM_EXPERTS_PER_TOK = 8
 NUM_SHARED_EXPERTS = 1
@@ -62,6 +63,7 @@ class DeepSeekV3Builder(GraphBuilder):
         self.q_lora_rank = Q_LORA_RANK
         self.kv_lora_rank = KV_LORA_RANK
         self.intermediate_size = INTERMEDIATE_SIZE // self.world_size
+        self.moe_intermediate_size = MOE_INTERMEDIATE_SIZE // self.world_size
 
         # MTP config
         self.mtp_config = getattr(mpk, 'spec_decode_config', None)
@@ -488,11 +490,75 @@ class DeepSeekV3Builder(GraphBuilder):
             block_dim=(128, 1, 1),
         )
 
-        # Weighted sum + residual
+        # ---- Shared Expert (1 expert, TP parallel, same as dense MLP) ----
+        # Shared expert runs on ALL tokens independently of routing.
+        # Its output is added to the residual before the routed expert reduction:
+        #   final = sum(routed * weights) + (residual + shared_expert_out)
+        shared_prefix = f"{prefix}shared_experts."
+
+        # gate_proj + up_proj fused
+        w_shared_gate_up = self.mpk.attach_input(
+            torch_tensor=torch.cat([
+                state_dict[f"{shared_prefix}gate_proj.weight"],
+                state_dict[f"{shared_prefix}up_proj.weight"],
+            ], dim=0),
+            name=f"layer_{layer_idx}_shared_expert_gate_up",
+        )
+        shared_mid = self.mpk.new_tensor(
+            dims=(self.max_num_batched_tokens, 2 * self.moe_intermediate_size),
+            dtype=bfloat16,
+            name=f"layer_{layer_idx}_shared_mid",
+            io_category="cuda_tensor",
+        )
+        self.mpk.linear_layer(
+            input=self.rmsnorm_out,
+            weight=w_shared_gate_up,
+            output=shared_mid,
+            grid_dim=(grid_for_rmsnorm_linear_layer(w_shared_gate_up.dim(0)), 1, 1),
+            block_dim=(128, 1, 1),
+        )
+
+        # silu_mul
+        shared_silu_out = self.mpk.new_tensor(
+            dims=(self.max_num_batched_tokens, self.moe_intermediate_size),
+            dtype=bfloat16,
+            name=f"layer_{layer_idx}_shared_silu",
+            io_category="cuda_tensor",
+        )
+        self.mpk.silu_mul_layer(
+            input=shared_mid,
+            output=shared_silu_out,
+            grid_dim=(self.moe_intermediate_size // 64, 1, 1),
+            block_dim=(128, 1, 1),
+        )
+
+        # down_proj with residual: shared_residual = self.x + shared_down(shared_silu)
+        # This fuses the shared expert output with the skip connection.
+        w_shared_down = self.mpk.attach_input(
+            torch_tensor=state_dict[f"{shared_prefix}down_proj.weight"],
+            name=f"layer_{layer_idx}_shared_expert_down",
+        )
+        shared_residual = self.mpk.new_tensor(
+            dims=(self.max_num_batched_tokens, self.hidden_size),
+            dtype=bfloat16,
+            name=f"layer_{layer_idx}_shared_residual",
+            io_category="cuda_tensor",
+        )
+        self.mpk.linear_with_residual_layer(
+            input=shared_silu_out,
+            weight=w_shared_down,
+            residual=self.x,
+            output=shared_residual,
+            grid_dim=(self.hidden_size // 64, 1, 1),
+            block_dim=(128, 1, 1),
+        )
+
+        # Final: moe_output = sum(routed_experts * weights) + shared_residual
+        # where shared_residual = original_hidden + shared_expert_output
         self.mpk.moe_mul_sum_add_layer(
             input=moe_down_out,
             weight=moe_topk_weights,
-            residual=self.x,
+            residual=shared_residual,
             output=moe_output,
             grid_dim=(self.max_num_batched_tokens, 1, 1),
             block_dim=(128, 1, 1),
