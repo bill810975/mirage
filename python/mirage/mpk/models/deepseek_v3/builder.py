@@ -255,12 +255,19 @@ class DeepSeekV3Builder(GraphBuilder):
             io_category="cuda_tensor",
         )
 
+    def _safe_attach(self, tensor, name):
+        """Attach tensor, converting unsupported dtypes to byte-equivalent ones."""
+        if tensor.dtype == torch.float8_e4m3fn:
+            tensor = tensor.view(torch.uint8)
+        elif tensor.dtype == torch.float32:
+            # scale_inv tensors: keep as float32 (mirage supports it)
+            pass
+        return self.mpk.attach_input(torch_tensor=tensor, name=name)
+
     def _attach_fp8_weight(self, state_dict, key, name):
         """Attach FP8 weight + its packed UE8M0 scale_inv."""
-        w = self.mpk.attach_input(
-            torch_tensor=state_dict[key], name=name)
-        s = self.mpk.attach_input(
-            torch_tensor=state_dict[f"{key}_scale_inv"], name=f"{name}_scale")
+        w = self._safe_attach(state_dict[key], name)
+        s = self._safe_attach(state_dict[f"{key}_scale_inv"], f"{name}_scale")
         return w, s
 
     def _build_mla_attention_layer(self, layer_idx: int, state_dict: dict):
@@ -300,22 +307,18 @@ class DeepSeekV3Builder(GraphBuilder):
         latent_ratio = self.kv_lora_rank / (self.kv_lora_rank + QK_ROPE_HEAD_DIM)
         scale_rows_latent = round(scale_rows_total * latent_ratio)
 
-        w_kv_latent, s_kv_latent = (
-            self.mpk.attach_input(
-                torch_tensor=kv_a_w[:self.kv_lora_rank].contiguous(),
-                name=f"layer_{layer_idx}_kv_a_latent"),
-            self.mpk.attach_input(
-                torch_tensor=kv_a_s[:scale_rows_latent].contiguous(),
-                name=f"layer_{layer_idx}_kv_a_latent_scale"),
-        )
-        w_kv_rope, s_kv_rope = (
-            self.mpk.attach_input(
-                torch_tensor=kv_a_w[self.kv_lora_rank:].contiguous(),
-                name=f"layer_{layer_idx}_kv_a_rope"),
-            self.mpk.attach_input(
-                torch_tensor=kv_a_s[scale_rows_latent:].contiguous(),
-                name=f"layer_{layer_idx}_kv_a_rope_scale"),
-        )
+        w_kv_latent = self._safe_attach(
+            kv_a_w[:self.kv_lora_rank].contiguous(),
+            f"layer_{layer_idx}_kv_a_latent")
+        s_kv_latent = self._safe_attach(
+            kv_a_s[:scale_rows_latent].contiguous(),
+            f"layer_{layer_idx}_kv_a_latent_scale")
+        w_kv_rope = self._safe_attach(
+            kv_a_w[self.kv_lora_rank:].contiguous(),
+            f"layer_{layer_idx}_kv_a_rope")
+        s_kv_rope = self._safe_attach(
+            kv_a_s[scale_rows_latent:].contiguous(),
+            f"layer_{layer_idx}_kv_a_rope_scale")
 
         self._fp8_linear(self.rmsnorm_out, w_kv_latent, s_kv_latent, self.c_latent_out,
                          grid_dim=(grid_for_rmsnorm_linear_layer(self.kv_lora_rank), 1, 1),
@@ -452,14 +455,12 @@ class DeepSeekV3Builder(GraphBuilder):
         )
 
         # Expert W1+W3 (gate + up projection) — FP8
-        w_experts_w13 = self.mpk.attach_input(
-            torch_tensor=state_dict[f"{prefix}experts.w13.weight"],
-            name=f"layer_{layer_idx}_experts_w13",
-        )
-        s_experts_w13 = self.mpk.attach_input(
-            torch_tensor=state_dict[f"{prefix}experts.w13.weight_scale_inv"],
-            name=f"layer_{layer_idx}_experts_w13_scale",
-        )
+        w_experts_w13 = self._safe_attach(
+            state_dict[f"{prefix}experts.w13.weight"],
+            f"layer_{layer_idx}_experts_w13")
+        s_experts_w13 = self._safe_attach(
+            state_dict[f"{prefix}experts.w13.weight_scale_inv"],
+            f"layer_{layer_idx}_experts_w13_scale")
         # Quantize input for MoE FP8
         mbt = self.max_num_batched_tokens
         moe_input_fp8 = self.mpk.new_tensor(
@@ -510,14 +511,12 @@ class DeepSeekV3Builder(GraphBuilder):
 
         # Expert W2 (down projection) — FP8
         # Need to quantize silu output for FP8 W2
-        w_experts_w2 = self.mpk.attach_input(
-            torch_tensor=state_dict[f"{prefix}experts.w2.weight"],
-            name=f"layer_{layer_idx}_experts_w2",
-        )
-        s_experts_w2 = self.mpk.attach_input(
-            torch_tensor=state_dict[f"{prefix}experts.w2.weight_scale_inv"],
-            name=f"layer_{layer_idx}_experts_w2_scale",
-        )
+        w_experts_w2 = self._safe_attach(
+            state_dict[f"{prefix}experts.w2.weight"],
+            f"layer_{layer_idx}_experts_w2")
+        s_experts_w2 = self._safe_attach(
+            state_dict[f"{prefix}experts.w2.weight_scale_inv"],
+            f"layer_{layer_idx}_experts_w2_scale")
         # TODO: quantize silu_out for FP8 W2 (need per-token-group quantize on 3D tensor)
         # For now, use BF16 W2 as fallback since 3D quantize not yet supported
         moe_down_out = self.mpk.new_tensor(
@@ -550,14 +549,12 @@ class DeepSeekV3Builder(GraphBuilder):
         shared_up_w = state_dict[f"{shared_prefix}up_proj.weight"]
         shared_gate_s = state_dict[f"{shared_prefix}gate_proj.weight_scale_inv"]
         shared_up_s = state_dict[f"{shared_prefix}up_proj.weight_scale_inv"]
-        w_shared_gate_up = self.mpk.attach_input(
-            torch_tensor=torch.cat([shared_gate_w, shared_up_w], dim=0),
-            name=f"layer_{layer_idx}_shared_expert_gate_up",
-        )
-        s_shared_gate_up = self.mpk.attach_input(
-            torch_tensor=torch.cat([shared_gate_s, shared_up_s], dim=0),
-            name=f"layer_{layer_idx}_shared_expert_gate_up_scale",
-        )
+        w_shared_gate_up = self._safe_attach(
+            torch.cat([shared_gate_w, shared_up_w], dim=0),
+            f"layer_{layer_idx}_shared_expert_gate_up")
+        s_shared_gate_up = self._safe_attach(
+            torch.cat([shared_gate_s, shared_up_s], dim=0),
+            f"layer_{layer_idx}_shared_expert_gate_up_scale")
         shared_mid = self.mpk.new_tensor(
             dims=(self.max_num_batched_tokens, 2 * self.moe_intermediate_size),
             dtype=bfloat16,
@@ -704,18 +701,14 @@ class DeepSeekV3Builder(GraphBuilder):
         latent_ratio = self.kv_lora_rank / (self.kv_lora_rank + QK_ROPE_HEAD_DIM)
         scale_rows_latent = round(scale_rows_total * latent_ratio)
 
-        w_kv_latent = self.mpk.attach_input(
-            torch_tensor=kv_a_w[:self.kv_lora_rank].contiguous(),
-            name=f"mtp_{attn}kv_a_latent")
-        s_kv_latent = self.mpk.attach_input(
-            torch_tensor=kv_a_s[:scale_rows_latent].contiguous(),
-            name=f"mtp_{attn}kv_a_latent_scale")
-        w_kv_rope = self.mpk.attach_input(
-            torch_tensor=kv_a_w[self.kv_lora_rank:].contiguous(),
-            name=f"mtp_{attn}kv_a_rope")
-        s_kv_rope = self.mpk.attach_input(
-            torch_tensor=kv_a_s[scale_rows_latent:].contiguous(),
-            name=f"mtp_{attn}kv_a_rope_scale")
+        w_kv_latent = self._safe_attach(
+            kv_a_w[:self.kv_lora_rank].contiguous(), f"mtp_{attn}kv_a_latent")
+        s_kv_latent = self._safe_attach(
+            kv_a_s[:scale_rows_latent].contiguous(), f"mtp_{attn}kv_a_latent_scale")
+        w_kv_rope = self._safe_attach(
+            kv_a_w[self.kv_lora_rank:].contiguous(), f"mtp_{attn}kv_a_rope")
+        s_kv_rope = self._safe_attach(
+            kv_a_s[scale_rows_latent:].contiguous(), f"mtp_{attn}kv_a_rope_scale")
 
         self._fp8_linear(self.rmsnorm_out, w_kv_latent, s_kv_latent, self.c_latent_out,
                          grid_dim=(grid_for_rmsnorm_linear_layer(self.kv_lora_rank), 1, 1),
@@ -860,12 +853,10 @@ class DeepSeekV3Builder(GraphBuilder):
         shared_up_w = state_dict[f"{sp}up_proj.weight"]
         shared_gate_s = state_dict[f"{sp}gate_proj.weight_scale_inv"]
         shared_up_s = state_dict[f"{sp}up_proj.weight_scale_inv"]
-        w_s_gu = self.mpk.attach_input(
-            torch_tensor=torch.cat([shared_gate_w, shared_up_w], dim=0),
-            name=f"mtp_{sp}gate_up")
-        s_s_gu = self.mpk.attach_input(
-            torch_tensor=torch.cat([shared_gate_s, shared_up_s], dim=0),
-            name=f"mtp_{sp}gate_up_scale")
+        w_s_gu = self._safe_attach(
+            torch.cat([shared_gate_w, shared_up_w], dim=0), f"mtp_{sp}gate_up")
+        s_s_gu = self._safe_attach(
+            torch.cat([shared_gate_s, shared_up_s], dim=0), f"mtp_{sp}gate_up_scale")
         shared_mid = self.mpk.new_tensor(
             dims=(mbt, 2 * self.moe_intermediate_size), dtype=bfloat16,
             name="mtp_shared_mid", io_category="cuda_tensor")

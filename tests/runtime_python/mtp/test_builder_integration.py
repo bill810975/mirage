@@ -34,34 +34,58 @@ TEST_NUM_LAYERS = 2
 TEST_FIRST_MOE_LAYER = 1  # layer 0 = dense, layer 1 = MoE
 
 
+def fp8_weight(shape, device):
+    """Create mock FP8 weight + packed UE8M0 scale_inv."""
+    # Use bfloat16 as placeholder for FP8 (same size, builder only checks shape)
+    w = torch.randn(shape, device=device, dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+    # Scale: one uint32 per 128 elements along reduction dim (last dim)
+    scale_shape = list(shape)
+    scale_shape[-1] = (shape[-1] + 127) // 128
+    s = torch.ones(scale_shape, device=device, dtype=torch.float32)
+    return w, s
+
+
 def make_attn_weights(prefix, device):
     d = {}
-    d[f"{prefix}self_attn.q_a_proj.weight"] = torch.randn(Q_LORA_RANK, HIDDEN, device=device, dtype=torch.bfloat16)
-    d[f"{prefix}self_attn.q_a_layernorm.weight"] = torch.randn(Q_LORA_RANK, device=device, dtype=torch.bfloat16)
-    d[f"{prefix}self_attn.q_b_proj.weight"] = torch.randn(
-        LOCAL_Q_HEADS * QK_HEAD_DIM_TOTAL, Q_LORA_RANK, device=device, dtype=torch.bfloat16)
-    d[f"{prefix}self_attn.kv_a_proj_with_mqa.weight"] = torch.randn(
-        QK_HEAD_DIM_TOTAL, HIDDEN, device=device, dtype=torch.bfloat16)
-    d[f"{prefix}self_attn.kv_a_layernorm.weight"] = torch.randn(KV_LORA_RANK, device=device, dtype=torch.bfloat16)
-    d[f"{prefix}self_attn.o_proj.weight"] = torch.randn(
-        HIDDEN, LOCAL_Q_HEADS * V_HEAD_DIM_TOTAL, device=device, dtype=torch.bfloat16)
+    p = f"{prefix}self_attn."
+    w, s = fp8_weight((Q_LORA_RANK, HIDDEN), device)
+    d[f"{p}q_a_proj.weight"] = w
+    d[f"{p}q_a_proj.weight_scale_inv"] = s
+    d[f"{p}q_a_layernorm.weight"] = torch.randn(Q_LORA_RANK, device=device, dtype=torch.bfloat16)
+    w, s = fp8_weight((LOCAL_Q_HEADS * QK_HEAD_DIM_TOTAL, Q_LORA_RANK), device)
+    d[f"{p}q_b_proj.weight"] = w
+    d[f"{p}q_b_proj.weight_scale_inv"] = s
+    w, s = fp8_weight((QK_HEAD_DIM_TOTAL, HIDDEN), device)
+    d[f"{p}kv_a_proj_with_mqa.weight"] = w
+    d[f"{p}kv_a_proj_with_mqa.weight_scale_inv"] = s
+    d[f"{p}kv_a_layernorm.weight"] = torch.randn(KV_LORA_RANK, device=device, dtype=torch.bfloat16)
+    w, s = fp8_weight((HIDDEN, LOCAL_Q_HEADS * V_HEAD_DIM_TOTAL), device)
+    d[f"{p}o_proj.weight"] = w
+    d[f"{p}o_proj.weight_scale_inv"] = s
     return d
 
 
 def make_moe_weights(prefix, device):
     d = {}
-    d[f"{prefix}mlp.gate.weight"] = torch.randn(NUM_EXPERTS, HIDDEN, device=device, dtype=torch.bfloat16)
-    d[f"{prefix}mlp.gate.e_score_correction_bias"] = torch.randn(NUM_EXPERTS, device=device, dtype=torch.float32)
-    d[f"{prefix}mlp.experts.w13.weight"] = torch.randn(
-        NUM_EXPERTS, 2 * LOCAL_MOE_INTERMEDIATE, HIDDEN, device=device, dtype=torch.bfloat16)
-    d[f"{prefix}mlp.experts.w2.weight"] = torch.randn(
-        NUM_EXPERTS, HIDDEN, LOCAL_MOE_INTERMEDIATE, device=device, dtype=torch.bfloat16)
-    d[f"{prefix}mlp.shared_experts.gate_proj.weight"] = torch.randn(
-        LOCAL_MOE_INTERMEDIATE, HIDDEN, device=device, dtype=torch.bfloat16)
-    d[f"{prefix}mlp.shared_experts.up_proj.weight"] = torch.randn(
-        LOCAL_MOE_INTERMEDIATE, HIDDEN, device=device, dtype=torch.bfloat16)
-    d[f"{prefix}mlp.shared_experts.down_proj.weight"] = torch.randn(
-        HIDDEN, LOCAL_MOE_INTERMEDIATE, device=device, dtype=torch.bfloat16)
+    p = f"{prefix}mlp."
+    # Router: BF16
+    d[f"{p}gate.weight"] = torch.randn(NUM_EXPERTS, HIDDEN, device=device, dtype=torch.bfloat16)
+    d[f"{p}gate.e_score_correction_bias"] = torch.randn(NUM_EXPERTS, device=device, dtype=torch.float32)
+    # Experts: FP8
+    w, s = fp8_weight((NUM_EXPERTS, 2 * LOCAL_MOE_INTERMEDIATE, HIDDEN), device)
+    d[f"{p}experts.w13.weight"] = w
+    d[f"{p}experts.w13.weight_scale_inv"] = s
+    w, s = fp8_weight((NUM_EXPERTS, HIDDEN, LOCAL_MOE_INTERMEDIATE), device)
+    d[f"{p}experts.w2.weight"] = w
+    d[f"{p}experts.w2.weight_scale_inv"] = s
+    # Shared expert: FP8
+    for proj in ["gate_proj", "up_proj"]:
+        w, s = fp8_weight((LOCAL_MOE_INTERMEDIATE, HIDDEN), device)
+        d[f"{p}shared_experts.{proj}.weight"] = w
+        d[f"{p}shared_experts.{proj}.weight_scale_inv"] = s
+    w, s = fp8_weight((HIDDEN, LOCAL_MOE_INTERMEDIATE), device)
+    d[f"{p}shared_experts.down_proj.weight"] = w
+    d[f"{p}shared_experts.down_proj.weight_scale_inv"] = s
     return d
 
 
@@ -77,10 +101,12 @@ def make_mock_state_dict(device):
         d[f"{prefix}post_attention_layernorm.weight"] = torch.randn(HIDDEN, device=device, dtype=torch.bfloat16)
         d.update(make_attn_weights(prefix, device))
         if i < TEST_FIRST_MOE_LAYER:
-            d[f"{prefix}mlp.gate_up_proj.weight"] = torch.randn(
-                2 * LOCAL_INTERMEDIATE, HIDDEN, device=device, dtype=torch.bfloat16)
-            d[f"{prefix}mlp.down_proj.weight"] = torch.randn(
-                HIDDEN, LOCAL_INTERMEDIATE, device=device, dtype=torch.bfloat16)
+            w, s = fp8_weight((2 * LOCAL_INTERMEDIATE, HIDDEN), device)
+            d[f"{prefix}mlp.gate_up_proj.weight"] = w
+            d[f"{prefix}mlp.gate_up_proj.weight_scale_inv"] = s
+            w, s = fp8_weight((HIDDEN, LOCAL_INTERMEDIATE), device)
+            d[f"{prefix}mlp.down_proj.weight"] = w
+            d[f"{prefix}mlp.down_proj.weight_scale_inv"] = s
         else:
             d.update(make_moe_weights(prefix, device))
 
