@@ -172,7 +172,7 @@ class DeepSeekV3Builder(GraphBuilder):
         # AllReduce buffer
         if self.world_size > 1:
             self.allreduce_buf = self.mpk.new_tensor(
-                dims=(mbt, self.hidden_size),
+                dims=(self.world_size, mbt, self.hidden_size),
                 dtype=bfloat16,
                 name="allreduce_buf",
                 io_category="nvshmem_tensor",
@@ -789,10 +789,15 @@ class DeepSeekV3Builder(GraphBuilder):
             dummy_output=self.rmsnorm_out,
             grid_dim=(self.max_num_batched_tokens, 1, 1), block_dim=(128, 1, 1),
         )
-        self.mpk.moe_topk_softmax_routing_layer(
+        w_gate_bias = self.mpk.attach_input(
+            torch_tensor=state_dict[f"{mlp_prefix}gate.e_score_correction_bias"],
+            name=f"mtp_{mlp_prefix}gate_bias",
+        )
+        self.mpk.moe_topk_sigmoid_routing_layer(
             input=router_logits,
+            bias=w_gate_bias,
             output=(moe_topk_weights, moe_routing_indices, moe_mask),
-            grid_dim=(1, 1, 1), block_dim=(128, 1, 1),
+            grid_dim=(1, 1, 1), block_dim=(256, 1, 1),
         )
 
         w_experts_w13 = self.mpk.attach_input(
@@ -947,8 +952,7 @@ class DeepSeekV3Builder(GraphBuilder):
         # ---- Draft generation loop (statically unrolled) ----
         for step in range(num_draft_steps):
             # 1. Get draft token: step 0 from main argmax, step 1+ from prev MTP
-            # For step 0, the main model's argmax output is already in output_tokens
-            draft_input = self.output_tokens if step == 0 else draft_token_ids
+            draft_input = self.argmax_out_dtensor if step == 0 else draft_token_ids
 
             # 2. Embed draft token (shared embed_tokens weight)
             self.mpk.embed_layer(
@@ -1040,18 +1044,24 @@ class DeepSeekV3Builder(GraphBuilder):
         # ---- Prepare verify: write draft tokens to sequence buffer ----
         # This sets up input for the next iteration's verification forward:
         # tokens[request, step+1] = main_token, tokens[request, step+2..K+1] = drafts
-        tokens_buffer = self.mpk.meta_tensors.get("tokens", None)
-        step_tensor = self.mpk.meta_tensors.get("step", None)
-        num_new_tokens_tensor = self.mpk.meta_tensors.get("num_new_tokens", None)
-        main_model_output = self.output_tokens
+        # Note: these meta tensors must be attached as DTensors for the task graph
+        tokens_buf_raw = self.mpk.meta_tensors.get("tokens", None)
+        step_raw = self.mpk.meta_tensors.get("step", None)
+        num_new_raw = self.mpk.meta_tensors.get("num_new_tokens", None)
 
-        if tokens_buffer is not None and step_tensor is not None:
+        if tokens_buf_raw is not None and step_raw is not None:
+            d_tokens_buf = self.mpk.attach_input(
+                torch_tensor=tokens_buf_raw, name="mtp_tokens_buffer")
+            d_step = self.mpk.attach_input(
+                torch_tensor=step_raw, name="mtp_step")
+            d_num_new = self.mpk.attach_input(
+                torch_tensor=num_new_raw, name="mtp_num_new_tokens")
             self.mpk.mtp_prepare_verify_layer(
-                main_token=main_model_output,
+                main_token=self.argmax_out_dtensor,
                 draft_tokens=all_draft_ids,
-                tokens_buffer=tokens_buffer,
-                step=step_tensor,
-                num_new_tokens=num_new_tokens_tensor,
+                tokens_buffer=d_tokens_buf,
+                step=d_step,
+                num_new_tokens=d_num_new,
                 grid_dim=(self.mpk.max_num_batched_requests, 1, 1),
                 block_dim=(128, 1, 1),
                 num_draft_tokens=num_draft_steps,
@@ -1089,8 +1099,10 @@ class DeepSeekV3Builder(GraphBuilder):
         # TODO: add probabilistic and synthetic verify paths
 
         # Accept/commit: update position and output final tokens
-        current_position = self.mpk.meta_tensors.get("step", None)
-        if current_position is not None:
+        step_raw = self.mpk.meta_tensors.get("step", None)
+        if step_raw is not None:
+            current_position = self.mpk.attach_input(
+                torch_tensor=step_raw, name="mtp_accept_step")
             new_position = self.mpk.new_tensor(
                 dims=(mbt, 1), dtype=int64,
                 name="mtp_new_position", io_category="cuda_tensor",
@@ -1239,9 +1251,10 @@ class DeepSeekV3Builder(GraphBuilder):
             )
 
             # Argmax
-            argmax_out = self.mpk.attach_input(
+            self.argmax_out_dtensor = self.mpk.attach_input(
                 torch_tensor=self.output_tokens, name="output_token",
             )
+            argmax_out = self.argmax_out_dtensor
             self.mpk.argmax_partial_layer(
                 input=lm_head_out, output=(self.argmax_part_value, self.argmax_part_index),
                 grid_dim=(self.max_num_batched_tokens, 1, 1),

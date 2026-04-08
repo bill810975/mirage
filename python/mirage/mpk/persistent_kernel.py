@@ -883,7 +883,7 @@ class PersistentKernel:
         moe_topk_weight, moe_routing_indices, moe_masks = output
         assert moe_topk_weight.num_dims == 2  # (batch_size, num_experts_per_tok)
         assert moe_routing_indices.num_dims == 2  # (num_experts, batch_size)
-        assert moe_masks.num_dims == 1  # (num_experts + 1)
+        assert moe_masks.num_dims <= 2  # (num_experts + 1) or (num_experts + 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         tb_graph.new_input(input, (0, -1, -1), -1, True)
         tb_graph.new_input(moe_topk_weight, (0, -1, -1), -1, True)
@@ -912,7 +912,7 @@ class PersistentKernel:
         moe_topk_weight, moe_routing_indices, moe_masks = output
         assert moe_topk_weight.num_dims == 2      # (batch_size, k)
         assert moe_routing_indices.num_dims == 2   # (num_experts, batch_size)
-        assert moe_masks.num_dims == 1             # (num_experts + 1)
+        assert moe_masks.num_dims <= 2             # (num_experts + 1) or (num_experts + 1, 1)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         tb_graph.new_input(input, (0, -1, -1), -1, True)
         tb_graph.new_input(bias, (-1, -1, -1), -1, True)
@@ -939,7 +939,7 @@ class PersistentKernel:
         assert input.num_dims == 2  # (batch_size, hidden_size / world_size)
         assert weight.num_dims == 3  # (num_experts, 2*intermediate_size, hidden_size)
         assert moe_routing_indices.num_dims == 2  # (num_experts_per_tok, batch_size)
-        assert moe_mask.num_dims == 1  # (num_experts + 1)
+        assert moe_mask.num_dims <= 2  # (num_experts + 1) or (num_experts + 1, 1)
         assert output.num_dims == 3  # (batch_size, num_expert_per_tok, 2*intermediate_size)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         tb_graph.new_input(input, (-1, -1, -1), 1, True)
@@ -980,7 +980,7 @@ class PersistentKernel:
         assert weight_fp8.num_dims == 3
         assert weight_scale.num_dims == 3
         assert moe_routing_indices.num_dims == 2
-        assert moe_mask.num_dims == 1
+        assert moe_mask.num_dims <= 2
         assert output.num_dims == 3
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         tb_graph.new_input(input_fp8,           (-1, -1, -1), -1, False)
@@ -1020,7 +1020,7 @@ class PersistentKernel:
         assert weight_fp8.num_dims == 3
         assert weight_scale.num_dims == 3
         assert moe_routing_indices.num_dims == 2
-        assert moe_mask.num_dims == 1
+        assert moe_mask.num_dims <= 2
         assert output.num_dims == 3
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         tb_graph.new_input(input_fp8,           (-1, -1, -1), -1, False)
@@ -1066,7 +1066,7 @@ class PersistentKernel:
         assert input.num_dims == 3  # (batch_size, num_expert_per_tok, intermediate_size)
         assert weight.num_dims == 3  # (num_experts, hidden_size, intermediate_size)
         assert moe_routing_indices.num_dims == 2  # (num_experts_per_tok, batch_size)
-        assert moe_mask.num_dims == 1  # (num_experts + 1)
+        assert moe_mask.num_dims <= 2  # (num_experts + 1) or (num_experts + 1, 1)
         assert output.num_dims == 3  # (batch_size, num_expert_per_tok, hidden_size)
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         tb_graph.new_input(input, (-1, -1, -1), 2, True)
