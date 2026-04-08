@@ -261,12 +261,7 @@ class DeepSeekV3Builder(GraphBuilder):
         )
 
     def _safe_attach(self, tensor, name):
-        """Attach tensor, converting unsupported dtypes to byte-equivalent ones."""
-        if tensor.dtype == torch.float8_e4m3fn:
-            tensor = tensor.view(torch.uint8)
-        elif tensor.dtype == torch.float32:
-            # scale_inv tensors: keep as float32 (mirage supports it)
-            pass
+        """Attach tensor. FP8 is now natively supported in core.pyx."""
         return self.mpk.attach_input(torch_tensor=tensor, name=name)
 
     def _attach_fp8_weight(self, state_dict, key, name):
