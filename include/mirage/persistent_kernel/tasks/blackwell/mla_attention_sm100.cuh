@@ -145,7 +145,11 @@ __device__ __forceinline__ void mla_paged_attention_sm100_task_impl(
   constexpr int SV = KV_TILE_SIZE * V_HEAD_DIM;
 
   extern __shared__ char smem[];
-  T *s_q = reinterpret_cast<T *>(smem);                         // [MAX_TOKENS][QK_HEAD_DIM]
+  // Align smem base to 16 bytes for ldmatrix requirements.
+  // In persistent kernel, extern __shared__ may not start 16B-aligned
+  // due to static __shared__ variables from the host kernel.
+  char *smem_aligned = smem + ((16 - (reinterpret_cast<uintptr_t>(smem) & 15)) & 15);
+  T *s_q = reinterpret_cast<T *>(smem_aligned);                 // [MAX_TOKENS][QK_HEAD_DIM]
   T *s_k = s_q + SQ;                                            // [2][KV_TILE_SIZE][QK_HEAD_DIM]
   T *s_v = s_k + PIPE_STAGES * SK;                              // [2][KV_TILE_SIZE][V_HEAD_DIM]
 
