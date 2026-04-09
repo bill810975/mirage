@@ -375,7 +375,7 @@ class DeepSeekV3Builder(GraphBuilder):
         # BF16 linear for rope projection (64 output dims, not FP8-aligned)
         self.mpk.linear_layer(
             input=self.rmsnorm_out, weight=w_kv_rope, output=self.k_pe_out,
-            grid_dim=(grid_for_rmsnorm_linear_layer(QK_ROPE_HEAD_DIM), 1, 1),
+            grid_dim=(1, 1, 1),
             block_dim=(128, 1, 1))
 
         # Step 5: kv_a_layernorm on c_latent ONLY
@@ -822,7 +822,7 @@ class DeepSeekV3Builder(GraphBuilder):
                          block_dim=(128, 1, 1))
         self.mpk.linear_layer(
             input=self.rmsnorm_out, weight=w_kv_rope, output=self.k_pe_out,
-            grid_dim=(grid_for_rmsnorm_linear_layer(QK_ROPE_HEAD_DIM), 1, 1),
+            grid_dim=(1, 1, 1),
             block_dim=(128, 1, 1))
 
         w_kv_a_ln = self.mpk.attach_input(

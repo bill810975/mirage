@@ -97,8 +97,9 @@ __host__ static inline void fill_tma_desc(CUtensorMap *tma_desc,
     assert(false);
   }
 
+  // TMA requires 16B-aligned global address
   assert((reinterpret_cast<uint64_t>(global_addr) & 0b1111) ==
-         0); // Address must be 16B-aligned
+         0 && "TMA global address must be 16B-aligned");
 
   assert(gmem_prob_shape[0] >= (uint64_t(1)));       // Size must be min 1
   assert(gmem_prob_shape[0] <= (uint64_t(1) << 32)); // Size must be max 2^32

@@ -599,8 +599,18 @@ if __name__ == "__main__":
             # Free raw GPU state_dict before moving converted weights to GPU
             del state_dict
             torch.cuda.empty_cache()
-            # Move converted weights to GPU
-            converted_state_dict = {k: v.cuda() for k, v in raw_weights.items()}
+            # Move converted weights to GPU with guaranteed contiguity and alignment
+            # TMA requires 16-byte aligned global addresses
+            converted_state_dict = {}
+            for k, v in raw_weights.items():
+                t = v.contiguous().cuda()
+                # Verify 16-byte alignment (TMA requirement)
+                if t.data_ptr() % 16 != 0:
+                    # Re-allocate aligned
+                    aligned = torch.empty_like(t)
+                    aligned.copy_(t)
+                    t = aligned
+                converted_state_dict[k] = t
             del raw_weights, raw_scales
             state_dict = converted_state_dict
             print(f"  Converted: {len(state_dict)} keys")
