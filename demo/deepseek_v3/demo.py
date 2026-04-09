@@ -527,10 +527,83 @@ if __name__ == "__main__":
         if args.correctness and args.layers:
             layer_indices_arg = [int(x) for x in args.layers.split(',')]
 
-        # Correctness test: run PyTorch reference first
+        # Correctness test: run PyTorch reference first (on raw weights)
         if args.correctness:
             test_layers = layer_indices_arg if layer_indices_arg else list(range(num_layers))
             run_correctness_test(args, state_dict, test_layers, rank, world_size)
+
+            # Convert raw weights → builder format in-memory
+            print("\nConverting weights for MPK builder (in-memory)...")
+            import sys
+            sys.path.insert(0, os.path.join(os.path.dirname(__file__), "models"))
+            from convert import (
+                dequantize_fp8, absorb_kv_into_q, get_model_params, is_fp8,
+                find_scale_for_weight,
+            )
+            config_dict = AutoConfig.from_pretrained(args.model_path).to_dict()
+            mp = get_model_params(config_dict)
+
+            # Separate weights and scales
+            raw_weights = {}
+            raw_scales = {}
+            for k, v in state_dict.items():
+                if k.endswith("_scale_inv") or k.endswith("_scale"):
+                    raw_scales[k] = v.cpu()
+                else:
+                    raw_weights[k] = v.cpu()
+
+            # Dequant FP8 → BF16
+            for name in list(raw_weights.keys()):
+                w = raw_weights[name]
+                if is_fp8(w):
+                    scale = find_scale_for_weight(name, raw_scales)
+                    raw_weights[name] = dequantize_fp8(w, scale).to(torch.bfloat16)
+                elif w.dtype != torch.bfloat16:
+                    raw_weights[name] = w.to(torch.bfloat16)
+
+            # Absorb kv_b_proj into q_b_proj for selected layers
+            for li in test_layers:
+                q_key = f"model.layers.{li}.self_attn.q_b_proj.weight"
+                kv_key = f"model.layers.{li}.self_attn.kv_b_proj.weight"
+                if q_key in raw_weights and kv_key in raw_weights:
+                    raw_weights[q_key] = absorb_kv_into_q(
+                        raw_weights[q_key], raw_weights[kv_key], mp).to(torch.bfloat16)
+                    del raw_weights[kv_key]
+
+            # Fuse gate_proj + up_proj → gate_up_proj for dense layers
+            for li in test_layers:
+                gate_key = f"model.layers.{li}.mlp.gate_proj.weight"
+                up_key = f"model.layers.{li}.mlp.up_proj.weight"
+                if gate_key in raw_weights and up_key in raw_weights:
+                    raw_weights[f"model.layers.{li}.mlp.gate_up_proj.weight"] = torch.cat(
+                        [raw_weights.pop(gate_key), raw_weights.pop(up_key)], dim=0)
+
+            # Fuse per-expert weights into experts.w13/w2 tensors
+            for li in test_layers:
+                ep = f"model.layers.{li}.mlp.experts."
+                # Check if this layer has experts
+                expert_keys = [k for k in raw_weights if k.startswith(ep) and ".gate_proj.weight" in k]
+                if expert_keys:
+                    n_exp = len(expert_keys)
+                    # Fuse gate+up → w13 [n_exp, 2*intermediate, hidden]
+                    gate_list, up_list, down_list = [], [], []
+                    for e in range(n_exp):
+                        g = raw_weights.pop(f"{ep}{e}.gate_proj.weight")
+                        u = raw_weights.pop(f"{ep}{e}.up_proj.weight")
+                        d = raw_weights.pop(f"{ep}{e}.down_proj.weight")
+                        gate_list.append(torch.cat([g, u], dim=0))
+                        down_list.append(d)
+                    raw_weights[f"{ep}w13.weight"] = torch.stack(gate_list)
+                    raw_weights[f"{ep}w2.weight"] = torch.stack(down_list)
+
+            # Free raw GPU state_dict before moving converted weights to GPU
+            del state_dict
+            torch.cuda.empty_cache()
+            # Move converted weights to GPU
+            converted_state_dict = {k: v.cuda() for k, v in raw_weights.items()}
+            del raw_weights, raw_scales
+            state_dict = converted_state_dict
+            print(f"  Converted: {len(state_dict)} keys")
 
         # Build MLA model config for the builder
         model_config = MirageModelConfig(

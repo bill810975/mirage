@@ -89,32 +89,42 @@ class DeepSeekV3Builder(GraphBuilder):
             layer_indices=layer_indices,
         )
 
-    def _fp8_linear(self, input_bf16, weight_fp8, weight_scale, output,
+    def _fp8_linear(self, input_bf16, weight, weight_scale, output,
                      grid_dim, block_dim, residual=None):
         """Quantize BF16 input → FP8, then run FP8 GEMM.
 
-        If weight is BF16 (no scale), falls back to BF16 linear.
-        Handles the quantize → gemm pipeline automatically.
+        If weight_scale is None (weight already BF16), falls back to BF16 linear.
         """
+        if weight_scale is None:
+            # BF16 path (post-dequant weights)
+            if residual is not None:
+                self.mpk.linear_with_residual_layer(
+                    input=input_bf16, weight=weight, residual=residual,
+                    output=output, grid_dim=grid_dim, block_dim=block_dim)
+            else:
+                self.mpk.linear_layer(
+                    input=input_bf16, weight=weight, output=output,
+                    grid_dim=grid_dim, block_dim=block_dim)
+            return
+
+        # FP8 path
         mbt = self.max_num_batched_tokens
-        reduction_size = weight_fp8.dim(1) if weight_fp8.num_dims == 2 else weight_fp8.dim(-1)
+        reduction_size = weight.dim(1) if weight.num_dims == 2 else weight.dim(-1)
         group_size = 128
         num_groups = (reduction_size + group_size - 1) // group_size
 
-        # Allocate quantize output buffers (reusable)
         if not hasattr(self, '_fp8_input_buf') or self._fp8_input_buf.dim(1) != reduction_size:
             self._fp8_input_buf = self.mpk.new_tensor(
-                dims=(mbt, reduction_size), dtype=bfloat16,  # placeholder dtype, actual is fp8
+                dims=(mbt, reduction_size), dtype=float8_e4m3,
                 name=f"fp8_input_{reduction_size}",
                 io_category="cuda_tensor",
             )
             self._fp8_scale_buf = self.mpk.new_tensor(
-                dims=(mbt, num_groups), dtype=bfloat16,  # placeholder, actual is uint32
+                dims=(mbt, num_groups), dtype=float32,
                 name=f"fp8_scale_{reduction_size}",
                 io_category="cuda_tensor",
             )
 
-        # Step 1: Quantize input BF16 → FP8
         self.mpk.quantize_fp8_layer(
             input=input_bf16,
             output_fp8=self._fp8_input_buf,
@@ -123,12 +133,11 @@ class DeepSeekV3Builder(GraphBuilder):
             block_dim=(128, 1, 1),
         )
 
-        # Step 2: FP8 GEMM
         if residual is not None:
             self.mpk.linear_fp8_with_residual_layer(
                 input_fp8=self._fp8_input_buf,
                 input_scale=self._fp8_scale_buf,
-                weight_fp8=weight_fp8,
+                weight_fp8=weight,
                 weight_scale=weight_scale,
                 residual=residual,
                 output=output,
@@ -139,7 +148,7 @@ class DeepSeekV3Builder(GraphBuilder):
             self.mpk.linear_fp8_layer(
                 input_fp8=self._fp8_input_buf,
                 input_scale=self._fp8_scale_buf,
-                weight_fp8=weight_fp8,
+                weight_fp8=weight,
                 weight_scale=weight_scale,
                 output=output,
                 grid_dim=grid_dim,
@@ -285,10 +294,19 @@ class DeepSeekV3Builder(GraphBuilder):
         """Attach tensor. FP8 is now natively supported in core.pyx."""
         return self.mpk.attach_input(torch_tensor=tensor, name=name)
 
+    @property
+    def _weights_are_fp8(self):
+        """Check if we're working with FP8 weights (vs BF16 post-dequant)."""
+        return hasattr(self, '_is_fp8_mode') and self._is_fp8_mode
+
     def _attach_fp8_weight(self, state_dict, key, name):
-        """Attach FP8 weight + its packed UE8M0 scale_inv."""
+        """Attach FP8 weight + scale_inv, or BF16 weight if already dequantized."""
         w = self._safe_attach(state_dict[key], name)
-        s = self._safe_attach(state_dict[f"{key}_scale_inv"], f"{name}_scale")
+        scale_key = f"{key}_scale_inv"
+        if scale_key in state_dict:
+            s = self._safe_attach(state_dict[scale_key], f"{name}_scale")
+        else:
+            s = None  # weight is already BF16 (post-dequant)
         return w, s
 
     def _build_mla_attention_layer(self, layer_idx: int, state_dict: dict):
@@ -322,24 +340,31 @@ class DeepSeekV3Builder(GraphBuilder):
         # Split the [576, hidden] weight into [512, hidden] and [64, hidden]
         # Also split the scale_inv accordingly
         kv_a_w = state_dict[f"{attn}kv_a_proj_with_mqa.weight"]
-        kv_a_s = state_dict[f"{attn}kv_a_proj_with_mqa.weight_scale_inv"]
-        # Determine scale row split based on output dim ratio
-        scale_rows_total = kv_a_s.shape[0]
-        latent_ratio = self.kv_lora_rank / (self.kv_lora_rank + QK_ROPE_HEAD_DIM)
-        scale_rows_latent = round(scale_rows_total * latent_ratio)
+        kv_a_s_key = f"{attn}kv_a_proj_with_mqa.weight_scale_inv"
+        has_kv_scale = kv_a_s_key in state_dict
 
-        w_kv_latent = self._safe_attach(
-            kv_a_w[:self.kv_lora_rank].contiguous(),
-            f"layer_{layer_idx}_kv_a_latent")
-        s_kv_latent = self._safe_attach(
-            kv_a_s[:scale_rows_latent].contiguous(),
-            f"layer_{layer_idx}_kv_a_latent_scale")
-        # kv_a_rope: output=64, not 128-aligned for FP8 GEMM. Use BF16 dequant.
-        kv_rope_w_fp8 = kv_a_w[self.kv_lora_rank:].contiguous()
-        kv_rope_s = kv_a_s[scale_rows_latent:].contiguous()
-        # Dequantize FP8 weight to BF16 for this small projection
-        kv_rope_w_bf16 = (kv_rope_w_fp8.float() * kv_rope_s.float().repeat_interleave(
-            128, dim=-1)[:, :kv_rope_w_fp8.shape[-1]]).to(torch.bfloat16)
+        if has_kv_scale:
+            kv_a_s = state_dict[kv_a_s_key]
+            scale_rows_total = kv_a_s.shape[0]
+            latent_ratio = self.kv_lora_rank / (self.kv_lora_rank + QK_ROPE_HEAD_DIM)
+            scale_rows_latent = round(scale_rows_total * latent_ratio)
+            w_kv_latent = self._safe_attach(
+                kv_a_w[:self.kv_lora_rank].contiguous(),
+                f"layer_{layer_idx}_kv_a_latent")
+            s_kv_latent = self._safe_attach(
+                kv_a_s[:scale_rows_latent].contiguous(),
+                f"layer_{layer_idx}_kv_a_latent_scale")
+            kv_rope_w_fp8 = kv_a_w[self.kv_lora_rank:].contiguous()
+            kv_rope_s = kv_a_s[scale_rows_latent:].contiguous()
+            kv_rope_w_bf16 = (kv_rope_w_fp8.float() * kv_rope_s.float().repeat_interleave(
+                128, dim=-1)[:, :kv_rope_w_fp8.shape[-1]]).to(torch.bfloat16)
+        else:
+            w_kv_latent = self._safe_attach(
+                kv_a_w[:self.kv_lora_rank].contiguous(),
+                f"layer_{layer_idx}_kv_a_latent")
+            s_kv_latent = None
+            kv_rope_w_bf16 = kv_a_w[self.kv_lora_rank:].contiguous()
+
         w_kv_rope = self.mpk.attach_input(
             torch_tensor=kv_rope_w_bf16,
             name=f"layer_{layer_idx}_kv_a_rope")
@@ -482,29 +507,33 @@ class DeepSeekV3Builder(GraphBuilder):
             block_dim=(256, 1, 1),  # 8 warps required by topk kernel
         )
 
-        # Expert W1+W3 (gate + up projection) — FP8
+        # Expert W1+W3 (gate + up projection)
+        # Check if weights are FP8 (have scale_inv) or BF16 (post-dequant)
+        w13_scale_key = f"{prefix}experts.w13.weight_scale_inv"
+        use_fp8_experts = w13_scale_key in state_dict
         w_experts_w13 = self._safe_attach(
             state_dict[f"{prefix}experts.w13.weight"],
             f"layer_{layer_idx}_experts_w13")
         s_experts_w13 = self._safe_attach(
-            state_dict[f"{prefix}experts.w13.weight_scale_inv"],
-            f"layer_{layer_idx}_experts_w13_scale")
-        # Quantize input for MoE FP8
+            state_dict[w13_scale_key],
+            f"layer_{layer_idx}_experts_w13_scale") if use_fp8_experts else None
         mbt = self.max_num_batched_tokens
-        moe_input_fp8 = self.mpk.new_tensor(
-            dims=(mbt, self.hidden_size), dtype=bfloat16,
-            name=f"layer_{layer_idx}_moe_input_fp8", io_category="cuda_tensor",
-        )
-        moe_input_scale = self.mpk.new_tensor(
-            dims=(mbt, self.hidden_size // 128), dtype=bfloat16,
-            name=f"layer_{layer_idx}_moe_input_scale", io_category="cuda_tensor",
-        )
-        self.mpk.quantize_fp8_layer(
-            input=self.rmsnorm_out,
-            output_fp8=moe_input_fp8,
-            output_scale=moe_input_scale,
-            grid_dim=(mbt, 1, 1), block_dim=(128, 1, 1),
-        )
+        if use_fp8_experts:
+            # Quantize input for MoE FP8
+            moe_input_fp8 = self.mpk.new_tensor(
+                dims=(mbt, self.hidden_size), dtype=float8_e4m3,
+                name=f"layer_{layer_idx}_moe_input_fp8", io_category="cuda_tensor",
+            )
+            moe_input_scale = self.mpk.new_tensor(
+                dims=(mbt, self.hidden_size // 128), dtype=float32,
+                name=f"layer_{layer_idx}_moe_input_scale", io_category="cuda_tensor",
+            )
+            self.mpk.quantize_fp8_layer(
+                input=self.rmsnorm_out,
+                output_fp8=moe_input_fp8,
+                output_scale=moe_input_scale,
+                grid_dim=(mbt, 1, 1), block_dim=(128, 1, 1),
+            )
 
         moe_mid = self.mpk.new_tensor(
             dims=(mbt, NUM_EXPERTS_PER_TOK, 2 * self.moe_intermediate_size),
@@ -512,17 +541,28 @@ class DeepSeekV3Builder(GraphBuilder):
             name=f"layer_{layer_idx}_moe_mid",
             io_category="cuda_tensor",
         )
-        self.mpk.moe_w13_fp8_layer(
-            input_fp8=moe_input_fp8,
-            input_scale=moe_input_scale,
-            weight_fp8=w_experts_w13,
-            weight_scale=s_experts_w13,
-            moe_routing_indices=moe_routing_indices,
-            moe_mask=moe_mask,
-            output=moe_mid,
-            grid_dim=(NUM_EXPERTS, 1, 1),
-            block_dim=(128, 1, 1),
-        )
+        if use_fp8_experts:
+            self.mpk.moe_w13_fp8_layer(
+                input_fp8=moe_input_fp8,
+                input_scale=moe_input_scale,
+                weight_fp8=w_experts_w13,
+                weight_scale=s_experts_w13,
+                moe_routing_indices=moe_routing_indices,
+                moe_mask=moe_mask,
+                output=moe_mid,
+                grid_dim=(NUM_EXPERTS, 1, 1),
+                block_dim=(128, 1, 1),
+            )
+        else:
+            self.mpk.moe_w13_linear_layer(
+                input=self.rmsnorm_out,
+                weight=w_experts_w13,
+                moe_routing_indices=moe_routing_indices,
+                moe_mask=moe_mask,
+                output=moe_mid,
+                grid_dim=(NUM_EXPERTS, 1, 1),
+                block_dim=(128, 1, 1),
+            )
 
         # SiLU activation
         moe_silu_out = self.mpk.new_tensor(
@@ -537,51 +577,64 @@ class DeepSeekV3Builder(GraphBuilder):
             block_dim=(128, 1, 1),
         )
 
-        # Expert W2 (down projection) — FP8
-        # Quantize 3D silu_out [batch, topk, intermediate] — quantize kernel
-        # flattens to [batch*topk, intermediate] internally
+        # Expert W2 (down projection)
+        w2_scale_key = f"{prefix}experts.w2.weight_scale_inv"
         w_experts_w2 = self._safe_attach(
             state_dict[f"{prefix}experts.w2.weight"],
             f"layer_{layer_idx}_experts_w2")
         s_experts_w2 = self._safe_attach(
-            state_dict[f"{prefix}experts.w2.weight_scale_inv"],
-            f"layer_{layer_idx}_experts_w2_scale")
-        moe_silu_fp8 = self.mpk.new_tensor(
-            dims=(mbt, NUM_EXPERTS_PER_TOK, self.moe_intermediate_size),
-            dtype=float8_e4m3,
-            name=f"layer_{layer_idx}_moe_silu_fp8",
-            io_category="cuda_tensor",
-        )
-        moe_silu_scale = self.mpk.new_tensor(
-            dims=(mbt, NUM_EXPERTS_PER_TOK, self.moe_intermediate_size // 128),
-            dtype=float32,
-            name=f"layer_{layer_idx}_moe_silu_scale",
-            io_category="cuda_tensor",
-        )
-        self.mpk.quantize_fp8_layer(
-            input=moe_silu_out,
-            output_fp8=moe_silu_fp8,
-            output_scale=moe_silu_scale,
-            grid_dim=(mbt * NUM_EXPERTS_PER_TOK, 1, 1),
-            block_dim=(128, 1, 1),
-        )
+            state_dict[w2_scale_key],
+            f"layer_{layer_idx}_experts_w2_scale") if use_fp8_experts else None
+
+        if use_fp8_experts:
+            moe_silu_fp8 = self.mpk.new_tensor(
+                dims=(mbt, NUM_EXPERTS_PER_TOK, self.moe_intermediate_size),
+                dtype=float8_e4m3,
+                name=f"layer_{layer_idx}_moe_silu_fp8",
+                io_category="cuda_tensor",
+            )
+            moe_silu_scale = self.mpk.new_tensor(
+                dims=(mbt, NUM_EXPERTS_PER_TOK, self.moe_intermediate_size // 128),
+                dtype=float32,
+                name=f"layer_{layer_idx}_moe_silu_scale",
+                io_category="cuda_tensor",
+            )
+            self.mpk.quantize_fp8_layer(
+                input=moe_silu_out,
+                output_fp8=moe_silu_fp8,
+                output_scale=moe_silu_scale,
+                grid_dim=(mbt * NUM_EXPERTS_PER_TOK, 1, 1),
+                block_dim=(128, 1, 1),
+            )
+
         moe_down_out = self.mpk.new_tensor(
             dims=(mbt, NUM_EXPERTS_PER_TOK, self.hidden_size),
             dtype=bfloat16,
             name=f"layer_{layer_idx}_moe_down",
             io_category="cuda_tensor",
         )
-        self.mpk.moe_w2_fp8_layer(
-            input_fp8=moe_silu_fp8,
-            input_scale=moe_silu_scale,
-            weight_fp8=w_experts_w2,
-            weight_scale=s_experts_w2,
-            moe_routing_indices=moe_routing_indices,
-            moe_mask=moe_mask,
-            output=moe_down_out,
-            grid_dim=(NUM_EXPERTS, 1, 1),
-            block_dim=(128, 1, 1),
-        )
+        if use_fp8_experts:
+            self.mpk.moe_w2_fp8_layer(
+                input_fp8=moe_silu_fp8,
+                input_scale=moe_silu_scale,
+                weight_fp8=w_experts_w2,
+                weight_scale=s_experts_w2,
+                moe_routing_indices=moe_routing_indices,
+                moe_mask=moe_mask,
+                output=moe_down_out,
+                grid_dim=(NUM_EXPERTS, 1, 1),
+                block_dim=(128, 1, 1),
+            )
+        else:
+            self.mpk.moe_w2_linear_layer(
+                input=moe_silu_out,
+                weight=w_experts_w2,
+                moe_routing_indices=moe_routing_indices,
+                moe_mask=moe_mask,
+                output=moe_down_out,
+                grid_dim=(NUM_EXPERTS, 1, 1),
+                block_dim=(128, 1, 1),
+            )
 
         # ---- Shared Expert (1 expert, TP parallel, same as dense MLP) ----
         # Shared expert runs on ALL tokens independently of routing.
@@ -593,14 +646,19 @@ class DeepSeekV3Builder(GraphBuilder):
         # Concatenate gate and up FP8 weights + scales
         shared_gate_w = state_dict[f"{shared_prefix}gate_proj.weight"]
         shared_up_w = state_dict[f"{shared_prefix}up_proj.weight"]
-        shared_gate_s = state_dict[f"{shared_prefix}gate_proj.weight_scale_inv"]
-        shared_up_s = state_dict[f"{shared_prefix}up_proj.weight_scale_inv"]
+        gate_scale_key = f"{shared_prefix}gate_proj.weight_scale_inv"
+        has_shared_scale = gate_scale_key in state_dict
         w_shared_gate_up = self._safe_attach(
             torch.cat([shared_gate_w, shared_up_w], dim=0),
             f"layer_{layer_idx}_shared_expert_gate_up")
-        s_shared_gate_up = self._safe_attach(
-            torch.cat([shared_gate_s, shared_up_s], dim=0),
-            f"layer_{layer_idx}_shared_expert_gate_up_scale")
+        if has_shared_scale:
+            shared_gate_s = state_dict[gate_scale_key]
+            shared_up_s = state_dict[f"{shared_prefix}up_proj.weight_scale_inv"]
+            s_shared_gate_up = self._safe_attach(
+                torch.cat([shared_gate_s, shared_up_s], dim=0),
+                f"layer_{layer_idx}_shared_expert_gate_up_scale")
+        else:
+            s_shared_gate_up = None
         shared_mid = self.mpk.new_tensor(
             dims=(self.max_num_batched_tokens, 2 * self.moe_intermediate_size),
             dtype=bfloat16,

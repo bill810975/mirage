@@ -79,10 +79,23 @@ __device__ __forceinline__ void mla_paged_attention_sm100_task_impl(
     int const *paged_kv_indptr_buffer_ptr,
     int const *paged_kv_indices_buffer_ptr,
     int const *paged_kv_last_page_len_buffer_ptr,
-    void const *cos_ptr,    // [max_seq_len, ROPE_DIM] cos position embeddings
-    void const *sin_ptr,    // [max_seq_len, ROPE_DIM] sin position embeddings
+    void const *cos_ptr,    // [max_seq_len, ROPE_DIM] cos position embeddings (nullptr=skip)
+    void const *sin_ptr,    // [max_seq_len, ROPE_DIM] sin position embeddings (nullptr=skip)
     int16_t request_id,
-    int qh_idx) {
+    int qh_idx = -1) {  // -1 = loop over all Q-heads (persistent kernel mode)
+
+  // If qh_idx == -1, loop over all Q-heads serially (persistent kernel mode)
+  if (qh_idx < 0) {
+    for (int h = 0; h < NUM_Q_HEADS; h++) {
+      mla_paged_attention_sm100_task_impl<T, NUM_Q_HEADS, QK_HEAD_DIM,
+          V_HEAD_DIM, MAX_SEQ_LEN, PAGE_SIZE, MAX_TOKENS, KV_TILE_SIZE>(
+          q_nope_pe_ptr, ckv_kpe_cache_ptr, c_latent_new_ptr, k_pe_new_ptr,
+          output_ptr, qo_indptr_buffer_ptr, paged_kv_indptr_buffer_ptr,
+          paged_kv_indices_buffer_ptr, paged_kv_last_page_len_buffer_ptr,
+          cos_ptr, sin_ptr, request_id, h);
+    }
+    return;
+  }
 
   constexpr int BARRIER_ID = 6;
   cutlass::arch::NamedBarrier wg_barrier(NUM_THREADS, BARRIER_ID);
