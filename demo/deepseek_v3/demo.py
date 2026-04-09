@@ -82,63 +82,107 @@ def run_correctness_test(args, state_dict, layer_indices, rank, world_size):
         w = torch.gather(scores, 1, idx)
         return w / w.sum(dim=-1, keepdim=True), idx
 
+    QK_NOPE = 128   # per-head nope dim (before absorption)
+    V_ORIG = 128     # per-head V dim (before absorption)
+
+    def dequant_fp8(weight, scale, block_k=128):
+        """Dequantize FP8 weight using block-wise scale_inv.
+
+        Weight: [M, K], Scale: [M/block_k, K/block_k].
+        Each scale element covers a block_k × block_k tile.
+        """
+        w = weight.float()
+        s = scale.float()
+        if s.dim() == 2 and w.dim() == 2:
+            # Expand scale to match weight shape
+            s = s.repeat_interleave(block_k, dim=0)[:w.shape[0]]
+            s = s.repeat_interleave(block_k, dim=1)[:, :w.shape[1]]
+        return (w * s).to(torch.bfloat16)
+
+    def fp8_linear(x, weight_key, sd, block_k=128):
+        """Dequant FP8 weight then matmul."""
+        w = dequant_fp8(sd[weight_key], sd[f"{weight_key}_scale_inv"], block_k)
+        return F.linear(x.float(), w.float()).to(x.dtype)
+
     def mla_attention(hidden, prefix, sd, kv_cache, seq_pos, num_heads):
+        """MLA attention following raw checkpoint flow (no weight absorption)."""
         bs = hidden.shape[0]
         p = prefix + "self_attn."
-        # q path (BF16 linear for now since FP8 core not ready)
-        q_a = F.linear(hidden.float(), sd[f"{p}q_a_proj.weight"].float()).to(hidden.dtype)
+
+        # Q path: q_a_proj → norm → q_b_proj → split(q_nope, q_pe)
+        q_a = fp8_linear(hidden, f"{p}q_a_proj.weight", sd)
         q_a = rms_norm(q_a, sd[f"{p}q_a_layernorm.weight"])
-        q = F.linear(q_a.float(), sd[f"{p}q_b_proj.weight"].float()).to(hidden.dtype)
-        q = q.view(bs, num_heads, QK_HEAD_DIM)
-        # kv path
-        kv_w = sd[f"{p}kv_a_proj_with_mqa.weight"]
-        kv_full = F.linear(hidden.float(), kv_w.float()).to(hidden.dtype)
-        c_lat = kv_full[:, :KV_LORA_RANK]
-        k_pe = kv_full[:, KV_LORA_RANK:]
+        q_full = fp8_linear(q_a, f"{p}q_b_proj.weight", sd)
+        q_full = q_full.view(bs, num_heads, QK_NOPE + QK_ROPE_HEAD_DIM)  # [bs, H, 192]
+        q_nope = q_full[:, :, :QK_NOPE]   # [bs, H, 128]
+        q_pe = q_full[:, :, QK_NOPE:]      # [bs, H, 64]
+
+        # KV path: kv_a_proj → split → norm(c_latent)
+        kv_full = fp8_linear(hidden, f"{p}kv_a_proj_with_mqa.weight", sd)
+        c_lat = kv_full[:, :KV_LORA_RANK]   # [bs, 512]
+        k_pe_raw = kv_full[:, KV_LORA_RANK:]  # [bs, 64]
         c_lat = rms_norm(c_lat, sd[f"{p}kv_a_layernorm.weight"])
-        kv_new = torch.cat([c_lat, k_pe], dim=-1)
+
+        # Cache write
+        kv_new = torch.cat([c_lat, k_pe_raw], dim=-1)  # [bs, 576]
         for b in range(bs):
             kv_cache[seq_pos + b] = kv_new[b]
-        kv_all = kv_cache[:seq_pos + bs]
-        # attention
-        q_n, q_p = q[:, :, :KV_LORA_RANK], q[:, :, KV_LORA_RANK:]
-        k_n, k_p = kv_all[:, :KV_LORA_RANK], kv_all[:, KV_LORA_RANK:]
-        s = (torch.einsum('bhd,sd->bhs', q_n.float(), k_n.float()) +
-             torch.einsum('bhd,sd->bhs', q_p.float(), k_p.float()))
+        kv_all = kv_cache[:seq_pos + bs]  # [kv_len, 576]
+
+        # Weight absorption via kv_b_proj
+        kv_b = dequant_fp8(sd[f"{p}kv_b_proj.weight"],
+                           sd[f"{p}kv_b_proj.weight_scale_inv"])
+        kv_b = kv_b.view(num_heads, V_ORIG + QK_NOPE, KV_LORA_RANK)  # [H, 256, 512]
+        W_UK = kv_b[:, V_ORIG:, :]   # [H, 128, 512] K nope absorption
+        W_UV = kv_b[:, :V_ORIG, :]   # [H, 128, 512] V absorption
+
+        # Absorbed Q: q_nope_abs = q_nope @ W_UK → [bs, H, 512]
+        q_nope_abs = torch.einsum('bhd,hdk->bhk', q_nope.float(), W_UK.float()).to(hidden.dtype)
+
+        # Attention: Q_abs × c_kv^T + q_pe × k_pe^T
+        k_nope = kv_all[:, :KV_LORA_RANK]   # [kv_len, 512]
+        k_pe_all = kv_all[:, KV_LORA_RANK:]  # [kv_len, 64]
+        s = (torch.einsum('bhd,sd->bhs', q_nope_abs.float(), k_nope.float()) +
+             torch.einsum('bhd,sd->bhs', q_pe.float(), k_pe_all.float()))
         s = s / math.sqrt(QK_HEAD_DIM)
-        attn = F.softmax(s, dim=-1)
-        v = kv_all[:, :V_HEAD_DIM]
-        out = torch.einsum('bhs,sd->bhd', attn, v.float()).to(hidden.dtype)
-        flat = out.reshape(bs, num_heads * V_HEAD_DIM)
-        return F.linear(flat.float(), sd[f"{p}o_proj.weight"].float()).to(hidden.dtype)
+        attn_probs = F.softmax(s, dim=-1)
+
+        # V absorption: attn @ c_kv → [bs, H, 512], then × W_UV^T → [bs, H, 128]
+        attn_v = torch.einsum('bhs,sd->bhd', attn_probs, kv_all[:, :KV_LORA_RANK].float())
+        attn_out = torch.einsum('bhd,hkd->bhk', attn_v, W_UV.float()).to(hidden.dtype)
+
+        # o_proj
+        flat = attn_out.reshape(bs, num_heads * V_ORIG)
+        return fp8_linear(flat, f"{p}o_proj.weight", sd)
 
     def dense_mlp(hidden, prefix, sd):
-        gu = F.linear(hidden.float(), sd[f"{prefix}mlp.gate_up_proj.weight"].float()).to(hidden.dtype)
-        mid = gu.shape[-1] // 2
-        x = F.silu(gu[:, :mid].float()).to(hidden.dtype) * gu[:, mid:]
-        return F.linear(x.float(), sd[f"{prefix}mlp.down_proj.weight"].float()).to(hidden.dtype)
+        p = prefix + "mlp."
+        gate = F.silu(fp8_linear(hidden, f"{p}gate_proj.weight", sd))
+        up = fp8_linear(hidden, f"{p}up_proj.weight", sd)
+        return fp8_linear(gate * up, f"{p}down_proj.weight", sd)
 
     def moe_mlp(hidden, prefix, sd):
         bs = hidden.shape[0]
         p = prefix + "mlp."
+        # Router (BF16)
         logits = F.linear(hidden.float(), sd[f"{p}gate.weight"].float()).to(hidden.dtype)
         weights, topk_idx = sigmoid_topk(logits, sd[f"{p}gate.e_score_correction_bias"], TOPK)
         out = torch.zeros(bs, HIDDEN, device=device, dtype=hidden.dtype)
+        # Routed experts (per-expert individual weights, FP8)
         for b in range(bs):
             for ki in range(TOPK):
                 eid = topk_idx[b, ki].item()
                 w = weights[b, ki].item()
-                w13 = sd[f"{p}experts.w13.weight"][eid]
-                gu = F.linear(hidden[b:b+1].float(), w13.float()).to(hidden.dtype)
-                mid = gu.shape[-1] // 2
-                x = F.silu(gu[:, :mid].float()).to(hidden.dtype) * gu[:, mid:]
-                w2 = sd[f"{p}experts.w2.weight"][eid]
-                out[b] += w * F.linear(x.float(), w2.float()).squeeze(0).to(hidden.dtype)
-        # Shared expert
+                ep = f"{p}experts.{eid}."
+                gate = F.silu(fp8_linear(hidden[b:b+1], f"{ep}gate_proj.weight", sd))
+                up = fp8_linear(hidden[b:b+1], f"{ep}up_proj.weight", sd)
+                down = fp8_linear(gate * up, f"{ep}down_proj.weight", sd)
+                out[b] += w * down.squeeze(0)
+        # Shared expert (FP8)
         sp = p + "shared_experts."
-        sg = F.silu(F.linear(hidden.float(), sd[f"{sp}gate_proj.weight"].float()).to(hidden.dtype))
-        su = F.linear(hidden.float(), sd[f"{sp}up_proj.weight"].float()).to(hidden.dtype)
-        sd_out = F.linear((sg * su).float(), sd[f"{sp}down_proj.weight"].float()).to(hidden.dtype)
+        sg = F.silu(fp8_linear(hidden, f"{sp}gate_proj.weight", sd))
+        su = fp8_linear(hidden, f"{sp}up_proj.weight", sd)
+        sd_out = fp8_linear(sg * su, f"{sp}down_proj.weight", sd)
         return out + sd_out
 
     print(f"\n{'='*60}")
@@ -412,23 +456,49 @@ if __name__ == "__main__":
         # Load state dict from converted weights
         print(f"Loading model weights from: {args.model_path}")
         from safetensors.torch import load_file
+        from safetensors import safe_open
+
+        # Determine which layers we need
+        layer_indices_for_load = None
+        if args.correctness and args.layers:
+            layer_indices_for_load = [int(x) for x in args.layers.split(',')]
+            # Also need MTP layer if --mtp
+            if args.mtp:
+                layer_indices_for_load.append(num_layers)  # layer 61
+
         weight_file = os.path.join(
             args.model_path, f"model{rank}-mp{world_size}.safetensors"
         )
         if os.path.exists(weight_file):
             state_dict = load_file(weight_file, device="cuda")
         else:
-            # Try single-file format
-            candidates = [
-                os.path.join(args.model_path, "model.safetensors"),
-            ]
-            state_dict = None
-            for candidate in candidates:
-                if os.path.exists(candidate):
-                    state_dict = load_file(candidate, device="cuda")
-                    break
-            if state_dict is None:
-                # Try loading from multiple shard files
+            # Selective loading: only load needed layers from sharded files
+            index_file = os.path.join(args.model_path, "model.safetensors.index.json")
+            if os.path.exists(index_file) and layer_indices_for_load is not None:
+                # Smart loading: use index to only load relevant shards/keys
+                print(f"  Selective loading for layers: {layer_indices_for_load}")
+                state_dict = {}
+                with open(index_file) as f:
+                    index = json.load(f)
+                # Build key filter: global keys + selected layer keys
+                needed_prefixes = ["model.embed_tokens.", "model.norm.", "lm_head."]
+                for li in layer_indices_for_load:
+                    needed_prefixes.append(f"model.layers.{li}.")
+                # Group keys by shard file
+                shard_to_keys = {}
+                for key, shard in index["weight_map"].items():
+                    if any(key.startswith(p) for p in needed_prefixes):
+                        shard_to_keys.setdefault(shard, []).append(key)
+                # Load only needed shards and keys
+                for shard, keys in sorted(shard_to_keys.items()):
+                    shard_path = os.path.join(args.model_path, shard)
+                    print(f"  Loading {len(keys)} keys from {shard}")
+                    with safe_open(shard_path, framework="pt", device="cuda") as f:
+                        for key in keys:
+                            state_dict[key] = f.get_tensor(key)
+                print(f"  Loaded {len(state_dict)} keys total")
+            else:
+                # Full loading (no index or no layer filter)
                 import glob
                 shard_files = sorted(glob.glob(
                     os.path.join(args.model_path, "model-*.safetensors")
@@ -438,10 +508,19 @@ if __name__ == "__main__":
                     for shard_file in shard_files:
                         state_dict.update(load_file(shard_file, device="cuda"))
                 else:
-                    raise FileNotFoundError(
-                        f"Could not find model weights at {args.model_path}. "
-                        f"Expected {weight_file} or model.safetensors or model-*.safetensors"
-                    )
+                    candidates = [
+                        os.path.join(args.model_path, "model.safetensors"),
+                    ]
+                    state_dict = None
+                    for candidate in candidates:
+                        if os.path.exists(candidate):
+                            state_dict = load_file(candidate, device="cuda")
+                            break
+                    if state_dict is None:
+                        raise FileNotFoundError(
+                            f"Could not find model weights at {args.model_path}. "
+                            f"Expected {weight_file} or model.safetensors or model-*.safetensors"
+                        )
 
         # Parse layer indices for correctness mode
         layer_indices_arg = None
