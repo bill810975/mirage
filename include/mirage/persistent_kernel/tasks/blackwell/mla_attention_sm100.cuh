@@ -84,18 +84,12 @@ __device__ __forceinline__ void mla_paged_attention_sm100_task_impl(
     int16_t request_id,
     int qh_idx = -1) {  // -1 = loop over all Q-heads (persistent kernel mode)
 
-  // If qh_idx == -1, loop over all Q-heads serially (persistent kernel mode)
-  if (qh_idx < 0) {
-    for (int h = 0; h < NUM_Q_HEADS; h++) {
-      mla_paged_attention_sm100_task_impl<T, NUM_Q_HEADS, QK_HEAD_DIM,
-          V_HEAD_DIM, MAX_SEQ_LEN, PAGE_SIZE, MAX_TOKENS, KV_TILE_SIZE>(
-          q_nope_pe_ptr, ckv_kpe_cache_ptr, c_latent_new_ptr, k_pe_new_ptr,
-          output_ptr, qo_indptr_buffer_ptr, paged_kv_indptr_buffer_ptr,
-          paged_kv_indices_buffer_ptr, paged_kv_last_page_len_buffer_ptr,
-          cos_ptr, sin_ptr, request_id, h);
-    }
-    return;
-  }
+  // Determine head range: qh_idx=-1 means loop all, qh_idx>=0 means single head
+  int qh_start = (qh_idx < 0) ? 0 : qh_idx;
+  int qh_end = (qh_idx < 0) ? NUM_Q_HEADS : (qh_idx + 1);
+
+  for (int _qh = qh_start; _qh < qh_end; _qh++) {
+  // _qh is the current Q-head index for this iteration
 
   constexpr int BARRIER_ID = 6;
   cutlass::arch::NamedBarrier wg_barrier(NUM_THREADS, BARRIER_ID);
@@ -185,7 +179,7 @@ __device__ __forceinline__ void mla_paged_attention_sm100_task_impl(
       ? reinterpret_cast<T const *>(sin_ptr) : nullptr;
 
   // ---- Phase 0: Write new KV to cache with RoPE on k_pe (head-0 block only) ----
-  if (qh_idx == 0) {
+  if (_qh == 0) {
     for (int idx = threadIdx.x; idx < num_tokens * QK_HEAD_DIM;
          idx += NUM_THREADS) {
       int t = idx / QK_HEAD_DIM;
@@ -226,7 +220,7 @@ __device__ __forceinline__ void mla_paged_attention_sm100_task_impl(
     int vc = idx % QK_VEC;
     reinterpret_cast<uint4 *>(s_q + t * QK_HEAD_DIM)[vc] =
         reinterpret_cast<const uint4 *>(
-            d_q + t * Q_STRIDE + qh_idx * QK_HEAD_DIM)[vc];
+            d_q + t * Q_STRIDE + _qh * QK_HEAD_DIM)[vc];
   }
   wg_barrier.arrive_and_wait();
 
@@ -497,11 +491,12 @@ __device__ __forceinline__ void mla_paged_attention_sm100_task_impl(
         float d_val = d_acc[mma_m][(fi & 3) >> 1];
         float o_val = o_acc[mma_m][mma_n][fi];
         o_val = (d_val > 0.f) ? (o_val / d_val) : 0.f;
-        d_output[row * O_STRIDE + qh_idx * V_HEAD_DIM + col] =
+        d_output[row * O_STRIDE + _qh * V_HEAD_DIM + col] =
             float_to_T<T>(o_val);
       }
     }
   }
+  } // end Q-head loop
 }
 
 } // namespace kernel
