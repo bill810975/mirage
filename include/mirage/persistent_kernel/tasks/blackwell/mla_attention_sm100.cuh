@@ -247,10 +247,15 @@ __device__ __forceinline__ void mla_paged_attention_sm100_task_impl(
     wg_barrier.arrive_and_wait();
   }
 
-  // ---- Accumulators (warp 0 only, but declared for all to avoid divergence) ----
+  // ---- Accumulators ----
+  // Split PV output into PV_CHUNKS to reduce register pressure.
+  // o_acc holds only PV_CHUNK_SIZE columns at a time (64 floats vs 256).
+  constexpr int PV_CHUNK_SIZE = 8;  // process 8 of 32 MMA_N_PV blocks at a time
+  constexpr int PV_CHUNKS = (MMA_N_PV + PV_CHUNK_SIZE - 1) / PV_CHUNK_SIZE;  // 4
+
   float m_local[MMA_M][2];
   float d_acc[MMA_M][2];
-  float o_acc[MMA_M][MMA_N_PV][8];
+  float o_acc[MMA_M][PV_CHUNK_SIZE][8];  // only 64 floats instead of 256!
 #pragma unroll
   for (int m = 0; m < MMA_M; m++) {
     m_local[m][0] = -INFINITY;
@@ -258,18 +263,18 @@ __device__ __forceinline__ void mla_paged_attention_sm100_task_impl(
     d_acc[m][0] = 1.f;
     d_acc[m][1] = 1.f;
 #pragma unroll
-    for (int n = 0; n < MMA_N_PV; n++) {
+    for (int n = 0; n < PV_CHUNK_SIZE; n++) {
       clear_8_floats(o_acc[m][n]);
     }
   }
 
-  // ---- KV loading lambda (all 128 threads cooperate) ----
-  // Loads combined K (576-wide) and separate V (512-wide) for a tile
-  auto load_kv_tile = [&](int kv_start, int tile_len, int buf) {
+  // ---- KV loading lambda ----
+  // stride parameter: NUM_THREADS (128) when all warps load, 32 when warp 0 only
+  auto load_kv_tile = [&](int kv_start, int tile_len, int buf, int stride = NUM_THREADS) {
     T *k_dst = s_k + buf * SK;
     T *v_dst = s_v + buf * SV;
-    // Load K: tile_len rows x QK_HEAD_DIM cols
-    for (int idx = threadIdx.x; idx < tile_len * QK_VEC; idx += NUM_THREADS) {
+    int tid = threadIdx.x % stride;  // local thread index within active threads
+    for (int idx = tid; idx < tile_len * QK_VEC; idx += stride) {
       int row = idx / QK_VEC, vc = idx % QK_VEC;
       int cp = kv_start + row;
       int pi = s_page_indices[cp / PAGE_SIZE];
@@ -279,7 +284,7 @@ __device__ __forceinline__ void mla_paged_attention_sm100_task_impl(
               d_cache + (pi * PAGE_SIZE + po) * QK_HEAD_DIM)[vc];
     }
     // Load V: tile_len rows x V_HEAD_DIM cols (first 512 of each cache row)
-    for (int idx = threadIdx.x; idx < tile_len * V_VEC; idx += NUM_THREADS) {
+    for (int idx = tid; idx < tile_len * V_VEC; idx += stride) {
       int row = idx / V_VEC, vc = idx % V_VEC;
       int cp = kv_start + row;
       int pi = s_page_indices[cp / PAGE_SIZE];
@@ -290,212 +295,165 @@ __device__ __forceinline__ void mla_paged_attention_sm100_task_impl(
     }
   };
 
-  // Load first tile
-  int first_kv_len = min(seq_len, KV_TILE_SIZE);
-  load_kv_tile(0, first_kv_len, 0);
-  int kv_loaded = first_kv_len;
-  int stage = 0;
+  // Warps 1-3: skip MMA, jump to end of Q-head iteration
+  if (warp_idx != 0) goto end_qh_iter;
 
-  // ---- Phase 2: KV tile loop ----
-  for (int kv_iter = 0; kv_iter < num_kv_iters; kv_iter++) {
-    int curr_kv_len = min(seq_len - kv_iter * KV_TILE_SIZE, KV_TILE_SIZE);
-    int next_buf = 1 - stage;
+  // ---- Phase 2+3 combined: PV chunked, each chunk re-does QK+softmax ----
+  // Warp 0 only. Process PV_CHUNK_SIZE (8) output columns at a time.
+  // Each chunk re-runs the full KV tile loop (QK + softmax + PV).
+  // This trades 4x compute for 4x less register pressure (no spill).
 
-    // Prefetch next tile into other buffer (all threads)
-    if (kv_loaded < seq_len) {
-      int next_len = min(seq_len - kv_loaded, KV_TILE_SIZE);
-      load_kv_tile(kv_loaded, next_len, next_buf);
-      kv_loaded += next_len;
-    }
-    wg_barrier.arrive_and_wait();
+  for (int pv_chunk = 0; pv_chunk < PV_CHUNKS; pv_chunk++) {
+    int pv_col_base = pv_chunk * PV_CHUNK_SIZE;
 
-    // ---- Warps 1-3: help load, then skip MMA ----
-    if (warp_idx != 0) {
-      wg_barrier.arrive_and_wait();
-      stage = next_buf;
-      continue;
-    }
-
-    // ==== Warp 0: QK^T MMA ====
-    float x_frag_f[MMA_M][MMA_N_QK][8];
-#pragma unroll
-    for (int m = 0; m < MMA_M; m++)
-#pragma unroll
-      for (int n = 0; n < MMA_N_QK; n++)
-        clear_8_floats(x_frag_f[m][n]);
-
-    T *my_k = s_k + stage * SK;
-    T *my_v = s_v + stage * SV;
-
-    // Q * K^T  (combined 576-wide)
-    uint32_t a_frag[4], b_frag[4];
+    // Reset accumulators for this chunk
+    float chunk_m[MMA_M][2];
+    float chunk_d[MMA_M][2];
 #pragma unroll
     for (int m = 0; m < MMA_M; m++) {
+      chunk_m[m][0] = -INFINITY; chunk_m[m][1] = -INFINITY;
+      chunk_d[m][0] = 1.f; chunk_d[m][1] = 1.f;
 #pragma unroll
-      for (int n = 0; n < MMA_N_QK; n++) {
-#pragma unroll
-        for (int k = 0; k < MMA_K_QK; k++) {
-          int q_row = m * 16 + (lane_idx & 0xF);
-          int q_col = k * 16 + ((lane_idx >> 4) << 3);
-          T *src_a = q_row < num_tokens
-                         ? s_q + q_row * QK_HEAD_DIM + q_col
-                         : s_ldmatrix_zeros;
+      for (int n = 0; n < PV_CHUNK_SIZE; n++) clear_8_floats(o_acc[m][n]);
+    }
 
-          int kt_col = n * 16 + ((lane_idx >> 4) << 3) + (lane_idx & 0x7);
-          int kt_row = k * 16 + (((lane_idx & 0xF) >> 3) << 3);
-          T *src_b = kt_col < curr_kv_len
-                         ? my_k + kt_col * QK_HEAD_DIM + kt_row
-                         : s_ldmatrix_zeros;
+    // Re-load first KV tile
+    load_kv_tile(0, min(seq_len, KV_TILE_SIZE), 0, 32);
+    int pv_kv_loaded = min(seq_len, KV_TILE_SIZE);
+    int pv_stage = 0;
 
-          ldsm(src_a, a_frag);
-          ldsm(src_b, b_frag);
-          mma_m16n16k16_bf16bf16bf32(
-              x_frag_f[m][n], a_frag, b_frag, x_frag_f[m][n]);
-        }
+    for (int kv_iter = 0; kv_iter < num_kv_iters; kv_iter++) {
+      int pv_kv_len = min(seq_len - kv_iter * KV_TILE_SIZE, KV_TILE_SIZE);
+      int pv_next_buf = 1 - pv_stage;
+      if (pv_kv_loaded < seq_len) {
+        int nl = min(seq_len - pv_kv_loaded, KV_TILE_SIZE);
+        load_kv_tile(pv_kv_loaded, nl, pv_next_buf, 32);
+        pv_kv_loaded += nl;
       }
-    }
+      __syncwarp();
 
-    // ==== Online softmax (warp 0) ====
-    float m_prev[MMA_M][2];
+      T *my_k2 = s_k + pv_stage * SK;
+      T *my_v2 = s_v + pv_stage * SV;
+
+      // Recompute QK^T for this tile
+      float xf[MMA_M][MMA_N_QK][8];
+      uint32_t af[4], bf[4];
 #pragma unroll
-    for (int m = 0; m < MMA_M; m++) {
-      m_prev[m][0] = m_local[m][0];
-      m_prev[m][1] = m_local[m][1];
+      for (int m = 0; m < MMA_M; m++)
 #pragma unroll
-      for (int n = 0; n < MMA_N_QK; n++) {
+        for (int n = 0; n < MMA_N_QK; n++) clear_8_floats(xf[m][n]);
+#pragma unroll
+      for (int m = 0; m < MMA_M; m++)
+#pragma unroll
+        for (int n = 0; n < MMA_N_QK; n++)
+#pragma unroll
+          for (int k = 0; k < MMA_K_QK; k++) {
+            int qr = m*16+(lane_idx&0xF), qc = k*16+((lane_idx>>4)<<3);
+            T *sa = qr < num_tokens ? s_q+qr*QK_HEAD_DIM+qc : s_ldmatrix_zeros;
+            int kc = n*16+((lane_idx>>4)<<3)+(lane_idx&0x7);
+            int kr = k*16+(((lane_idx&0xF)>>3)<<3);
+            T *sb = kc < pv_kv_len ? my_k2+kc*QK_HEAD_DIM+kr : s_ldmatrix_zeros;
+            ldsm(sa, af); ldsm(sb, bf);
+            mma_m16n16k16_bf16bf16bf32(xf[m][n], af, bf, xf[m][n]);
+          }
+
+      // Online softmax
+      float mp[MMA_M][2];
+#pragma unroll
+      for (int m = 0; m < MMA_M; m++) {
+        mp[m][0] = chunk_m[m][0]; mp[m][1] = chunk_m[m][1];
+#pragma unroll
+        for (int n = 0; n < MMA_N_QK; n++)
+#pragma unroll
+          for (int fi = 0; fi < 8; fi++) {
+            int row = (m<<4)+(lane_idx>>2)+(((fi&3)>>1)<<3);
+            int col = n*16+((lane_idx&3)<<1)+((fi>>2)<<3)+(fi&1);
+            bool valid = (row < num_tokens) &&
+                         (col+kv_iter*KV_TILE_SIZE <= row+seq_len-num_tokens);
+            xf[m][n][fi] = valid ? xf[m][n][fi] : -INFINITY;
+            chunk_m[m][(fi&3)>>1] = max(chunk_m[m][(fi&3)>>1], xf[m][n][fi]);
+          }
+        chunk_m[m][0] = max(chunk_m[m][0], __shfl_xor_sync(0xFFFFFFFF, chunk_m[m][0], 0x1));
+        chunk_m[m][0] = max(chunk_m[m][0], __shfl_xor_sync(0xFFFFFFFF, chunk_m[m][0], 0x2));
+        chunk_m[m][1] = max(chunk_m[m][1], __shfl_xor_sync(0xFFFFFFFF, chunk_m[m][1], 0x1));
+        chunk_m[m][1] = max(chunk_m[m][1], __shfl_xor_sync(0xFFFFFFFF, chunk_m[m][1], 0x2));
+      }
+      float rsc[MMA_M][2];
+#pragma unroll
+      for (int m = 0; m < MMA_M; m++) {
+        rsc[m][0] = expf(mp[m][0]*sm_scale - chunk_m[m][0]*sm_scale);
+        rsc[m][1] = expf(mp[m][1]*sm_scale - chunk_m[m][1]*sm_scale);
+      }
+      float dp[MMA_M][2];
+#pragma unroll
+      for (int m = 0; m < MMA_M; m++) {
+        dp[m][0] = 0.f; dp[m][1] = 0.f;
+#pragma unroll
+        for (int n = 0; n < MMA_N_QK; n++)
+#pragma unroll
+          for (int fi = 0; fi < 8; fi++) {
+            xf[m][n][fi] = xf[m][n][fi] != -INFINITY
+                ? expf(xf[m][n][fi]*sm_scale - chunk_m[m][(fi&3)>>1]*sm_scale) : 0.f;
+            dp[m][(fi&3)>>1] += xf[m][n][fi];
+          }
+        dp[m][0] += __shfl_xor_sync(0xFFFFFFFF, dp[m][0], 0x1);
+        dp[m][0] += __shfl_xor_sync(0xFFFFFFFF, dp[m][0], 0x2);
+        dp[m][1] += __shfl_xor_sync(0xFFFFFFFF, dp[m][1], 0x1);
+        dp[m][1] += __shfl_xor_sync(0xFFFFFFFF, dp[m][1], 0x2);
+        chunk_d[m][0] = chunk_d[m][0]*rsc[m][0] + dp[m][0];
+        chunk_d[m][1] = chunk_d[m][1]*rsc[m][1] + dp[m][1];
+      }
+
+      // Rescale + PV for this chunk only
+#pragma unroll
+      for (int m = 0; m < MMA_M; m++)
+#pragma unroll
+        for (int n = 0; n < PV_CHUNK_SIZE; n++)
+#pragma unroll
+          for (int fi = 0; fi < 8; fi++)
+            o_acc[m][n][fi] *= rsc[m][(fi&3)>>1];
+
+#pragma unroll
+      for (int m = 0; m < MMA_M; m++)
+#pragma unroll
+        for (int kk = 0; kk < MMA_K_PV; kk++) {
+          uint32_t pf[4];
+          convert_f32_to_bf16_uint32(xf[m][kk], pf);
+#pragma unroll
+          for (int nn = 0; nn < PV_CHUNK_SIZE; nn++) {
+            uint32_t vf[4];
+            int vr = kk*16+(lane_idx&0xF);
+            int vc = (pv_col_base+nn)*16+((lane_idx>>4)<<3);
+            T *sv = vr < pv_kv_len ? &my_v2[vr*V_HEAD_DIM+vc] : s_ldmatrix_zeros;
+            ldsm_t(sv, vf);
+            mma_m16n16k16_bf16bf16bf32(o_acc[m][nn], pf, vf, o_acc[m][nn]);
+          }
+        }
+
+      __syncwarp();
+      pv_stage = pv_next_buf;
+    } // end KV tile loop for this PV chunk
+
+    // Write this chunk's output
+#pragma unroll
+    for (int mma_m = 0; mma_m < MMA_M; mma_m++)
+#pragma unroll
+      for (int mma_n = 0; mma_n < PV_CHUNK_SIZE; mma_n++)
 #pragma unroll
         for (int fi = 0; fi < 8; fi++) {
-          int row = (m << 4) + (lane_idx >> 2) + (((fi & 3) >> 1) << 3);
-          int col =
-              n * 16 + ((lane_idx & 3) << 1) + ((fi >> 2) << 3) + (fi & 1);
-          bool valid =
-              (row < num_tokens) &&
-              (col + kv_iter * KV_TILE_SIZE <=
-               row + seq_len - num_tokens);
-          x_frag_f[m][n][fi] = valid ? x_frag_f[m][n][fi] : -INFINITY;
-          m_local[m][(fi & 3) >> 1] =
-              max(m_local[m][(fi & 3) >> 1], x_frag_f[m][n][fi]);
+          int row_local = (lane_idx/4) + (((fi>>1)&1)*8);
+          int col_local = ((fi>>2)&1)*8 + (lane_idx%4)*2 + (fi&1);
+          int row = mma_m*16 + row_local;
+          int col = (pv_col_base+mma_n)*16 + col_local;
+          if (row >= num_tokens || col >= V_HEAD_DIM) continue;
+          float dv = chunk_d[mma_m][(fi&3)>>1];
+          float ov = o_acc[mma_m][mma_n][fi];
+          ov = (dv > 0.f) ? (ov / dv) : 0.f;
+          d_output[row*O_STRIDE + _qh*V_HEAD_DIM + col] = float_to_T<T>(ov);
         }
-      }
-      // Warp-level max reduction via shfl_xor
-      m_local[m][0] =
-          max(m_local[m][0],
-              __shfl_xor_sync(0xFFFFFFFF, m_local[m][0], 0x1));
-      m_local[m][0] =
-          max(m_local[m][0],
-              __shfl_xor_sync(0xFFFFFFFF, m_local[m][0], 0x2));
-      m_local[m][1] =
-          max(m_local[m][1],
-              __shfl_xor_sync(0xFFFFFFFF, m_local[m][1], 0x1));
-      m_local[m][1] =
-          max(m_local[m][1],
-              __shfl_xor_sync(0xFFFFFFFF, m_local[m][1], 0x2));
-    }
-
-    // Rescale previous output accumulator
-    float rescale[MMA_M][2];
-#pragma unroll
-    for (int m = 0; m < MMA_M; m++) {
-      rescale[m][0] =
-          expf(m_prev[m][0] * sm_scale - m_local[m][0] * sm_scale);
-      rescale[m][1] =
-          expf(m_prev[m][1] * sm_scale - m_local[m][1] * sm_scale);
-    }
-
-    // Compute exp and sum for denominator
-    float d_partial[MMA_M][2];
-#pragma unroll
-    for (int m = 0; m < MMA_M; m++) {
-      d_partial[m][0] = 0.f;
-      d_partial[m][1] = 0.f;
-#pragma unroll
-      for (int n = 0; n < MMA_N_QK; n++) {
-#pragma unroll
-        for (int fi = 0; fi < 8; fi++) {
-          x_frag_f[m][n][fi] =
-              x_frag_f[m][n][fi] != -INFINITY
-                  ? expf(x_frag_f[m][n][fi] * sm_scale -
-                         m_local[m][(fi & 3) >> 1] * sm_scale)
-                  : 0.f;
-          d_partial[m][(fi & 3) >> 1] += x_frag_f[m][n][fi];
-        }
-      }
-      d_partial[m][0] +=
-          __shfl_xor_sync(0xFFFFFFFF, d_partial[m][0], 0x1);
-      d_partial[m][0] +=
-          __shfl_xor_sync(0xFFFFFFFF, d_partial[m][0], 0x2);
-      d_partial[m][1] +=
-          __shfl_xor_sync(0xFFFFFFFF, d_partial[m][1], 0x1);
-      d_partial[m][1] +=
-          __shfl_xor_sync(0xFFFFFFFF, d_partial[m][1], 0x2);
-      d_acc[m][0] = d_acc[m][0] * rescale[m][0] + d_partial[m][0];
-      d_acc[m][1] = d_acc[m][1] * rescale[m][1] + d_partial[m][1];
-    }
-
-    // Rescale previous o_acc
-#pragma unroll
-    for (int m = 0; m < MMA_M; m++)
-#pragma unroll
-      for (int n = 0; n < MMA_N_PV; n++)
-#pragma unroll
-        for (int fi = 0; fi < 8; fi++)
-          o_acc[m][n][fi] *= rescale[m][(fi & 3) >> 1];
-
-    // ==== PV MMA: attention probs (in registers) x V (from smem) ====
-    // P is [MAX_TOKENS x KV_TILE_SIZE] in x_frag_f registers
-    // V is [KV_TILE_SIZE x V_HEAD_DIM] in s_v
-    // We convert P fragments to bf16 via convert_f32_to_bf16_uint32
-#pragma unroll
-    for (int m = 0; m < MMA_M; m++) {
-#pragma unroll
-      for (int kk = 0; kk < MMA_K_PV; kk++) {
-        // Convert the P fragment from float to bf16 uint32 for MMA A-operand
-        uint32_t p_frag[4];
-        convert_f32_to_bf16_uint32(x_frag_f[m][kk], p_frag);
-
-#pragma unroll
-        for (int nn = 0; nn < MMA_N_PV; nn++) {
-          // Load V fragment from smem via ldsm_t (B-operand, transposed)
-          uint32_t v_frag[4];
-          int v_row = kk * 16 + (lane_idx & 0xF);
-          int v_col = nn * 16 + ((lane_idx >> 4) << 3);
-          T *src_v = v_row < curr_kv_len
-                         ? &my_v[v_row * V_HEAD_DIM + v_col]
-                         : s_ldmatrix_zeros;
-          ldsm_t(src_v, v_frag);
-          mma_m16n16k16_bf16bf16bf32(
-              o_acc[m][nn], p_frag, v_frag, o_acc[m][nn]);
-        }
-      }
-    }
-
-    wg_barrier.arrive_and_wait();
-    stage = next_buf;
-  } // end KV tile loop
-
-  // ---- Phase 3: Output normalization + write (warp 0 only) ----
-  if (warp_idx != 0) return;
-
-#pragma unroll
-  for (int mma_m = 0; mma_m < MMA_M; mma_m++) {
-#pragma unroll
-    for (int mma_n = 0; mma_n < MMA_N_PV; mma_n++) {
-#pragma unroll
-      for (int fi = 0; fi < 8; fi++) {
-        int row_local = (lane_idx / 4) + (((fi >> 1) & 1) * 8);
-        int col_local =
-            ((fi >> 2) & 1) * 8 + (lane_idx % 4) * 2 + (fi & 1);
-        int row = mma_m * 16 + row_local;
-        int col = mma_n * 16 + col_local;
-        if (row >= num_tokens || col >= V_HEAD_DIM) continue;
-        float d_val = d_acc[mma_m][(fi & 3) >> 1];
-        float o_val = o_acc[mma_m][mma_n][fi];
-        o_val = (d_val > 0.f) ? (o_val / d_val) : 0.f;
-        d_output[row * O_STRIDE + _qh * V_HEAD_DIM + col] =
-            float_to_T<T>(o_val);
-      }
-    }
-  }
+  } // end PV chunk loop
+  end_qh_iter:; // warps 1-3 jump here, warp 0 falls through
+  wg_barrier.arrive_and_wait(); // sync all warps before next Q-head iteration
   } // end Q-head loop
 }
 
