@@ -110,21 +110,12 @@ def dequantize_fp8(
         result = weight_f * scale.unsqueeze(1)
     elif scale.dim() == 2:
         # Block-wise scale: scale shape [ceil(out/block_out), ceil(in/block_in)]
-        # DeepSeek V3 uses 128x128 blocks by default.
+        # Vectorized: expand scale to match weight shape via repeat_interleave
         block_size = 128
-        scale_rows, scale_cols = scale.shape
         out_features, in_features = weight.shape
-
-        result = torch.zeros_like(weight_f)
-        for r in range(scale_rows):
-            for c in range(scale_cols):
-                r_start = r * block_size
-                r_end = min(r_start + block_size, out_features)
-                c_start = c * block_size
-                c_end = min(c_start + block_size, in_features)
-                result[r_start:r_end, c_start:c_end] = (
-                    weight_f[r_start:r_end, c_start:c_end] * scale[r, c]
-                )
+        expanded = scale.repeat_interleave(block_size, dim=0)[:out_features]
+        expanded = expanded.repeat_interleave(block_size, dim=1)[:, :in_features]
+        result = weight_f * expanded
     else:
         # Fallback: try broadcasting
         result = weight_f * scale
