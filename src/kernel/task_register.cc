@@ -2841,9 +2841,10 @@ int TaskRegister::register_linear_fp8_sm100_task(
   constexpr int MMA_M = 128;
   constexpr int MMA_N = 16;
   constexpr int bK = 64;
-  constexpr int num_ab_stages = 8;
+  // Reduced stages to fit in 222KB dynamic smem (B200: 228KB - 6KB static)
+  constexpr int num_ab_stages = 4;  // was 8
   constexpr int num_acc_stages = 2;
-  constexpr int num_c_stages = 4;
+  constexpr int num_c_stages = 2;  // was 4
   constexpr int B = 3, M = 3, S = 3;
   constexpr int TMA_CP_ASYNC_SIZE = 64;
   constexpr int TILE_SIZE = 64;
