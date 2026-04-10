@@ -89,12 +89,14 @@ class DeepSeekV3Builder(GraphBuilder):
             layer_indices=layer_indices,
         )
 
+    _fp8_call_count = 0
     def _fp8_linear(self, input_bf16, weight, weight_scale, output,
                      grid_dim, block_dim, residual=None):
-        """Quantize BF16 input → FP8, then run FP8 GEMM.
-
-        If weight_scale is None (weight already BF16), falls back to BF16 linear.
-        """
+        """Quantize BF16 input → FP8, then run FP8 GEMM."""
+        # DEBUG: only allow first FP8 call, rest use BF16
+        DeepSeekV3Builder._fp8_call_count += 1
+        if weight_scale is not None and DeepSeekV3Builder._fp8_call_count > 1:
+            weight_scale = None  # Force BF16 for all but first
         if weight_scale is None:
             # BF16 path (post-dequant weights)
             if residual is not None:

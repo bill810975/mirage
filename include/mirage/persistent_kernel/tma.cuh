@@ -48,7 +48,7 @@ __host__ static inline void fill_tma_desc(CUtensorMap *tma_desc,
   constexpr CUtensorMapL2promotion tma_l2Promotion =
       CU_TENSOR_MAP_L2_PROMOTION_L2_128B;
   constexpr CUtensorMapFloatOOBfill tma_oobFill =
-      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE;
+      CU_TENSOR_MAP_FLOAT_OOB_FILL_NAN_REQUEST_ZERO_FMA;
   constexpr CUtensorMapSwizzle tma_swizzle =
       (B == 1   ? CU_TENSOR_MAP_SWIZZLE_32B
        : B == 2 ? CU_TENSOR_MAP_SWIZZLE_64B
@@ -781,7 +781,7 @@ __host__ inline void fill_tma_desc_by_task(CUtensorMap *tma_desc,
       bool is_output = (param_id == (size_t)(task_desc.num_inputs));
 
       if (is_fp8 && (param_id == 0 || param_id == 2)) {
-        // FP8 input or weight — matching standalone test exactly
+        // FP8 input or weight
         int rows = tensor_desc.dim[0];
         int cols = tensor_desc.dim[1];
         uint64_t gs[2] = {(uint64_t)rows, (uint64_t)cols};
