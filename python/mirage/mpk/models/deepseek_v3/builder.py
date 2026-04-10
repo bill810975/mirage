@@ -93,8 +93,7 @@ class DeepSeekV3Builder(GraphBuilder):
     def _fp8_linear(self, input_bf16, weight, weight_scale, output,
                      grid_dim, block_dim, residual=None):
         """Quantize BF16 input → FP8, then run FP8 GEMM."""
-        # DEBUG: force ALL BF16 to test pipeline without FP8
-        weight_scale = None
+        # FP8 path (original, not debug BF16 bypass)
         if weight_scale is None:
             # BF16 path (post-dequant weights)
             if residual is not None:
@@ -351,15 +350,6 @@ class DeepSeekV3Builder(GraphBuilder):
         prefix = f"model.layers.{layer_idx}."
         attn = f"{prefix}self_attn."
 
-        # DEBUG: skip everything, just zero attn_proj_out via chained tensor_init
-        self.mpk.tensor_init_layer(
-            input=self.attn_proj_out,
-            dummy_input=self.rmsnorm_out,
-            dummy_output=self.rmsnorm_out,
-            grid_dim=(self.max_num_batched_tokens, 1, 1),
-            block_dim=(128, 1, 1))
-        return
-
         # Step 2: q_a_layernorm (BF16 norm weight)
         w_q_a_ln = self.mpk.attach_input(
             torch_tensor=state_dict[f"{attn}q_a_layernorm.weight"],
@@ -464,9 +454,8 @@ class DeepSeekV3Builder(GraphBuilder):
         w_down, s_down = self._attach_fp8_weight(
             state_dict, f"{prefix}mlp.down_proj.weight",
             f"layer_{layer_idx}_down_proj")
-        # DEBUG: use grid=1 for down_proj to rule out partitioning issue
         self._fp8_linear(self.silu_mul_out, w_down, s_down, self.mlp_out,
-                         grid_dim=(1, 1, 1),
+                         grid_dim=(grid_for_rmsnorm_linear_layer(self.hidden_size), 1, 1),
                          block_dim=(128, 1, 1))
 
     def _build_moe_mlp(self, layer_idx: int, state_dict: dict):
@@ -1364,8 +1353,11 @@ class DeepSeekV3Builder(GraphBuilder):
                 block_dim=(128, 1, 1),
             )
 
-            # DEBUG: skip MLA only
-            self.x = self.rmsnorm_out  # pretend attention output = rmsnorm_out
+            # MLA attention
+            self._build_mla_attention_layer(i, state_dict)
+
+            # Residual connection
+            self.x = self.attn_proj_out
 
             # AllReduce after attention
             if self.world_size > 1:
