@@ -252,11 +252,21 @@ class DeepSeekV3Builder(GraphBuilder):
             io_category="cuda_tensor",
         )
         self.mla_max_splits = max_splits
-        # Attention output: [batch, num_local_q_heads * v_head_dim]
+        # Attention output: [batch, num_local_q_heads * v_head_dim_absorbed]
+        # v_head_dim = 512 (kv_lora_rank, after absorption)
         self.attn_out = self.mpk.new_tensor(
             dims=(mbt, self.num_local_q_heads * self.v_head_dim),
             dtype=bfloat16,
             name="attn_out",
+            io_category="cuda_tensor",
+        )
+        # V un-absorption output: [batch, num_local_q_heads * v_head_dim_original]
+        # v_head_dim_original = 128 (before absorption)
+        V_HEAD_DIM_ORIG = 128
+        self.attn_unabsorbed = self.mpk.new_tensor(
+            dims=(mbt, self.num_local_q_heads * V_HEAD_DIM_ORIG),
+            dtype=bfloat16,
+            name="attn_unabsorbed",
             io_category="cuda_tensor",
         )
         # O projection output (same as hidden_size)
@@ -428,10 +438,27 @@ class DeepSeekV3Builder(GraphBuilder):
             block_dim=(128, 1, 1),
         )
 
+        # Step 6b: V un-absorption — attn_out [N, H*512] → attn_unabsorbed [N, H*128]
+        # v_unabsorb.weight [H*128, 512] = kv_b_proj V part, extracted during conversion
+        v_unabsorb_key = f"{attn}v_unabsorb.weight"
+        if v_unabsorb_key in state_dict:
+            w_v_unabsorb = self.mpk.attach_input(
+                torch_tensor=state_dict[v_unabsorb_key],
+                name=f"layer_{layer_idx}_v_unabsorb")
+            self.mpk.linear_layer(
+                input=self.attn_out, weight=w_v_unabsorb,
+                output=self.attn_unabsorbed,
+                grid_dim=(grid_for_rmsnorm_linear_layer(
+                    self.num_local_q_heads * 128), 1, 1),
+                block_dim=(128, 1, 1))
+        else:
+            # Fallback: skip un-absorption (for testing without kv_b_proj)
+            self.attn_unabsorbed = self.attn_out
+
         # Step 7: O projection (FP8)
         w_o, s_o = self._attach_fp8_weight(
             state_dict, f"{attn}o_proj.weight", f"layer_{layer_idx}_o_proj")
-        self._fp8_linear(self.attn_out, w_o, s_o, self.attn_proj_out,
+        self._fp8_linear(self.attn_unabsorbed, w_o, s_o, self.attn_proj_out,
                          grid_dim=(self.hidden_size // 128, 128 * 128 // self.hidden_size, 1),
                          block_dim=(256, 1, 1))
 

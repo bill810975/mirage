@@ -569,6 +569,15 @@ if __name__ == "__main__":
                     else:
                         kv_bf16 = kv_w.cuda().to(torch.bfloat16)
                     absorbed = absorb_kv_into_q(q_bf16, kv_bf16, mp).to(torch.bfloat16)
+                    # Extract V un-absorption weight before deleting kv_b_proj
+                    # kv_b_proj: [num_heads * (qk_nope + v_dim), kv_lora_rank]
+                    num_heads = mp["num_heads"]
+                    qk_nope = mp["qk_nope_head_dim"]
+                    v_dim = mp["v_head_dim"]
+                    kv_head_dim = qk_nope + v_dim
+                    kv_b_reshaped = kv_bf16.reshape(num_heads, kv_head_dim, -1)
+                    v_weight = kv_b_reshaped[:, :v_dim, :].reshape(num_heads * v_dim, -1)
+                    state_dict[f"{attn}v_unabsorb.weight"] = v_weight.contiguous()
                     # Replace q_b_proj with absorbed BF16 version, remove scale
                     state_dict[q_key] = absorbed
                     if q_s_key in state_dict:
