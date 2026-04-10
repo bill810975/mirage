@@ -12,11 +12,10 @@ def grid_for_rmsnorm_linear_layer(size):
     if size % 96 == 0:
         return 96
     elif size % 64 == 0:
-        # TMA requires 16-byte aligned sub-tensor offsets.
-        # For bf16 (2 bytes), per-block columns must be a multiple of 8.
-        # Ensure (size / grid) >= 8 to guarantee alignment.
+        # Each block must process >= MMA_M=128 output columns for SM100 linear.
+        # Also TMA requires 16B aligned offsets (>= 8 bf16 elements).
         grid = 64
-        while grid > 1 and (size // grid) < 8:
+        while grid > 1 and (size // grid) < 128:
             grid //= 2
         return grid
     

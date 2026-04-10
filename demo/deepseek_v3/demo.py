@@ -569,15 +569,39 @@ if __name__ == "__main__":
                     else:
                         kv_bf16 = kv_w.cuda().to(torch.bfloat16)
                     absorbed = absorb_kv_into_q(q_bf16, kv_bf16, mp).to(torch.bfloat16)
-                    # Extract V un-absorption weight before deleting kv_b_proj
-                    # kv_b_proj: [num_heads * (qk_nope + v_dim), kv_lora_rank]
-                    num_heads = mp["num_heads"]
+                    # Fuse V un-absorption into o_proj:
+                    # o_proj_fused[h] = o_proj[h] @ W_UV[h]
+                    # where W_UV[h] = kv_b_proj V part: [v_orig, kv_lora_rank]
+                    num_heads_loc = mp["num_heads"]  # use full heads, shard later
                     qk_nope = mp["qk_nope_head_dim"]
                     v_dim = mp["v_head_dim"]
+                    kv_lora_rank = mp["kv_lora_rank"]
                     kv_head_dim = qk_nope + v_dim
-                    kv_b_reshaped = kv_bf16.reshape(num_heads, kv_head_dim, -1)
-                    v_weight = kv_b_reshaped[:, :v_dim, :].reshape(num_heads * v_dim, -1)
-                    state_dict[f"{attn}v_unabsorb.weight"] = v_weight.contiguous()
+                    kv_b_reshaped = kv_bf16.reshape(num_heads_loc, kv_head_dim, kv_lora_rank)
+                    W_UV = kv_b_reshaped[:, :v_dim, :]  # [H, v_dim, kv_lora_rank]
+
+                    # Fuse into o_proj: o_proj [hidden, H*v_dim] → o_proj_fused [hidden, H*kv_lora]
+                    o_key = f"{attn}o_proj.weight"
+                    if o_key in state_dict:
+                        o_w = state_dict[o_key]
+                        if is_fp8(o_w):
+                            o_s_key = f"{o_key}_scale_inv"
+                            if o_s_key in state_dict:
+                                o_bf16 = dequantize_fp8(o_w.cuda(), state_dict[o_s_key].cuda()).to(torch.bfloat16)
+                                del state_dict[o_s_key]
+                            else:
+                                o_bf16 = o_w.cuda().to(torch.bfloat16)
+                        else:
+                            o_bf16 = o_w.cuda().to(torch.bfloat16)
+                        # o_bf16: [hidden, H*v_dim] → reshape [hidden, H, v_dim]
+                        hidden = o_bf16.shape[0]
+                        o_reshaped = o_bf16.reshape(hidden, num_heads_loc, v_dim)
+                        # o_fused[h] = o_reshaped[:, h, :] @ W_UV[h] → [hidden, kv_lora_rank]
+                        # Batched: o_fused = einsum('dhn,hnk->dhk', o_reshaped, W_UV) → [hidden, H, kv_lora]
+                        o_fused = torch.einsum('dhn,hnk->dhk', o_reshaped.float(), W_UV.float())
+                        state_dict[o_key] = o_fused.reshape(hidden, num_heads_loc * kv_lora_rank).to(torch.bfloat16)
+                        print(f"  Fused o_proj: [{hidden}, {num_heads_loc*v_dim}] → [{hidden}, {num_heads_loc*kv_lora_rank}]")
+
                     # Replace q_b_proj with absorbed BF16 version, remove scale
                     state_dict[q_key] = absorbed
                     if q_s_key in state_dict:

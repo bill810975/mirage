@@ -351,12 +351,14 @@ class DeepSeekV3Builder(GraphBuilder):
         prefix = f"model.layers.{layer_idx}."
         attn = f"{prefix}self_attn."
 
-        # Step 1: q_a_proj (FP8)
-        w_q_a, s_q_a = self._attach_fp8_weight(
-            state_dict, f"{attn}q_a_proj.weight", f"layer_{layer_idx}_q_a_proj")
-        self._fp8_linear(self.rmsnorm_out, w_q_a, s_q_a, self.q_a_out,
-                         grid_dim=(grid_for_rmsnorm_linear_layer(w_q_a.dim(0)), 1, 1),
-                         block_dim=(128, 1, 1))
+        # DEBUG: skip everything, just zero attn_proj_out via chained tensor_init
+        self.mpk.tensor_init_layer(
+            input=self.attn_proj_out,
+            dummy_input=self.rmsnorm_out,
+            dummy_output=self.rmsnorm_out,
+            grid_dim=(self.max_num_batched_tokens, 1, 1),
+            block_dim=(128, 1, 1))
+        return
 
         # Step 2: q_a_layernorm (BF16 norm weight)
         w_q_a_ln = self.mpk.attach_input(
@@ -438,29 +440,13 @@ class DeepSeekV3Builder(GraphBuilder):
             block_dim=(128, 1, 1),
         )
 
-        # Step 6b: V un-absorption — attn_out [N, H*512] → attn_unabsorbed [N, H*128]
-        # v_unabsorb.weight [H*128, 512] = kv_b_proj V part, extracted during conversion
-        v_unabsorb_key = f"{attn}v_unabsorb.weight"
-        if v_unabsorb_key in state_dict:
-            w_v_unabsorb = self.mpk.attach_input(
-                torch_tensor=state_dict[v_unabsorb_key],
-                name=f"layer_{layer_idx}_v_unabsorb")
-            self.mpk.linear_layer(
-                input=self.attn_out, weight=w_v_unabsorb,
-                output=self.attn_unabsorbed,
-                grid_dim=(grid_for_rmsnorm_linear_layer(
-                    self.num_local_q_heads * 128), 1, 1),
-                block_dim=(128, 1, 1))
-        else:
-            # Fallback: skip un-absorption (for testing without kv_b_proj)
-            self.attn_unabsorbed = self.attn_out
-
-        # Step 7: O projection (FP8)
+        # Step 7: O projection (V un-absorption fused into o_proj during conversion)
+        # o_proj_fused: [7168, H*kv_lora_rank] — directly takes attn_out [N, H*kv_lora_rank]
         w_o, s_o = self._attach_fp8_weight(
             state_dict, f"{attn}o_proj.weight", f"layer_{layer_idx}_o_proj")
-        self._fp8_linear(self.attn_unabsorbed, w_o, s_o, self.attn_proj_out,
-                         grid_dim=(self.hidden_size // 128, 128 * 128 // self.hidden_size, 1),
-                         block_dim=(256, 1, 1))
+        self._fp8_linear(self.attn_out, w_o, s_o, self.attn_proj_out,
+                         grid_dim=(grid_for_rmsnorm_linear_layer(self.hidden_size), 1, 1),
+                         block_dim=(128, 1, 1))
 
     def _build_dense_mlp(self, layer_idx: int, state_dict: dict):
         """Build dense MLP for layers 0-2 (FP8 weights)."""
@@ -479,8 +465,8 @@ class DeepSeekV3Builder(GraphBuilder):
             state_dict, f"{prefix}mlp.down_proj.weight",
             f"layer_{layer_idx}_down_proj")
         self._fp8_linear(self.silu_mul_out, w_down, s_down, self.mlp_out,
-                         grid_dim=(self.hidden_size // 128, 128 * 128 // self.hidden_size, 1),
-                         block_dim=(256, 1, 1))
+                         grid_dim=(grid_for_rmsnorm_linear_layer(self.hidden_size), 1, 1),
+                         block_dim=(128, 1, 1))
 
     def _build_moe_mlp(self, layer_idx: int, state_dict: dict):
         """Build MoE MLP for layers 3-60.
@@ -921,8 +907,8 @@ class DeepSeekV3Builder(GraphBuilder):
         w_o, s_o = self._attach_fp8_weight(
             state_dict, f"{attn}o_proj.weight", f"mtp_{attn}o_proj")
         self._fp8_linear(self.attn_out, w_o, s_o, self.attn_proj_out,
-                         grid_dim=(self.hidden_size // 128, 128 * 128 // self.hidden_size, 1),
-                         block_dim=(256, 1, 1))
+                         grid_dim=(grid_for_rmsnorm_linear_layer(self.hidden_size), 1, 1),
+                         block_dim=(128, 1, 1))
 
     def _build_dense_mlp_with_prefix(self, prefix: str, state_dict: dict):
         """Build dense MLP using a custom weight prefix (FP8, for MTP reuse)."""
@@ -941,8 +927,8 @@ class DeepSeekV3Builder(GraphBuilder):
             state_dict, f"{mlp_prefix}down_proj.weight",
             f"mtp_{mlp_prefix}down_proj")
         self._fp8_linear(self.silu_mul_out, w_down, s_down, self.mlp_out,
-                         grid_dim=(self.hidden_size // 128, 128 * 128 // self.hidden_size, 1),
-                         block_dim=(256, 1, 1))
+                         grid_dim=(grid_for_rmsnorm_linear_layer(self.hidden_size), 1, 1),
+                         block_dim=(128, 1, 1))
 
     def _build_moe_mlp_with_prefix(self, prefix: str, state_dict: dict):
         """Build MoE MLP using a custom weight prefix (FP8, for MTP reuse)."""
@@ -1377,11 +1363,8 @@ class DeepSeekV3Builder(GraphBuilder):
                 block_dim=(128, 1, 1),
             )
 
-            # MLA attention
-            self._build_mla_attention_layer(i, state_dict)
-
-            # Residual connection
-            self.x = self.attn_proj_out
+            # DEBUG: skip MLA only
+            self.x = self.rmsnorm_out  # pretend attention output = rmsnorm_out
 
             # AllReduce after attention
             if self.world_size > 1:
@@ -1409,8 +1392,6 @@ class DeepSeekV3Builder(GraphBuilder):
                 self._build_dense_mlp(i, state_dict)
             else:
                 self._build_moe_mlp(i, state_dict)
-
-            # Residual + optional AllReduce
             self.x = self.mlp_out
             if self.world_size > 1:
                 self.mpk.allreduce_layer(
