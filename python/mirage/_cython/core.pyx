@@ -308,6 +308,8 @@ def convert_dtype_to_ctype(type : dtype):
         return DT_INT64
     elif type.is_fp64():
         return DT_DOUBLE
+    elif type.name == 'fp8_e4m3':
+        return 930  # DT_FLOAT8 from type.h
     else:
         raise RuntimeError(f"Unsupported dtype: {dtype}")
 
@@ -346,6 +348,8 @@ def convert_ctype_to_dtype(type):
         return float32
     elif type == DT_DOUBLE:
         return float64
+    elif type == 930:  # DT_FLOAT8
+        return float8_e4m3
     else:
         return None
 
