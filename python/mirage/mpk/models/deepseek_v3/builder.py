@@ -464,8 +464,9 @@ class DeepSeekV3Builder(GraphBuilder):
         w_down, s_down = self._attach_fp8_weight(
             state_dict, f"{prefix}mlp.down_proj.weight",
             f"layer_{layer_idx}_down_proj")
+        # DEBUG: use grid=1 for down_proj to rule out partitioning issue
         self._fp8_linear(self.silu_mul_out, w_down, s_down, self.mlp_out,
-                         grid_dim=(grid_for_rmsnorm_linear_layer(self.hidden_size), 1, 1),
+                         grid_dim=(1, 1, 1),
                          block_dim=(128, 1, 1))
 
     def _build_moe_mlp(self, layer_idx: int, state_dict: dict):

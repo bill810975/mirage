@@ -466,8 +466,7 @@ void register_mugraph(
       }
       // assert that their is at least a single tensor shared between ops
       if (num_shared_tensors < 1) {
-        // No shared tensors (DAG branching). Use trivial dependency:
-        // all prev tasks must finish before any current task starts.
+        printf("DAG BARRIER: task_type=%d, num_shared=0\n", task_type);
         input_map = make_int3(-1, -1, -1);
         output_map = make_int3(-1, -1, -1);
       }
