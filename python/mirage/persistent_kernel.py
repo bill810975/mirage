@@ -198,7 +198,6 @@ def get_compile_command(
         ] + (["-DMIRAGE_ENABLE_PROFILER"] if profiling else [])
     elif target_cc == 100:
         specific_cmd = [
-            "-arch=sm_100a",
             "-gencode=arch=compute_100a,code=sm_100a",
             "-DMPK_ENABLE_TMA",
             "-DMIRAGE_GRACE_BLACKWELL",
@@ -1090,6 +1089,148 @@ class PersistentKernel:
         if handler is None:
             raise ValueError(f"Invalid spec decode method: {method}")
         return handler(spec_decode_config, spec_tokens, target_output, grid_dim, block_dim)
+
+    # === MLA Layers ===
+    def mla_kv_gather_layer(self, c_latent_new, k_pe_new, paged_cache,
+                            contiguous_kv, mla_params, grid_dim, block_dim):
+        d_k, d_v, page_size = mla_params
+        params = [d_k, d_v, page_size]
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(c_latent_new, (-1, 1, -1), -1, True)
+        tb_graph.new_input(k_pe_new, (-1, 1, -1), -1, True)
+        tb_graph.new_input(paged_cache, (-1, 2, -1), 1, True)
+        tb_graph.new_input(contiguous_kv, (-1, -1, -1), -1, True)
+        self.kn_graph.customized(
+            [c_latent_new, k_pe_new, paged_cache, contiguous_kv], tb_graph)
+        self.kn_graph.register_task(tb_graph, "mla_kv_gather_sm100", params)
+
+    def mla_decode_layer(self, q_input, kv_input, output_partial, output_lse,
+                         mla_params, grid_dim, block_dim):
+        num_heads, d_k, d_v, num_splits, kv_len = mla_params
+        params = [num_heads, d_k, d_v, num_splits, kv_len]
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(q_input, (-1, -1, -1), -1, True)
+        tb_graph.new_input(kv_input, (-1, -1, -1), -1, True)
+        tb_graph.new_input(output_partial, (-1, -1, -1), -1, True)
+        tb_graph.new_input(output_lse, (-1, -1, -1), -1, True)
+        self.kn_graph.customized(
+            [q_input, kv_input, output_partial, output_lse], tb_graph)
+        self.kn_graph.register_task(tb_graph, "mla_decode_sm100", params)
+
+    def mla_reduce_layer(self, input_partial, input_lse, output,
+                         mla_params, grid_dim, block_dim):
+        num_heads, d_v, num_splits, d_start, d_count = mla_params
+        params = [num_heads, d_v, num_splits, d_start, d_count]
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(input_partial, (-1, -1, -1), -1, True)
+        tb_graph.new_input(input_lse, (-1, -1, -1), -1, True)
+        tb_graph.new_input(output, (-1, -1, -1), -1, True)
+        self.kn_graph.customized(
+            [input_partial, input_lse, output], tb_graph)
+        self.kn_graph.register_task(tb_graph, "mla_reduce_sm100", params)
+
+    def mla_prefill_layer(self, q_nope, q_pe, ckv, kpe, output,
+                          mla_params, grid_dim, block_dim):
+        num_heads, seq_len, d_ckv, d_kpe, d_v = mla_params
+        params = [num_heads, seq_len, d_ckv, d_kpe, d_v]
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(q_nope, (0, -1, -1), -1, True)
+        tb_graph.new_input(q_pe, (0, -1, -1), -1, True)
+        tb_graph.new_input(ckv, (0, -1, -1), -1, True)
+        tb_graph.new_input(kpe, (0, -1, -1), -1, True)
+        tb_graph.new_input(output, (0, -1, -1), -1, True)
+        self.kn_graph.customized(
+            [q_nope, q_pe, ckv, kpe, output], tb_graph)
+        self.kn_graph.register_task(tb_graph, "mla_prefill_sm100", params)
+
+    # === FP8 Layers ===
+    def quantize_fp8_layer(self, input, output_fp8, output_scale,
+                           grid_dim, block_dim):
+        params = []
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(input, (-1, -1, -1), -1, True)
+        tb_graph.new_input(output_fp8, (-1, -1, -1), -1, True)
+        tb_graph.new_input(output_scale, (-1, -1, -1), -1, True)
+        self.kn_graph.customized([input, output_fp8, output_scale], tb_graph)
+        self.kn_graph.register_task(tb_graph, "quantize_fp8_sm100", params)
+
+    def linear_fp8_layer(self, input_fp8, input_scale, weight_fp8,
+                         weight_scale, output, grid_dim, block_dim):
+        params = []
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(input_fp8, (-1, -1, -1), -1, True)
+        tb_graph.new_input(input_scale, (-1, -1, -1), -1, True)
+        tb_graph.new_input(weight_fp8, (-1, -1, -1), -1, True)
+        tb_graph.new_input(weight_scale, (-1, -1, -1), -1, True)
+        tb_graph.new_input(output, (-1, -1, -1), -1, True)
+        self.kn_graph.customized(
+            [input_fp8, input_scale, weight_fp8, weight_scale, output], tb_graph)
+        self.kn_graph.register_task(tb_graph, "linear_fp8_sm100", params)
+
+    def linear_fp8_with_residual_layer(self, input_fp8, input_scale,
+                                       weight_fp8, weight_scale, residual,
+                                       output, grid_dim, block_dim):
+        params = [1]
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(input_fp8, (-1, -1, -1), -1, True)
+        tb_graph.new_input(input_scale, (-1, -1, -1), -1, True)
+        tb_graph.new_input(weight_fp8, (-1, -1, -1), -1, True)
+        tb_graph.new_input(weight_scale, (-1, -1, -1), -1, True)
+        tb_graph.new_input(residual, (-1, -1, -1), -1, True)
+        tb_graph.new_input(output, (-1, -1, -1), -1, True)
+        self.kn_graph.customized(
+            [input_fp8, input_scale, weight_fp8, weight_scale, residual, output],
+            tb_graph)
+        self.kn_graph.register_task(
+            tb_graph, "linear_fp8_with_residual_sm100", params)
+
+    def moe_w13_fp8_layer(self, input_fp8, input_scale, weight_fp8,
+                          weight_scale, moe_routing_indices, moe_mask,
+                          output, grid_dim, block_dim):
+        params = []
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(input_fp8, (-1, -1, -1), -1, True)
+        tb_graph.new_input(input_scale, (-1, -1, -1), -1, True)
+        tb_graph.new_input(weight_fp8, (-1, -1, -1), -1, True)
+        tb_graph.new_input(weight_scale, (-1, -1, -1), -1, True)
+        tb_graph.new_input(moe_routing_indices, (-1, -1, -1), -1, True)
+        tb_graph.new_input(moe_mask, (-1, -1, -1), -1, True)
+        tb_graph.new_input(output, (-1, -1, -1), -1, True)
+        self.kn_graph.customized(
+            [input_fp8, input_scale, weight_fp8, weight_scale,
+             moe_routing_indices, moe_mask, output], tb_graph)
+        self.kn_graph.register_task(tb_graph, "moe_w13_fp8_sm100", params)
+
+    def moe_w2_fp8_layer(self, input_fp8, input_scale, weight_fp8,
+                         weight_scale, moe_routing_indices, moe_mask,
+                         output, grid_dim, block_dim):
+        params = []
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(input_fp8, (-1, -1, -1), -1, True)
+        tb_graph.new_input(input_scale, (-1, -1, -1), -1, True)
+        tb_graph.new_input(weight_fp8, (-1, -1, -1), -1, True)
+        tb_graph.new_input(weight_scale, (-1, -1, -1), -1, True)
+        tb_graph.new_input(moe_routing_indices, (-1, -1, -1), -1, True)
+        tb_graph.new_input(moe_mask, (-1, -1, -1), -1, True)
+        tb_graph.new_input(output, (-1, -1, -1), -1, True)
+        self.kn_graph.customized(
+            [input_fp8, input_scale, weight_fp8, weight_scale,
+             moe_routing_indices, moe_mask, output], tb_graph)
+        self.kn_graph.register_task(tb_graph, "moe_w2_fp8_sm100", params)
+
+    def moe_topk_sigmoid_routing_layer(self, input, bias, output,
+                                       grid_dim, block_dim):
+        params = []
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(input, (-1, -1, -1), -1, True)
+        tb_graph.new_input(bias, (-1, -1, -1), -1, True)
+        out_weights, out_indices, out_mask = output
+        tb_graph.new_input(out_weights, (-1, -1, -1), -1, True)
+        tb_graph.new_input(out_indices, (-1, -1, -1), -1, True)
+        tb_graph.new_input(out_mask, (-1, -1, -1), -1, True)
+        self.kn_graph.customized(
+            [input, bias, out_weights, out_indices, out_mask], tb_graph)
+        self.kn_graph.register_task(tb_graph, "moe_topk_sigmoid_sm100", params)
 
     def compile(
         self,
