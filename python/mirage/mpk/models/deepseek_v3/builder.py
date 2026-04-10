@@ -419,19 +419,7 @@ class DeepSeekV3Builder(GraphBuilder):
             input=self.c_latent_out, weight=w_kv_a_ln, output=self.c_latent_out,
             grid_dim=(self.max_num_batched_tokens, 1, 1), block_dim=(128, 1, 1))
 
-        # Step 6: MLA attention — kv_gather only (debug: skip decode/reduce)
-        cache = self.mpk.attach_input(
-            torch_tensor=self.ckv_kpe_cache[layer_idx],
-            name=f"layer_{layer_idx}_ckv_kpe_cache")
-        self.mpk.mla_kv_gather_layer(
-            c_latent_new=self.c_latent_out,
-            k_pe_new=self.k_pe_out,
-            paged_cache=cache,
-            contiguous_kv=self.contiguous_kv,
-            mla_params=(self.qk_head_dim, self.v_head_dim, self.mpk.page_size),
-            grid_dim=(self.mpk.max_num_batched_requests, 1, 1),
-            block_dim=(128, 1, 1),
-        )
+        # Step 6: MLA attention — disabled, zero attn_out (FP8 debug)
         self.mpk.tensor_init_layer(
             input=self.attn_out,
             dummy_input=self.rmsnorm_out,

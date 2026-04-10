@@ -766,14 +766,13 @@ __host__ inline void fill_tma_desc_by_task(CUtensorMap *tma_desc,
     }
     case TASK_LINEAR_FP8_SM100:
     case TASK_LINEAR_FP8_WITH_RESIDUAL_SM100: {
-      // FP8 linear: tensors have mixed types (FP8, FP32, BF16).
-      // Use tensor_desc.data_type to select TMA format.
-      // DT_FLOAT8=930, DT_BFLOAT16=941, DT_FLOAT32=950
-      int const cp_async_size = 64;
+      // FP8 linear: 1-byte elements, TMA_CP_ASYNC_SIZE=128 (not 64 like BF16)
+      // Matching standalone test: runtime_kernel_wrapper_sm100.cu line 266
+      int const cp_async_size = 128;  // FP8: 128 elements × 1 byte = 128B
       const size_t smem_repeat_row = 1;
       constexpr int B = 3, M = 3, S = 3;
       constexpr int MMA_M = 128, MMA_N = 16;
-      constexpr int TILE_SIZE = 64;
+      constexpr int TILE_SIZE = 128;  // FP8: bK=128
       size_t smem_repeat_col = (TILE_SIZE + cp_async_size - 1) / cp_async_size;
 
       bool is_fp8 = (tensor_desc.data_type == 930);
@@ -782,7 +781,8 @@ __host__ inline void fill_tma_desc_by_task(CUtensorMap *tma_desc,
       bool with_res = (task_desc.task_type == TASK_LINEAR_FP8_WITH_RESIDUAL_SM100);
       bool is_output = (param_id == (size_t)(task_desc.num_inputs));
 
-      if (is_fp8) {
+      if (is_fp8 && (param_id == 0 || param_id == 2)) {
+        // FP8 input or weight — matching standalone test exactly
         int rows = tensor_desc.dim[0];
         int cols = tensor_desc.dim[1];
         uint64_t gs[2] = {(uint64_t)rows, (uint64_t)cols};
@@ -791,17 +791,8 @@ __host__ inline void fill_tma_desc_by_task(CUtensorMap *tma_desc,
                           (uint32_t)cp_async_size};
         fill_tma_desc<cutlass::float_e4m3_t, B, M, S, 2>(
             tma_desc, tensor_desc.base_ptr, gs, gst, ss, smem_repeat_row, smem_repeat_col);
-      } else if (is_fp32) {
-        // Scale tensors: loaded via direct load in kernel, not TMA.
-        // Create a minimal valid TMA desc (won't be used for actual TMA loads).
-        int rows = tensor_desc.dim[0];
-        int cols = tensor_desc.dim[1];
-        uint64_t gs[2] = {(uint64_t)rows, (uint64_t)cols};
-        uint64_t gst[2] = {1, (uint64_t)cols};
-        uint32_t ss[2] = {1, (uint32_t)cols};
-        fill_tma_desc<float, 0, 0, 0, 2>(
-            tma_desc, tensor_desc.base_ptr, gs, gst, ss, 1, 1);
-      } else if (is_output) {
+      } else {
+        // BF16 output
         int rows = tensor_desc.dim[0];
         int cols = tensor_desc.dim[1];
         int stride = tensor_desc.stride[0];
@@ -810,15 +801,6 @@ __host__ inline void fill_tma_desc_by_task(CUtensorMap *tma_desc,
         uint32_t ss[2] = {(uint32_t)MMA_N, (uint32_t)MMA_M};
         fill_tma_desc<bfloat16, 0, M, S, 2>(
             tma_desc, tensor_desc.base_ptr, gs, gst, ss, smem_repeat_row, 1);
-      } else {
-        // BF16 residual
-        int rows = tensor_desc.dim[0];
-        int cols = tensor_desc.dim[1];
-        uint64_t gs[2] = {(uint64_t)rows, (uint64_t)cols};
-        uint64_t gst[2] = {1, (uint64_t)cols};
-        uint32_t ss[2] = {(uint32_t)MMA_N, (uint32_t)cp_async_size};
-        fill_tma_desc<bfloat16, B, M, S, 2>(
-            tma_desc, tensor_desc.base_ptr, gs, gst, ss, smem_repeat_row, smem_repeat_col);
       }
       break;
     }
@@ -1122,10 +1104,8 @@ __host__ inline void create_tma_desc_by_task(FullTaskDesc &task_desc) {
     case TASK_SPLITK_LINEAR_SWAPAB_HOPPER:
     case TASK_LINEAR_SM100:
     case TASK_LINEAR_WITH_RESIDUAL_SM100:
-    case TASK_SPLITK_LINEAR_SM100:
-    case TASK_LINEAR_FP8_SM100:
-    case TASK_LINEAR_FP8_WITH_RESIDUAL_SM100: {
-      // all tensors have 1 tma_desc
+    case TASK_SPLITK_LINEAR_SM100: {
+      // BF16 linear: all tensors have 1 tma_desc
       for (size_t param_id = 0;
            param_id < task_desc.num_inputs + task_desc.num_outputs;
            param_id++) {
@@ -1135,6 +1115,16 @@ __host__ inline void create_tma_desc_by_task(FullTaskDesc &task_desc) {
                 : task_desc.outputs[param_id - task_desc.num_inputs];
         create_tma_desc_for_tensor(task_desc, tensor_desc, param_id, 0);
       }
+      break;
+    }
+    case TASK_LINEAR_FP8_SM100:
+    case TASK_LINEAR_FP8_WITH_RESIDUAL_SM100: {
+      // FP8 linear: only create TMA for fp8_input(0), fp8_weight(2), output
+      // Scale tensors (1, 3) use direct load, not TMA
+      create_tma_desc_for_tensor(task_desc, task_desc.inputs[0], 0, 0);
+      create_tma_desc_for_tensor(task_desc, task_desc.inputs[2], 2, 0);
+      create_tma_desc_for_tensor(task_desc,
+          task_desc.outputs[0], task_desc.num_inputs, 0);
       break;
     }
     case TASK_PAGED_ATTENTION_HOPPER: {
