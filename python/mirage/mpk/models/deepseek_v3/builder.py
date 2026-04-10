@@ -129,7 +129,6 @@ class DeepSeekV3Builder(GraphBuilder):
             self._fp8_bufs[reduction_size] = (fp8_buf, scale_buf)
         self._fp8_input_buf, self._fp8_scale_buf = self._fp8_bufs[reduction_size]
 
-        print(f"DEBUG: quantize input guid={input_bf16.guid}, fp8_buf guid={self._fp8_input_buf.guid}")
         self.mpk.quantize_fp8_layer(
             input=input_bf16,
             output_fp8=self._fp8_input_buf,
@@ -1362,7 +1361,6 @@ class DeepSeekV3Builder(GraphBuilder):
                 grid_dim=(self.max_num_batched_tokens, 1, 1),
                 block_dim=(128, 1, 1),
             )
-            print(f"DEBUG: rmsnorm_out guid={self.rmsnorm_out.guid}")
 
             # MLA attention
             self._build_mla_attention_layer(i, state_dict)
