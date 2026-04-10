@@ -500,12 +500,24 @@ class DeepSeekV3Builder(GraphBuilder):
             grid_dim=(self.mpk.max_num_batched_requests, 1, 1),
             block_dim=(128, 1, 1),
         )
-        # ABLATION: skip MLA decode+reduce, zero attn_out
-        self.mpk.tensor_init_layer(
-            input=self.attn_out,
-            dummy_input=self.rmsnorm_out,
-            dummy_output=self.rmsnorm_out,
-            grid_dim=(self.max_num_batched_tokens, 1, 1),
+        num_splits = self.mla_max_splits
+        self.mpk.mla_decode_layer(
+            q_input=self.q_nope_pe,
+            kv_input=self.contiguous_kv,
+            output_partial=self.mla_partial_o,
+            output_lse=self.mla_partial_lse,
+            mla_params=(self.num_local_q_heads, self.qk_head_dim,
+                        self.v_head_dim, num_splits, self.mpk.max_seq_length),
+            grid_dim=(num_splits, 1, 1),
+            block_dim=(128, 1, 1),
+        )
+        self.mpk.mla_reduce_layer(
+            input_partial=self.mla_partial_o,
+            input_lse=self.mla_partial_lse,
+            output=self.attn_out,
+            mla_params=(self.num_local_q_heads, self.v_head_dim,
+                        num_splits, 0, self.v_head_dim),
+            grid_dim=(self.mpk.max_num_batched_requests, 1, 1),
             block_dim=(128, 1, 1),
         )
 
