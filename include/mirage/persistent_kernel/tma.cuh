@@ -766,13 +766,12 @@ __host__ inline void fill_tma_desc_by_task(CUtensorMap *tma_desc,
     }
     case TASK_LINEAR_FP8_SM100:
     case TASK_LINEAR_FP8_WITH_RESIDUAL_SM100: {
-      // FP8 linear: 1-byte elements, TMA_CP_ASYNC_SIZE=128 (not 64 like BF16)
-      // Matching standalone test: runtime_kernel_wrapper_sm100.cu line 266
-      int const cp_async_size = 128;  // FP8: 128 elements × 1 byte = 128B
+      // FP8: 128 elements × 1 byte = 128B (matches 128B TMA swizzle)
+      int const cp_async_size = 128;
       const size_t smem_repeat_row = 1;
       constexpr int B = 3, M = 3, S = 3;
       constexpr int MMA_M = 128, MMA_N = 16;
-      constexpr int TILE_SIZE = 128;  // FP8: bK=128
+      constexpr int TILE_SIZE = 128;
       size_t smem_repeat_col = (TILE_SIZE + cp_async_size - 1) / cp_async_size;
 
       bool is_fp8 = (tensor_desc.data_type == 930);
