@@ -377,8 +377,24 @@ void register_mugraph(
           if (task_type == TASK_MOE_W13_LINEAR_SM100 ||
               task_type == TASK_MOE_W2_LINEAR_SM100 ||
               task_type == TASK_MOE_W13_LINEAR_SM90 ||
-              task_type == TASK_MOE_W2_LINEAR_SM90) {
+              task_type == TASK_MOE_W2_LINEAR_SM90 ||
+              task_type == TASK_MOE_W13_FP8_SM100 ||
+              task_type == TASK_MOE_W2_FP8_SM100) {
             task.expert_offset = bid.x;
+          }
+          // MLA decode: request_id = batch (bid.y), head_group = split (bid.x)
+          if (task_type == TASK_MLA_DECODE_SM100) {
+            task.request_id = bid.y;
+            task.head_group = bid.x;
+          }
+          // MLA reduce/kv_gather/prefill: request_id = bid.x
+          if (task_type == TASK_MLA_REDUCE_SM100 ||
+              task_type == TASK_MLA_KV_GATHER_SM100) {
+            task.request_id = bid.x;
+          }
+          if (task_type == TASK_MLA_PREFILL_SM100) {
+            task.request_id = bid.x; // head
+            task.head_group = bid.y; // q_block
           }
           // Initialize input tensors to the task
           for (auto const &input : input_ops) {
@@ -450,18 +466,11 @@ void register_mugraph(
       }
       // assert that their is at least a single tensor shared between ops
       if (num_shared_tensors < 1) {
-        printf("ERROR: num_shared_tensors=%d, task_type=%d\n",
-               num_shared_tensors, task_type);
-        printf("  Current inputs (%zu):\n", input_ops.size());
-        for (auto const &input : input_ops) {
-          printf("    guid=%lu dim0=%d\n", (unsigned long)input->dtensor.guid, input->dtensor.dim[0]);
-        }
-        printf("  Prev outputs (%zu):\n", pre_output_ops.size());
-        for (auto const &output : pre_output_ops) {
-          printf("    guid=%lu dim0=%d\n", (unsigned long)output->dtensor.guid, output->dtensor.dim[0]);
-        }
+        // No shared tensors (DAG branching). Use trivial dependency:
+        // all prev tasks must finish before any current task starts.
+        input_map = make_int3(-1, -1, -1);
+        output_map = make_int3(-1, -1, -1);
       }
-      assert(num_shared_tensors >= 1);
       for (int d = 0; d < mirage::config::MAX_TENSOR_DIMS; d++) {
         if (d == input_map.x) {
           consumer_partition[d] = bgraph.grid_dim.x;
