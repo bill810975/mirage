@@ -703,6 +703,20 @@ TaskGraphResult print_task_graph(
            "task.at(\"task_type\") < TASK_SM100_TMA_END_TASK) {");
     code.e("create_tma_desc_by_task(task_desc);");
     code.e("}");
+    // MLA Decode needs TMA (outside SM100_TMA range)
+    code.e("if (task.at(\"task_type\") == TASK_MLA_DECODE_SM100) {");
+    code.e("create_tma_desc_by_task(task_desc);");
+    code.e("}");
+    // FP8 linear tasks need TMA (outside SM100_TMA range, CUTLASS creates own TMA internally)
+    code.e("if (task.at(\"task_type\") == TASK_LINEAR_FP8_SM100 || "
+           "task.at(\"task_type\") == TASK_LINEAR_FP8_WITH_RESIDUAL_SM100) {");
+    code.e("create_tma_desc_by_task(task_desc);");
+    code.e("}");
+    // MoE FP8 tasks need TMA
+    code.e("if (task.at(\"task_type\") == TASK_MOE_W13_FP8_SM100 || "
+           "task.at(\"task_type\") == TASK_MOE_W2_FP8_SM100) {");
+    code.e("create_tma_desc_by_task(task_desc);");
+    code.e("}");
     code.e("#endif");
     code.e("all_tasks.push_back(task_desc);");
     code.e("}");
@@ -1355,6 +1369,29 @@ TaskGraphResult print_task_graph(
   task_type_to_name[TASK_MOE_W13_LINEAR_SM100] = "TASK_MOE_W13_LINEAR_SM100";
   task_type_to_name[TASK_MOE_W2_LINEAR_SM100] = "TASK_MOE_W2_LINEAR_SM100";
   task_type_to_name[TASK_MOE_MUL_SUM_ADD_SM100] = "TASK_MOE_MUL_SUM_ADD_SM100";
+  task_type_to_name[TASK_MOE_W13_FP8_SM100] = "TASK_MOE_W13_FP8_SM100";
+  task_type_to_name[TASK_MOE_W2_FP8_SM100] = "TASK_MOE_W2_FP8_SM100";
+  task_type_to_name[TASK_MOE_TOPK_SIGMOID_SM100] = "TASK_MOE_TOPK_SIGMOID_SM100";
+  task_type_to_name[TASK_QUANTIZE_FP8_SM100] = "TASK_QUANTIZE_FP8_SM100";
+  task_type_to_name[TASK_LINEAR_FP8_SM100] = "TASK_LINEAR_FP8_SM100";
+  task_type_to_name[TASK_LINEAR_FP8_WITH_RESIDUAL_SM100] =
+      "TASK_LINEAR_FP8_WITH_RESIDUAL_SM100";
+  task_type_to_name[TASK_PAGED_ATTENTION_SPLIT_KV_SM100] =
+      "TASK_PAGED_ATTENTION_SPLIT_KV_SM100";
+  task_type_to_name[TASK_PAGED_ATTENTION_SPLIT_KV_MERGE_SM100] =
+      "TASK_PAGED_ATTENTION_SPLIT_KV_MERGE_SM100";
+  task_type_to_name[TASK_SAMPLING_SM100] = "TASK_SAMPLING_SM100";
+  task_type_to_name[TASK_MLA_KV_GATHER_SM100] = "TASK_MLA_KV_GATHER_SM100";
+  task_type_to_name[TASK_MLA_DECODE_SM100] = "TASK_MLA_DECODE_SM100";
+  task_type_to_name[TASK_MLA_REDUCE_SM100] = "TASK_MLA_REDUCE_SM100";
+  task_type_to_name[TASK_MLA_PREFILL_SM100] = "TASK_MLA_PREFILL_SM100";
+  task_type_to_name[TASK_MTP_VERIFY_STRICT] = "TASK_MTP_VERIFY_STRICT";
+  task_type_to_name[TASK_MTP_VERIFY_PROBABILISTIC] =
+      "TASK_MTP_VERIFY_PROBABILISTIC";
+  task_type_to_name[TASK_MTP_VERIFY_SYNTHETIC] = "TASK_MTP_VERIFY_SYNTHETIC";
+  task_type_to_name[TASK_MTP_ACCEPT_COMMIT] = "TASK_MTP_ACCEPT_COMMIT";
+  task_type_to_name[TASK_MTP_TOKEN_SCATTER] = "TASK_MTP_TOKEN_SCATTER";
+  task_type_to_name[TASK_MTP_PREPARE_VERIFY] = "TASK_MTP_PREPARE_VERIFY";
   task_type_to_name[TASK_MOE_W13_LINEAR_SM90] = "TASK_MOE_W13_LINEAR_SM90";
   task_type_to_name[TASK_MOE_W2_LINEAR_SM90] = "TASK_MOE_W2_LINEAR_SM90";
   task_type_to_name[TASK_SPLITK_LINEAR_SWAPAB_HOPPER] =

@@ -2689,5 +2689,864 @@ int TaskRegister::register_splitk_linear_swapAB_hopper_task(
                                code.to_string());
 }
 
+int TaskRegister::register_mtp_verify_strict_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  // params[0]: num_draft_tokens (1-7)
+  assert(params.size() == 1);
+  int num_draft = params[0];
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e("kernel::target_verify_strict_kernel<$>(", num_draft);
+  code.e("    task_desc->input_ptrs[0],");   // draft_token_ids
+  code.e("    task_desc->input_ptrs[1],");   // target_token_ids
+  code.e("    task_desc->output_ptrs[0],");  // accepted_count
+  code.e("    task_desc->output_ptrs[1]);"); // output_tokens
+  return register_task_variant(TASK_MTP_VERIFY_STRICT, code.to_string());
+}
+
+int TaskRegister::register_mtp_verify_probabilistic_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  // params[0]: num_draft_tokens (1-7)
+  assert(params.size() == 1);
+  int num_draft = params[0];
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e("kernel::target_verify_probabilistic_kernel<$>(", num_draft);
+  code.e("    task_desc->input_ptrs[0],");   // draft_token_ids
+  code.e("    task_desc->input_ptrs[1],");   // target_token_ids
+  code.e("    task_desc->input_ptrs[2],");   // target_probs (pre-computed)
+  code.e("    task_desc->input_ptrs[3],");   // draft_probs (pre-computed)
+  code.e("    task_desc->input_ptrs[4],");   // seed
+  code.e("    task_desc->output_ptrs[0],");  // accepted_count
+  code.e("    task_desc->output_ptrs[1]);"); // output_tokens
+  return register_task_variant(TASK_MTP_VERIFY_PROBABILISTIC, code.to_string());
+}
+
+int TaskRegister::register_mtp_verify_synthetic_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  // params[0]: num_draft_tokens (1-7)
+  assert(params.size() == 1);
+  int num_draft = params[0];
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e("kernel::target_verify_synthetic_kernel<$>(", num_draft);
+  code.e("    task_desc->input_ptrs[0],");   // draft_token_ids
+  code.e("    task_desc->input_ptrs[1],");   // target_token_ids
+  code.e("    task_desc->input_ptrs[2],");   // base_rate
+  code.e("    task_desc->input_ptrs[3],");   // decay
+  code.e("    task_desc->input_ptrs[4],");   // seed
+  code.e("    task_desc->output_ptrs[0],");  // accepted_count
+  code.e("    task_desc->output_ptrs[1]);"); // output_tokens
+  return register_task_variant(TASK_MTP_VERIFY_SYNTHETIC, code.to_string());
+}
+
+int TaskRegister::register_mtp_accept_commit_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  // params[0]: num_draft_tokens (1-7)
+  assert(params.size() == 1);
+  int num_draft = params[0];
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e("kernel::mtp_accept_commit_kernel<$>(", num_draft);
+  code.e("    task_desc->input_ptrs[0],");   // accepted_count
+  code.e("    task_desc->input_ptrs[1],");   // output_tokens
+  code.e("    task_desc->input_ptrs[2],");   // current_position
+  code.e("    task_desc->output_ptrs[0],");  // new_position
+  code.e("    task_desc->output_ptrs[1],");  // final_output
+  code.e("    task_desc->output_ptrs[2]);"); // num_new_tokens
+  return register_task_variant(TASK_MTP_ACCEPT_COMMIT, code.to_string());
+}
+
+int TaskRegister::register_mtp_token_scatter_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  // params[0]: batch_size, params[1]: num_slots, params[2]: slot_idx
+  assert(params.size() == 3);
+  int batch_size = params[0];
+  int num_slots = params[1];
+  int slot_idx = params[2];
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e("kernel::mtp_token_scatter_kernel<$, $, $>(", batch_size, num_slots, slot_idx);
+  code.e("    task_desc->input_ptrs[0],");   // src: single draft token
+  code.e("    task_desc->output_ptrs[0]);"); // dst: all_draft_ids buffer
+  return register_task_variant(TASK_MTP_TOKEN_SCATTER, code.to_string());
+}
+
+int TaskRegister::register_mtp_prepare_verify_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  // params[0]: num_draft_tokens, params[1]: max_seq_len
+  assert(params.size() == 2);
+  int num_draft = params[0];
+  int max_seq_len = params[1];
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e("kernel::mtp_prepare_verify_input_kernel<$, $>(", num_draft, max_seq_len);
+  code.e("    task_desc->input_ptrs[0],");   // main_token
+  code.e("    task_desc->input_ptrs[1],");   // draft_tokens
+  code.e("    task_desc->input_ptrs[2],");   // tokens_buffer
+  code.e("    task_desc->input_ptrs[3],");   // step
+  code.e("    task_desc->output_ptrs[0]);"); // num_new_tokens
+  return register_task_variant(TASK_MTP_PREPARE_VERIFY, code.to_string());
+}
+
+
+int TaskRegister::register_linear_fp8_sm100_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params,
+    bool with_residual) {
+  // Inputs: input_fp8 [batch, reduction], input_scale [batch, reduction/128],
+  //         weight_fp8 [output, reduction], weight_scale [output, reduction/128],
+  //         (optional) residual [batch, output]
+  // Output: output_bf16 [batch, output]
+  bool rank_with_residual = with_residual;
+  if (with_residual) {
+    assert(params.size() == 1);
+    rank_with_residual = (params[0] == 1);
+  } else {
+    assert(params.size() == 0);
+  }
+  int batch_size = 0, output_size = 0, reduction_size = 0, output_stride = 0;
+  std::vector<tb::TBInputOp *> input_ops;
+  std::vector<tb::TBInputOp *> output_ops;
+  // Inputs: input_fp8, input_scale, weight_fp8, weight_scale, [residual]
+  int num_inputs = with_residual ? 5 : 4;
+  int num_outputs = 1;
+
+  assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops.size() < (size_t)num_inputs) {
+      input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+  assert(output_ops[0]->output_tensors[0].num_dims == 2);
+  batch_size = output_ops[0]->output_tensors[0].dim[0];
+  output_size = output_ops[0]->output_tensors[0].dim[1];
+  assert(input_ops[0]->dtensor.num_dims == 2); // input_fp8
+  reduction_size = input_ops[0]->dtensor.dim[1];
+  assert(output_ops[0]->dtensor.owner_op->op_type == type::KN_INPUT_OP);
+  kn::KNInputOp *kn_input_op =
+      static_cast<kn::KNInputOp *>(output_ops[0]->dtensor.owner_op);
+  output_stride = static_cast<int>(kn_input_op->input_strides[0]);
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  constexpr int MMA_M = 128;
+  constexpr int MMA_N = 16;
+  constexpr int bK = 64;
+  constexpr int num_ab_stages = 8;
+  constexpr int num_acc_stages = 2;
+  constexpr int num_c_stages = 4;
+  constexpr int B = 3, M = 3, S = 3;
+  constexpr int TMA_CP_ASYNC_SIZE = 64;
+  constexpr int TILE_SIZE = 64;
+  int const output_tma_cp_size = 128;
+  int const output_atom_size = 128;
+
+  // TMA_A: weight [output, reduction] — FP8
+  code.e("using TMA_A = kernel::tma::tma_2d<cutlass::float_e4m3_t, $, $, $, "
+         "$, $, $, $, $, $, $, $, $, true>;",
+         B, M, S,
+         output_size, reduction_size,
+         MMA_M, TMA_CP_ASYNC_SIZE,
+         reduction_size, 1,
+         1, (TILE_SIZE + TMA_CP_ASYNC_SIZE - 1) / TMA_CP_ASYNC_SIZE,
+         MMA_M * TMA_CP_ASYNC_SIZE);
+  // TMA_B: input [batch, reduction] — FP8
+  code.e("using TMA_B = kernel::tma::tma_2d<cutlass::float_e4m3_t, $, $, $, "
+         "$, $, $, $, $, $, $, $, $, true>;",
+         B, M, S,
+         batch_size, reduction_size,
+         MMA_N, TMA_CP_ASYNC_SIZE,
+         reduction_size, 1,
+         1, (TILE_SIZE + TMA_CP_ASYNC_SIZE - 1) / TMA_CP_ASYNC_SIZE,
+         MMA_N * TMA_CP_ASYNC_SIZE);
+  // TMA_OUT: output [batch, output] — BF16
+  code.e("using TMA_OUT = kernel::tma::tma_2d<cute::bfloat16_t, $, $, $, "
+         "$, $, $, $, $, $, $, $, $, true>;",
+         0, M, S,
+         batch_size, output_size,
+         MMA_N, MMA_M,
+         output_stride, 1,
+         1, (output_atom_size + output_tma_cp_size - 1) / output_tma_cp_size,
+         MMA_N * MMA_M);
+
+  code.inc_indent();
+  code.e("TMA_A tma_a(static_cast<CUtensorMap*>("
+         "task_desc->input_tma_desc_ptrs[2][0]));");  // weight
+  code.e("TMA_B tma_b(static_cast<CUtensorMap*>("
+         "task_desc->input_tma_desc_ptrs[0][0]));");  // input
+  code.e("TMA_OUT tma_out(static_cast<CUtensorMap*>("
+         "task_desc->output_tma_desc_ptrs[0][0]));");
+  // Bias tensor (residual)
+  code.e("cute::Layout layout_Bias = cute::make_layout(cute::make_shape($, $), "
+         "cute::make_stride($, cute::Int<1>{}));",
+         batch_size, output_size, output_stride);
+  code.e("cute::Tensor mBias = "
+         "cute::make_tensor(cute::make_gmem_ptr(static_cast<cute::bfloat16_t*>("
+         "$)), layout_Bias);",
+         (with_residual && rank_with_residual)
+             ? "task_desc->input_ptrs[4]" : "nullptr");
+  code.e("kernel::linear_fp8_1d2d_sm100_task_impl<cutlass::float_e4m3_t, "
+         "TMA_A, TMA_B, decltype(mBias), TMA_OUT, "
+         "$, $, $, $, $, $, $, $, $, $>(",
+         MMA_M, MMA_N,
+         batch_size, output_size, reduction_size,
+         (with_residual && rank_with_residual) ? "false" : "true",
+         "false", // SplitK
+         num_ab_stages, num_acc_stages, num_c_stages);
+  code.e("    tma_a, tma_b,");
+  code.e("    static_cast<uint32_t const*>(task_desc->input_ptrs[3]),"); // weight_scale
+  code.e("    static_cast<uint32_t const*>(task_desc->input_ptrs[1]),"); // input_scale
+  code.e("    mBias, tma_out);");
+
+  if (with_residual) {
+    return register_task_variant(TASK_LINEAR_FP8_WITH_RESIDUAL_SM100,
+                                 code.to_string());
+  } else {
+    return register_task_variant(TASK_LINEAR_FP8_SM100, code.to_string());
+  }
+}
+
+
+int TaskRegister::register_quantize_fp8_sm100_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  // Input: bf16 [batch, hidden] or [batch, topk, hidden] (3D flattened)
+  // Output: fp8 same shape, scale [..., hidden/group_size]
+  assert(params.size() == 0);
+  int batch_size = 0, hidden_size = 0;
+  std::vector<tb::TBInputOp *> input_ops;
+  std::vector<tb::TBInputOp *> output_ops;
+  int num_inputs = 1;
+  int num_outputs = 2;
+  assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops.size() < (size_t)num_inputs) {
+      input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+  int ndims = input_ops[0]->dtensor.num_dims;
+  assert(ndims == 2 || ndims == 3);
+  if (ndims == 3) {
+    // Flatten first two dims: [batch, topk, hidden] → batch_size = batch*topk
+    batch_size = input_ops[0]->output_tensors[0].dim[0] *
+                 input_ops[0]->output_tensors[0].dim[1];
+    hidden_size = input_ops[0]->output_tensors[0].dim[2];
+  } else {
+    batch_size = input_ops[0]->output_tensors[0].dim[0];
+    hidden_size = input_ops[0]->output_tensors[0].dim[1];
+  }
+  int input_stride = input_ops[0]->dtensor.dim[1];
+  constexpr int GROUP_SIZE = 128;
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e("kernel::per_token_group_quantize_fp8_task_impl<$, $, $, $,",
+         batch_size, hidden_size, GROUP_SIZE, input_stride);
+  code.e("    cute::bfloat16_t, __nv_fp8_e4m3, true>(");
+  code.e("    task_desc->input_ptrs[0],");   // input bf16
+  code.e("    task_desc->output_ptrs[0],");  // output fp8
+  code.e("    task_desc->output_ptrs[1],");  // output scale
+  code.e("    1e-10f, -448.0f, 448.0f);");   // eps, min_8bit, max_8bit for e4m3
+  return register_task_variant(TASK_QUANTIZE_FP8_SM100, code.to_string());
+}
+
+int TaskRegister::register_mla_kv_gather_sm100_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  // params[0]: d_k (576)
+  // params[1]: d_v (512)
+  // params[2]: page_size (128)
+  assert(params.size() == 3);
+
+  int d_k = params[0];
+  int d_v = params[1];
+  int page_size = params[2];
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e("kernel::mla_kv_cache_gather_sm100_task_impl<$, $, $>(",
+         d_k, d_v, page_size);
+  code.e("    task_desc->input_ptrs[0],");   // c_latent_new
+  code.e("    task_desc->input_ptrs[1],");   // k_pe_new
+  code.e("    task_desc->input_ptrs[2],");   // paged_cache
+  code.e("    task_desc->input_ptrs[3],");   // contiguous_kv
+  code.e("    runtime_config.qo_indptr_buffer,");
+  code.e("    runtime_config.paged_kv_indptr_buffer,");
+  code.e("    runtime_config.paged_kv_indices_buffer,");
+  code.e("    runtime_config.paged_kv_last_page_len_buffer,");
+  code.e("    task_desc->task_metadata.request_id);");
+  return register_task_variant(TASK_MLA_KV_GATHER_SM100, code.to_string());
+}
+
+
+int TaskRegister::register_moe_topk_sigmoid_sm100_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  // params[0] is unused; tensor shapes inferred from bgraph
+  // Input: logits [batch, num_experts]
+  // Extra input: bias [num_experts] (e_score_correction_bias)
+  // Outputs: topk_weights [batch, k], routing_indices [experts, batch], mask [experts+1]
+  int batch_size = 0, num_experts = 0, num_experts_per_tok = 0, input_stride,
+      output_stride;
+  std::vector<tb::TBInputOp *> input_ops;
+  std::vector<tb::TBInputOp *> output_ops;
+  int num_inputs = 2;  // logits + bias
+  int num_outputs = 3; // weights + routing_indices + mask
+  assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops.size() < (size_t)num_inputs) {
+      input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+  assert(output_ops[0]->output_tensors[0].num_dims == 2);
+  assert(output_ops[1]->output_tensors[0].num_dims == 2);
+  assert(output_ops[2]->output_tensors[0].num_dims == 1);
+  num_experts = output_ops[1]->output_tensors[0].dim[0];
+  batch_size = output_ops[1]->output_tensors[0].dim[1];
+  num_experts_per_tok = output_ops[0]->output_tensors[0].dim[1];
+  assert(output_ops[0]->output_tensors[0].dim[0] == batch_size);
+  assert(output_ops[2]->output_tensors[0].dim[0] == num_experts + 1);
+  assert(input_ops[0]->dtensor.num_dims == 2);
+  assert(input_ops[0]->output_tensors[0].dim[0] == batch_size);
+  assert(input_ops[0]->output_tensors[0].dim[1] == num_experts);
+  // bias: [num_experts]
+  assert(input_ops[1]->dtensor.num_dims == 1);
+  assert(input_ops[1]->output_tensors[0].dim[0] == num_experts);
+  // get input stride
+  assert(input_ops[0]->dtensor.owner_op->op_type == type::KN_INPUT_OP);
+  kn::KNInputOp *kn_input_op =
+      static_cast<kn::KNInputOp *>(input_ops[0]->dtensor.owner_op);
+  input_stride = input_ops[0]->dtensor.dim[1];
+  assert(input_stride == static_cast<int>(kn_input_op->input_strides[0]));
+  assert(output_ops[0]->dtensor.owner_op->op_type == type::KN_INPUT_OP);
+  kn_input_op = static_cast<kn::KNInputOp *>(output_ops[0]->dtensor.owner_op);
+  output_stride = static_cast<int>(kn_input_op->input_strides[0]);
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e("kernel::topk_sigmoid_task_impl<cute::bfloat16_t, $, $, $, $>(",
+         /*VPT=*/8,
+         /*EXPERTS=*/num_experts,
+         /*WARPS_PER_TB=*/8,
+         /*BYTES_PER_LDG=*/16);
+  code.e("    task_desc->input_ptrs[0],");   // logits
+  code.e("    nullptr,");                     // finished
+  code.e("    task_desc->output_ptrs[0],");  // topk weights
+  code.e("    task_desc->input_ptrs[1],");   // bias (e_score_correction_bias)
+  code.e("    $,", batch_size);
+  code.e("    $,", num_experts_per_tok);
+  code.e("    task_desc->output_ptrs[1],");  // routing_indices
+  code.e("    task_desc->output_ptrs[2],");  // active_expert_ids
+  code.e("    0,");                           // start_expert
+  code.e("    $,", num_experts);              // end_expert
+  code.e("    true);");                       // renormalize
+  return register_task_variant(TASK_MOE_TOPK_SIGMOID_SM100, code.to_string());
+}
+
+
+
+int TaskRegister::register_sampling_sm100_task(threadblock::Graph const &bgraph,
+                                               std::vector<int> const &params) {
+  // params[0]: seed
+  assert(params.size() == 1);
+  std::vector<tb::TBInputOp *> input_ops;
+  std::vector<tb::TBInputOp *> output_ops;
+  int num_inputs = 1;
+  int num_outputs = 1;
+
+  assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops.size() < (size_t)num_inputs) {
+      input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+  assert(input_ops[0]->output_tensors[0].num_dims == 2);
+  int batch_size = input_ops[0]->output_tensors[0].dim[0];
+  int vocab_size = input_ops[0]->output_tensors[0].dim[1];
+  int seed = params[0];
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e("kernel::sampling_from_logits_kernel<256, 4, bfloat16, int>(");
+  code.e("    static_cast<bfloat16*>(task_desc->input_ptrs[0]),");
+  code.e("    static_cast<int*>(task_desc->output_ptrs[0]),");
+  code.e("    $,", vocab_size);
+  code.e("    $,", seed);
+  code.e("    0,  // philox_offset");
+  code.e("    $);", batch_size);
+  return register_task_variant(TASK_SAMPLING_SM100, code.to_string());
+}
+
+int TaskRegister::register_moe_fp8_sm100_task(
+    threadblock::Graph const &bgraph,
+    std::vector<int> const &params,
+    bool w13_linear) {
+  assert(params.size() == 0);
+  // Input ordering (6 inputs, 1 output):
+  //   [0] input_fp8       [batch, K] or [batch, top_k, K]
+  //   [1] input_scale     [batch, K/128] or [batch, top_k, K/128]
+  //   [2] weight_fp8      [num_experts, N, K]
+  //   [3] weight_scale    [num_experts, N, K/128]
+  //   [4] routing_indices [num_experts, batch]
+  //   [5] expert_mask     [num_experts+1]
+  //   output              [batch, top_k, N]
+  int num_inputs = 6;
+  int num_outputs = 1;
+  int num_experts = 0, num_experts_per_tok = 0, batch_size = 0;
+  int output_size = 0, orig_output_size = 0, reduction_size = 0, output_stride = 0;
+
+  std::vector<tb::TBInputOp *> input_ops;
+  std::vector<tb::TBInputOp *> output_ops;
+
+  assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops.size() < (size_t)num_inputs) {
+      input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+
+  // Output shape: [batch, top_k, N]
+  assert(output_ops[0]->output_tensors[0].num_dims == 3);
+  batch_size = output_ops[0]->output_tensors[0].dim[0];
+  num_experts_per_tok = output_ops[0]->output_tensors[0].dim[1];
+  output_size = output_ops[0]->output_tensors[0].dim[2];
+
+  // Reduction size from input_fp8
+  if (w13_linear) {
+    assert(input_ops[0]->output_tensors[0].num_dims == 2);
+    reduction_size = input_ops[0]->output_tensors[0].dim[1];
+  } else {
+    assert(input_ops[0]->output_tensors[0].num_dims == 3);
+    reduction_size = input_ops[0]->output_tensors[0].dim[2];
+    assert(input_ops[0]->output_tensors[0].dim[1] == num_experts_per_tok);
+  }
+
+  // Weight: [num_experts, N, K]
+  assert(input_ops[2]->output_tensors[0].num_dims == 3);
+  num_experts = input_ops[2]->output_tensors[0].dim[0];
+  assert(input_ops[2]->output_tensors[0].dim[1] == output_size);
+  assert(input_ops[2]->output_tensors[0].dim[2] == reduction_size);
+
+  // Routing indices: [num_experts, batch]
+  assert(input_ops[4]->output_tensors[0].num_dims == 2);
+  assert(input_ops[4]->output_tensors[0].dim[0] == num_experts);
+  assert(input_ops[4]->output_tensors[0].dim[1] == batch_size);
+
+  // Mask: [num_experts+1]
+  assert(input_ops[5]->output_tensors[0].num_dims == 1);
+  assert(input_ops[5]->output_tensors[0].dim[0] == num_experts + 1);
+
+  // Output stride
+  assert(output_ops[0]->dtensor.owner_op->op_type == type::KN_INPUT_OP);
+  kn::KNInputOp *kn_input_op =
+      static_cast<kn::KNInputOp *>(output_ops[0]->dtensor.owner_op);
+  output_stride = static_cast<int>(kn_input_op->input_strides[1]);
+  orig_output_size = input_ops[2]->dtensor.dim[1];
+
+  int k_scale = reduction_size / 128; // K/128 scale groups
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+
+  // MMA constants (same as BF16 MoE task)
+  constexpr int MMA_M = 128;
+  constexpr int MMA_N = 16;
+  constexpr int bK    = 128; // FP8: bK=128 for one scale-block per k-tile
+  constexpr int num_ab_stages  = 4;
+  constexpr int num_acc_stages = 2;
+  constexpr int num_c_stages   = 4;
+  constexpr int num_tmem_columns = MMA_N * num_acc_stages; // 32
+  assert(num_tmem_columns <= 512);
+
+  // Expert stride (same heuristic as BF16 variant)
+  int expert_stride = w13_linear ? 10 : 8;
+
+  // TMA for FP8 weight (param_id=2, dtype=uint8_t→UINT8 format, bK=128 tile)
+  constexpr int B = 3;
+  constexpr int M = 3;
+  constexpr int S = 3;
+  code.e("using TMA_Weight = kernel::tma::tma_2d<uint8_t, $, $, $, $, $, "
+         "$, $, $, $, $, $, $, true>;",
+         B,
+         M,
+         S,
+         (num_experts - 1) * orig_output_size + output_size, /*GMEM_ROW_*/
+         reduction_size,                                      /*GMEM_COL_*/
+         MMA_M,                                               /*SMEM_ROW_*/
+         bK,                                                  /*SMEM_COL_*/
+         reduction_size,                                      /*GMEM_STRIDE_ROW_*/
+         1,                                                   /*GMEM_STRIDE_COL_*/
+         1,                                                   /*SMEM_REPEAT_ROW_*/
+         1,                                                   /*SMEM_REPEAT_COL_*/
+         MMA_M * bK                                           /*SMEM_STRIDE_*/
+  );
+
+  code.inc_indent();
+  code.e("TMA_Weight tma_weight(static_cast<CUtensorMap*>("
+         "task_desc->input_tma_desc_ptrs[2][0]));");
+
+  // Input FP8 activation tensor
+  if (w13_linear) {
+    code.e("cute::Layout layout_input = cute::make_layout(cute::make_shape($, $), "
+           "cute::make_stride($, cute::Int<1>{}));",
+           batch_size, reduction_size, reduction_size);
+  } else {
+    code.e("cute::Layout layout_input = cute::make_layout(cute::make_shape($, $, $), "
+           "cute::make_stride($, cute::Int<1>{}, $));",
+           batch_size, reduction_size, num_experts_per_tok,
+           num_experts_per_tok * reduction_size, reduction_size);
+  }
+  code.e("cute::Tensor mInput = cute::make_tensor("
+         "cute::make_gmem_ptr(static_cast<uint8_t*>("
+         "task_desc->input_ptrs[0])), layout_input);");
+
+  // Input scale tensor [batch, K/128] or [batch, top_k, K/128]
+  if (w13_linear) {
+    code.e("cute::Layout layout_input_scale = cute::make_layout("
+           "cute::make_shape($, $), cute::make_stride($, cute::Int<1>{}));",
+           batch_size, k_scale, k_scale);
+  } else {
+    code.e("cute::Layout layout_input_scale = cute::make_layout("
+           "cute::make_shape($, $, $), "
+           "cute::make_stride($, cute::Int<1>{}, $));",
+           batch_size, k_scale, num_experts_per_tok,
+           num_experts_per_tok * k_scale, k_scale);
+  }
+  code.e("cute::Tensor mInputScale = cute::make_tensor("
+         "cute::make_gmem_ptr(static_cast<float*>("
+         "task_desc->input_ptrs[1])), layout_input_scale);");
+
+  // Weight scale tensor [num_experts * ORIG_OUTPUT_SIZE, K/128] (flat)
+  code.e("cute::Layout layout_weight_scale = cute::make_layout("
+         "cute::make_shape($, $), cute::make_stride($, cute::Int<1>{}));",
+         num_experts * orig_output_size, k_scale, k_scale);
+  code.e("cute::Tensor mWeightScale = cute::make_tensor("
+         "cute::make_gmem_ptr(static_cast<float*>("
+         "task_desc->input_ptrs[3])), layout_weight_scale);");
+
+  // Routing indices [num_experts, batch]
+  code.e("cute::Layout layout_routing_indices = cute::make_layout("
+         "cute::make_shape($, $), cute::make_stride($, cute::Int<1>{}));",
+         num_experts, batch_size, batch_size);
+  code.e("cute::Tensor mRoutingIndices = cute::make_tensor("
+         "cute::make_gmem_ptr(static_cast<cute::int32_t*>("
+         "task_desc->input_ptrs[4])), layout_routing_indices);");
+
+  // Expert mask [num_experts+1]
+  code.e("cute::Layout layout_expert_mask = cute::make_layout("
+         "cute::make_shape($), cute::make_stride(cute::Int<1>{}));",
+         num_experts + 1);
+  code.e("cute::Tensor mMask = cute::make_tensor("
+         "cute::make_gmem_ptr(static_cast<cute::int32_t*>("
+         "task_desc->input_ptrs[5])), layout_expert_mask);");
+
+  // Output tensor [batch, top_k, N] in BF16
+  code.e("cute::Layout layout_output = cute::make_layout("
+         "cute::make_shape($, $, $), "
+         "cute::make_stride($, cute::Int<1>{}, $));",
+         batch_size, output_size, num_experts_per_tok,
+         num_experts_per_tok * output_stride, output_stride);
+  code.e("cute::Tensor mOutput = cute::make_tensor("
+         "cute::make_gmem_ptr(static_cast<cute::bfloat16_t*>("
+         "task_desc->output_ptrs[0])), layout_output);");
+
+  // Kernel call
+  code.e("kernel::fp8_moe_group_gemm_sm100_task_impl<TMA_Weight, "
+         "decltype(mInput), decltype(mInputScale), decltype(mWeightScale), "
+         "decltype(mRoutingIndices), decltype(mMask), decltype(mOutput), "
+         "$, $, $, $, $, $, $, $, $, $, $, $, $>(",
+         MMA_M,
+         MMA_N,
+         batch_size,
+         output_size,
+         orig_output_size,
+         reduction_size,
+         num_experts,
+         num_experts_per_tok,
+         expert_stride,
+         w13_linear ? "true" : "false",
+         num_ab_stages,
+         num_acc_stages,
+         num_c_stages);
+  code.e("    tma_weight,");
+  code.e("    mInput,");
+  code.e("    mInputScale,");
+  code.e("    mWeightScale,");
+  code.e("    mRoutingIndices,");
+  code.e("    mMask,");
+  code.e("    mOutput,");
+  code.e("    task_desc->task_metadata.expert_offset);");
+
+  if (w13_linear) {
+    return register_task_variant(TASK_MOE_W13_FP8_SM100, code.to_string());
+  } else {
+    return register_task_variant(TASK_MOE_W2_FP8_SM100, code.to_string());
+  }
+}
+
+int TaskRegister::register_paged_attention_split_kv_sm100_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  // params[0]: num_q_heads
+  // params[1]: num_kv_heads
+  // params[2]: qk_norm
+  // params[3]: rotary_emd
+  // params[4]: max_seq_len
+  // params[5]: page_size
+  // params[6]: num_kv_chunks
+  assert(params.size() == 7);
+  std::vector<tb::TBInputOp *> input_ops;
+  std::vector<tb::TBInputOp *> output_ops;
+  int num_inputs = 7;
+  int num_outputs = 2;
+
+  assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops.size() < (size_t)num_inputs) {
+      input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+  assert(output_ops[0]->output_tensors[0].num_dims == 3); // lse
+  assert(output_ops[1]->output_tensors[0].num_dims == 3); // output_tmp
+
+  int qkv_stride = input_ops[0]->dtensor.dim[1];
+  int num_q_heads = params[0];
+  int num_kv_heads = params[1];
+  int head_dim = input_ops[1]->output_tensors[0].dim[3];
+  int output_size = head_dim * num_q_heads;
+  int kv_stride = head_dim * num_kv_heads;
+  int max_seq_len = params[4];
+  int page_size = params[5];
+  int num_kv_chunks = params[6];
+  // Assert that k_cache has the same head_dim
+  assert(input_ops[1]->output_tensors[0].num_dims == 4);
+  assert(head_dim == input_ops[1]->output_tensors[0].dim[3]);
+  assert(input_ops[2]->output_tensors[0].num_dims == 4);
+  assert(head_dim == input_ops[2]->output_tensors[0].dim[3]);
+  int max_tokens = input_ops[0]->dtensor.dim[0];
+  constexpr int SEQ_LEN_PER_BLOCK = 256;
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e("kernel::multitoken_paged_attention_split_kv_task_impl<bfloat16, $, "
+         "$, $, $, $, $, "
+         "$, $, $, $, $, $, $>(",
+         num_q_heads / num_kv_heads,
+         1,
+         num_kv_heads,
+         kv_stride,
+         qkv_stride,
+         output_size * num_kv_chunks, // o_stride should consider num_kv_chunks
+         head_dim,
+         SEQ_LEN_PER_BLOCK,
+         max_seq_len,
+         page_size,
+         max_tokens,
+         "true", // PARTITION_KV
+         num_kv_chunks);
+  code.e("    task_desc->input_ptrs[0],");
+  code.e("    task_desc->input_ptrs[1],");
+  code.e("    task_desc->input_ptrs[2],");
+  code.e("    task_desc->output_ptrs[1],");
+  code.e("    runtime_config.qo_indptr_buffer,");
+  code.e("    runtime_config.paged_kv_indptr_buffer,");
+  code.e("    runtime_config.paged_kv_indices_buffer,");
+  code.e("    runtime_config.paged_kv_last_page_len_buffer,");
+  code.e("    task_desc->task_metadata.request_id,");
+  code.e("    $,", params[2] > 0);
+  code.e("    $,", params[3] > 0);
+  code.e("    task_desc->input_ptrs[3],");
+  code.e("    task_desc->input_ptrs[4],");
+  code.e("    task_desc->input_ptrs[5],");
+  code.e("    task_desc->input_ptrs[6],");
+  code.e("    1e-6f,");
+  code.e("    1e-6f,");
+  code.e("    task_desc->output_ptrs[0],");
+  code.e("    task_desc->task_metadata.kv_idx);");
+  return register_task_variant(TASK_PAGED_ATTENTION_SPLIT_KV_SM100,
+                               code.to_string());
+}
+
+int TaskRegister::register_paged_attention_split_kv_merge_sm100_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  // params[0]: num_qo_heads_per_kv
+  // params[1]: head_dim
+  // params[2]: max_seq_len
+  // params[3]: page_size
+  // params[4]: num_kv_heads
+  assert(params.size() == 5);
+  std::vector<tb::TBInputOp *> input_ops;
+  std::vector<tb::TBInputOp *> output_ops;
+  int num_inputs = 2;
+  int num_outputs = 1;
+
+  assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops.size() < (size_t)num_inputs) {
+      input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+  assert(output_ops[0]->output_tensors[0].num_dims == 2);
+  int qkv_stride = input_ops[0]->dtensor.dim[1];
+  int output_size = output_ops[0]->dtensor.dim[1];
+  int num_q_heads_per_kv = params[0];
+  int head_dim = params[1];
+  int max_seq_len = params[2];
+  int page_size = params[3];
+  int num_kv_heads = params[4];
+
+  int max_tokens = input_ops[0]->dtensor.dim[0];
+  constexpr int SEQ_LEN_PER_BLOCK = 256;
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+
+  code.e("kernel::merge_splitkv<bfloat16, $, $, $, $, $, $, "
+         "$, $, $>(",
+         num_q_heads_per_kv,
+         1,
+         num_kv_heads,
+         head_dim,
+         max_tokens,
+         true,
+         (max_seq_len / SEQ_LEN_PER_BLOCK),
+         SEQ_LEN_PER_BLOCK,
+         page_size);
+  code.e("    task_desc->input_ptrs[0],");
+  code.e("    task_desc->input_ptrs[1],");
+  code.e("    runtime_config.qo_indptr_buffer,");
+  code.e("    runtime_config.paged_kv_indptr_buffer,");
+  code.e("    runtime_config.paged_kv_last_page_len_buffer,");
+  code.e("    task_desc->task_metadata.request_id,");
+  code.e("    task_desc->output_ptrs[0],");
+  code.e("    task_desc->task_metadata.merge_task_offset);");
+  return register_task_variant(TASK_PAGED_ATTENTION_SPLIT_KV_MERGE_SM100,
+                               code.to_string());
+}
+
+int TaskRegister::register_mla_decode_sm100_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  // params[0]: num_heads (e.g. 128)
+  // params[1]: d_k (e.g. 576)
+  // params[2]: d_v (e.g. 512)
+  // params[3]: num_splits
+  // params[4]: kv_len
+  assert(params.size() == 5);
+  int num_heads = params[0];
+  int d_k = params[1];
+  int d_v = params[2];
+  int num_splits = params[3];
+  int kv_len = params[4];
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e("kernel::mla_decode_dispatch<$, $, $>(", num_heads, d_k, d_v);
+  code.e("    static_cast<const "
+         "CUtensorMap*>(task_desc->input_tma_desc_ptrs[0][0]),");
+  code.e("    static_cast<const "
+         "CUtensorMap*>(task_desc->input_tma_desc_ptrs[1][0]),");
+  code.e("    static_cast<float*>(task_desc->output_ptrs[0]),");
+  code.e("    static_cast<float*>(task_desc->output_ptrs[1]),");
+  code.e("    $f,", 1.0f / sqrtf((float)d_k));
+  code.e("    $,", kv_len);
+  code.e("    $,", num_splits);                       // sk (total splits)
+  code.e("    task_desc->task_metadata.kv_idx,");     // si (split_idx)
+  code.e("    task_desc->task_metadata.request_id);"); // bi (batch_idx)
+  return register_task_variant(TASK_MLA_DECODE_SM100, code.to_string());
+}
+
+int TaskRegister::register_mla_reduce_sm100_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  // params[0]: num_heads (e.g. 128)
+  // params[1]: d_v (e.g. 512)
+  // params[2]: num_splits
+  // params[3]: d_start (start dim index for this task)
+  // params[4]: d_count (num dims this task handles)
+  assert(params.size() == 5);
+  int num_heads = params[0];
+  int d_v = params[1];
+  int num_splits = params[2];
+  int d_start = params[3];
+  int d_count = params[4];
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e("kernel::mla_reduce_sm100_task_impl<$, $>(", num_heads, d_v);
+  code.e("    static_cast<const float*>(task_desc->input_ptrs[0]),");
+  code.e("    static_cast<const float*>(task_desc->input_ptrs[1]),");
+  code.e("    static_cast<nv_bfloat16*>(task_desc->output_ptrs[0]),");
+  code.e("    $,", num_splits);
+  code.e("    task_desc->task_metadata.request_id,"); // batch_idx
+  code.e("    $,", d_start);
+  code.e("    $);", d_count);
+  return register_task_variant(TASK_MLA_REDUCE_SM100, code.to_string());
+}
+
+int TaskRegister::register_mla_prefill_sm100_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  // params[0]: num_heads (e.g. 128)
+  // params[1]: seq_len
+  // params[2]: d_ckv (e.g. 512)
+  // params[3]: d_kpe (e.g. 64)
+  // params[4]: d_v (e.g. 512)
+  assert(params.size() == 5);
+  int num_heads = params[0];
+  int seq_len = params[1];
+  int d_ckv = params[2];
+  int d_kpe = params[3];
+  int d_v = params[4];
+  float sm_scale = 1.0f / sqrtf((float)(d_ckv + d_kpe));
+  float sm_scale_log2 = sm_scale * 1.44269504089f;
+
+  // MLA prefill: grid = (H, num_q_blocks, B)
+  // task_metadata.request_id = head (bid.x)
+  // task_metadata.kv_idx = q_block (bid.y)
+  //
+  // Inputs: Q_nope [S,H,D_CKV], Q_pe [S,H,D_KPE], CKV [S,D_CKV], KPE [S,D_KPE]
+  // Output: O [S,H,D_V]
+  // All tensors are passed as raw pointers — no TMA.
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e("kernel::mla_prefill_sm100_task_impl(");
+  code.e(
+      "    static_cast<const nv_bfloat16*>(task_desc->input_ptrs[0]),"); // Q_nope
+  code.e(
+      "    static_cast<const nv_bfloat16*>(task_desc->input_ptrs[1]),"); // Q_pe
+  code.e(
+      "    static_cast<const nv_bfloat16*>(task_desc->input_ptrs[2]),"); // CKV
+  code.e(
+      "    static_cast<const nv_bfloat16*>(task_desc->input_ptrs[3]),"); // KPE
+  code.e("    static_cast<nv_bfloat16*>(task_desc->output_ptrs[0]),");   // O
+  code.e("    $,", seq_len);                                             // S
+  code.e("    $,", num_heads);                                           // H
+  code.e("    $f,", sm_scale_log2);                   // sm_scale_log2
+  code.e("    task_desc->task_metadata.request_id,"); // head
+  code.e("    task_desc->task_metadata.kv_idx);");    // q_block
+  return register_task_variant(TASK_MLA_PREFILL_SM100, code.to_string());
+}
+
 } // namespace runtime
 } // namespace mirage

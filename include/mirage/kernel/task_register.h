@@ -108,6 +108,42 @@ public:
                                  std::vector<int> const &params);
   int register_moe_mul_sum_add_sm100_task(threadblock::Graph const &bgraph,
                                           std::vector<int> const &params);
+  int register_moe_fp8_sm100_task(threadblock::Graph const &bgraph,
+                                  std::vector<int> const &params,
+                                  bool w13_linear);
+  int register_moe_topk_sigmoid_sm100_task(threadblock::Graph const &bgraph,
+                                            std::vector<int> const &params);
+  int register_quantize_fp8_sm100_task(threadblock::Graph const &bgraph,
+                                       std::vector<int> const &params);
+  int register_linear_fp8_sm100_task(threadblock::Graph const &bgraph,
+                                     std::vector<int> const &params,
+                                     bool with_residual);
+  int register_paged_attention_split_kv_sm100_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
+  int register_paged_attention_split_kv_merge_sm100_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
+  int register_sampling_sm100_task(threadblock::Graph const &bgraph,
+                                   std::vector<int> const &params);
+  int register_mla_kv_gather_sm100_task(threadblock::Graph const &bgraph,
+                                       std::vector<int> const &params);
+  int register_mla_decode_sm100_task(threadblock::Graph const &bgraph,
+                                     std::vector<int> const &params);
+  int register_mla_reduce_sm100_task(threadblock::Graph const &bgraph,
+                                     std::vector<int> const &params);
+  int register_mla_prefill_sm100_task(threadblock::Graph const &bgraph,
+                                      std::vector<int> const &params);
+  int register_mtp_verify_strict_task(threadblock::Graph const &bgraph,
+                                      std::vector<int> const &params);
+  int register_mtp_verify_probabilistic_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
+  int register_mtp_verify_synthetic_task(threadblock::Graph const &bgraph,
+                                         std::vector<int> const &params);
+  int register_mtp_accept_commit_task(threadblock::Graph const &bgraph,
+                                      std::vector<int> const &params);
+  int register_mtp_token_scatter_task(threadblock::Graph const &bgraph,
+                                      std::vector<int> const &params);
+  int register_mtp_prepare_verify_task(threadblock::Graph const &bgraph,
+                                       std::vector<int> const &params);
   // SM100 tasks end
   int register_task_variant(TaskType type, std::string const &code);
 
