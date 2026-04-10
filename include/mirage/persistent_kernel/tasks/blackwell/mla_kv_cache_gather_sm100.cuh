@@ -62,6 +62,15 @@ __device__ __forceinline__ void mla_kv_cache_gather_sm100_task_impl(
   int const last_page_len = paged_kv_last_page_len_buffer_ptr[request_id];
   int const seq_len = (num_pages - 1) * PAGE_SIZE + last_page_len;
 
+  if (tid == 0) {
+    printf("[KV_GATHER] req=%d tok=[%d,%d) pages=[%d,%d) last_pg_len=%d seq_len=%d\n",
+           request_id, first_token_pos, last_token_pos,
+           first_page_pos, last_page_pos, last_page_len, seq_len);
+  }
+
+  // Bounds check: skip if page table looks uninitialized
+  bool valid = (num_pages > 0 && num_pages <= 512 && num_new_tokens > 0 && seq_len > 0);
+
   T *paged_cache = reinterpret_cast<T *>(paged_cache_ptr);
   T *contiguous_kv = reinterpret_cast<T *>(contiguous_kv_ptr);
   T const *c_latent_new = reinterpret_cast<T const *>(c_latent_new_ptr);
@@ -69,10 +78,13 @@ __device__ __forceinline__ void mla_kv_cache_gather_sm100_task_impl(
 
   // Load page indices into shared memory
   __shared__ int page_indices[512]; // max pages per request
-  for (int i = tid; i < num_pages; i += NUM_THREADS) {
-    page_indices[i] = paged_kv_indices_buffer_ptr[first_page_pos + i];
+  if (valid) {
+    for (int i = tid; i < num_pages; i += NUM_THREADS) {
+      page_indices[i] = paged_kv_indices_buffer_ptr[first_page_pos + i];
+    }
   }
   __syncthreads();
+  if (!valid) return;
 
   // Step 1: Append new tokens to paged cache
   // Write c_latent (D_V=512 dims) + k_pe (ROPE_DIM=64 dims) into the correct

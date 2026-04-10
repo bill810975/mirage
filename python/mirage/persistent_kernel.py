@@ -1370,9 +1370,18 @@ class PersistentKernel:
             num_remote_schedulers=self.num_remote_schedulers,
             use_cutlass_kernel=self.use_cutlass_kernel,
         )
-        print("Compiling megakernel using the following command line:")
-        print(cc_cmd)
-        subprocess.check_call(cc_cmd)
+        precompiled_so = os.environ.get("MPK_PRECOMPILED_SO")
+        if precompiled_so and os.path.exists(precompiled_so):
+            shutil.copy(precompiled_so, so_path)
+            # Also copy task_graph.json to the directory where __FILE__ points
+            # (the .so reads json from __FILE__'s parent directory)
+            precompiled_dir = os.path.dirname(precompiled_so)
+            shutil.copy(json_file_path, os.path.join(precompiled_dir, "task_graph.json"))
+            print(f"Using precompiled .so: {precompiled_so}")
+        else:
+            print("Compiling megakernel using the following command line:")
+            print(cc_cmd)
+            subprocess.check_call(cc_cmd)
 
         import importlib.util
 

@@ -28,8 +28,10 @@ constexpr int WORKER_RESERVED_STATIC_SHARED_MEMORY_SIZE = 3 * 1024;
 #endif
 
 #if MPK_TARGET_CC >= 90
+// B200: 228KB total smem. PR 651 MLA reduce adds ~16KB static smem
+// (la_smem[MAX_SK*128]). Reduce dynamic budget to stay under total limit.
 constexpr int MAX_DYNAMIC_SHARED_MEMORY_SIZE =
-    227 * 1024 - WORKER_RESERVED_STATIC_SHARED_MEMORY_SIZE;
+    207 * 1024 - WORKER_RESERVED_STATIC_SHARED_MEMORY_SIZE;
 #elif MPK_TARGET_CC >= 86
 constexpr int MAX_DYNAMIC_SHARED_MEMORY_SIZE =
     99 * 1024 - WORKER_RESERVED_STATIC_SHARED_MEMORY_SIZE;

@@ -2896,6 +2896,8 @@ int TaskRegister::register_linear_fp8_sm100_task(
          "$)), layout_Bias);",
          (with_residual && rank_with_residual)
              ? "task_desc->input_ptrs[4]" : "nullptr");
+  code.e("if (threadIdx.x == 0) printf(\"[FP8] linear bs=$, out=$, red=$, tma_a=%p, tma_b=%p, tma_out=%p\\n\", tma_a.desc_ptr, tma_b.desc_ptr, tma_out.desc_ptr);",
+         batch_size, output_size, reduction_size);
   code.e("kernel::linear_fp8_1d2d_sm100_task_impl<cutlass::float_e4m3_t, "
          "TMA_A, TMA_B, decltype(mBias), TMA_OUT, "
          "$, $, $, $, $, $, $, $, $, $>(",
@@ -2908,6 +2910,8 @@ int TaskRegister::register_linear_fp8_sm100_task(
   code.e("    static_cast<uint32_t const*>(task_desc->input_ptrs[3]),"); // weight_scale
   code.e("    static_cast<uint32_t const*>(task_desc->input_ptrs[1]),"); // input_scale
   code.e("    mBias, tma_out);");
+  code.e("if (threadIdx.x == 0) printf(\"[FP8] DONE bs=$, out=$, red=$\\n\");",
+         batch_size, output_size, reduction_size);
 
   if (with_residual) {
     return register_task_variant(TASK_LINEAR_FP8_WITH_RESIDUAL_SM100,
@@ -3454,28 +3458,40 @@ int TaskRegister::register_mla_decode_sm100_task(
   // params[1]: d_k (e.g. 576)
   // params[2]: d_v (e.g. 512)
   // params[3]: num_splits
-  // params[4]: kv_len
+  // params[4]: max_seq_length
   assert(params.size() == 5);
   int num_heads = params[0];
   int d_k = params[1];
   int d_v = params[2];
   int num_splits = params[3];
-  int kv_len = params[4];
+  int max_seq_len = params[4];
 
   mirage::transpiler::CodeKeeper code;
   code.inc_indent();
-  code.e("kernel::mla_decode_dispatch<$, $, $>(", num_heads, d_k, d_v);
-  code.e("    static_cast<const "
-         "CUtensorMap*>(task_desc->input_tma_desc_ptrs[0][0]),");
-  code.e("    static_cast<const "
-         "CUtensorMap*>(task_desc->input_tma_desc_ptrs[1][0]),");
-  code.e("    static_cast<float*>(task_desc->output_ptrs[0]),");
-  code.e("    static_cast<float*>(task_desc->output_ptrs[1]),");
-  code.e("    $f,", 1.0f / sqrtf((float)d_k));
-  code.e("    $,", kv_len);
-  code.e("    $,", num_splits);                       // sk (total splits)
-  code.e("    task_desc->head_group,");     // si (split_idx)
-  code.e("    task_desc->request_id);"); // bi (batch_idx)
+  // Compute kv_len from page table (same as KV gather kernel)
+  code.e("{");
+  code.e("  int bi_ = task_desc->request_id;");
+  code.e("  int fp_ = runtime_config.paged_kv_indptr_buffer[bi_];");
+  code.e("  int lp_ = runtime_config.paged_kv_indptr_buffer[bi_ + 1];");
+  code.e("  int kv_len_ = (lp_ - fp_ - 1) * MPK_PAGE_SIZE + "
+         "runtime_config.paged_kv_last_page_len_buffer[bi_];");
+  // PR 651 MLA MTP decode kernel
+  code.e("  kernel::mla_mtp_decode_sm100_task_impl<false>(");
+  code.e("      static_cast<const "
+         "CUtensorMap*>(task_desc->input_tma_desc_ptrs[0][0]),"); // Q
+  code.e("      static_cast<const "
+         "CUtensorMap*>(task_desc->input_tma_desc_ptrs[1][0]),"); // KV
+  code.e("      static_cast<nv_bfloat16*>(task_desc->output_ptrs[0]),"); // Oa (bf16)
+  code.e("      static_cast<float*>(task_desc->output_ptrs[1]),");       // La
+  code.e("      $f,", 1.0f / sqrtf((float)d_k));  // softmax scale
+  code.e("      kv_len_,");                  // kv_len from runtime
+  code.e("      $,", num_splits);            // sk
+  code.e("      1,");                        // num_head_groups (1 for single-GPU decode)
+  code.e("      1,");                        // Q_LEN (1 for decode)
+  code.e("      0,");                        // gi (head group 0)
+  code.e("      task_desc->head_group,");    // si (split_idx)
+  code.e("      bi_);");                     // bi (batch_idx)
+  code.e("}");
   return register_task_variant(TASK_MLA_DECODE_SM100, code.to_string());
 }
 
@@ -3495,14 +3511,17 @@ int TaskRegister::register_mla_reduce_sm100_task(
 
   mirage::transpiler::CodeKeeper code;
   code.inc_indent();
-  code.e("kernel::mla_reduce_sm100_task_impl<$, $>(", num_heads, d_v);
-  code.e("    static_cast<const float*>(task_desc->input_ptrs[0]),");
-  code.e("    static_cast<const float*>(task_desc->input_ptrs[1]),");
-  code.e("    static_cast<nv_bfloat16*>(task_desc->output_ptrs[0]),");
-  code.e("    $,", num_splits);
-  code.e("    task_desc->request_id,"); // batch_idx
-  code.e("    $,", d_start);
-  code.e("    $);", d_count);
+  // PR 651 MLA MTP reduce kernel (256 threads for MPK)
+  code.e("kernel::mla_mtp_reduce_sm100_task_impl<256>(");
+  code.e("    static_cast<const nv_bfloat16*>(task_desc->input_ptrs[0]),"); // Oa (bf16)
+  code.e("    static_cast<const float*>(task_desc->input_ptrs[1]),");       // La
+  code.e("    static_cast<nv_bfloat16*>(task_desc->output_ptrs[0]),");      // O
+  code.e("    $,", num_splits);            // sk
+  code.e("    1,");                        // num_head_groups
+  code.e("    1,");                        // Q_LEN (decode)
+  code.e("    $,", d_start);               // dv_base
+  code.e("    0,");                        // gi (head group 0)
+  code.e("    task_desc->request_id);");   // bi
   return register_task_variant(TASK_MLA_REDUCE_SM100, code.to_string());
 }
 

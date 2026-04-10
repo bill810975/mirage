@@ -18,12 +18,14 @@
 #include "linear_sm100_mpk.cuh"
 #include "mla_kv_cache_gather_sm100.cuh"
 #include "mla_dispatch_sm100.cuh"
-// TODO: Enable when MLA MTP codegen is wired up
-// #include "mla_mtp_decode_sm100.cuh"
+// sm100_ptx.cuh must be included BEFORE mla_mtp_decode_sm100.cuh at top level,
+// so kernel::sm100_ptx is defined in the correct namespace. The #pragma once
+// prevents re-inclusion when mla_mtp_decode_sm100.cuh includes it internally.
+#include "sm100_ptx.cuh"
+#include "mla_mtp_decode_sm100.cuh"
 #include "mla_prefill_sm100.cuh"
 #include "mla_reduce_sm100.cuh"
-// #include "mla_sm100_2sm.cuh"
-// #include "sm100_ptx.cuh"
+#include "mla_sm100_2sm.cuh"
 #include "moe_linear_sm100.cuh"
 #include "mul_sum_add_sm100.cuh"
 #include "per_token_group_quantize_fp8.cuh"

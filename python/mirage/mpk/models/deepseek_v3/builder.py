@@ -89,11 +89,9 @@ class DeepSeekV3Builder(GraphBuilder):
             layer_indices=layer_indices,
         )
 
-    _fp8_call_count = 0
     def _fp8_linear(self, input_bf16, weight, weight_scale, output,
                      grid_dim, block_dim, residual=None):
         """Quantize BF16 input → FP8, then run FP8 GEMM."""
-        # FP8 path (original, not debug BF16 bypass)
         if weight_scale is None:
             # BF16 path (post-dequant weights)
             if residual is not None:
@@ -106,7 +104,17 @@ class DeepSeekV3Builder(GraphBuilder):
                     grid_dim=grid_dim, block_dim=block_dim)
             return
 
-        # FP8 path
+        # FP8 path — clamp grid so per_block >= 128 (MMA_M alignment)
+        output_size = weight.dim(0)
+        grid_x = grid_dim[0]
+        max_grid = output_size // 128
+        if max_grid < 1:
+            raise ValueError(
+                f"FP8 linear: output_size={output_size} < 128 (MMA_M). "
+                f"Must use BF16 linear for this dimension.")
+        if grid_x > max_grid:
+            grid_dim = (max_grid, grid_dim[1], grid_dim[2])
+
         mbt = self.max_num_batched_tokens
         reduction_size = weight.dim(1) if weight.num_dims == 2 else weight.dim(-1)
         group_size = 128
@@ -215,8 +223,9 @@ class DeepSeekV3Builder(GraphBuilder):
             name="c_latent_out",
             io_category="cuda_tensor",
         )
+        # Pad to 128 for SM100 MMA_M alignment (real data is first 64 elements)
         self.k_pe_out = self.mpk.new_tensor(
-            dims=(mbt, QK_ROPE_HEAD_DIM),  # [batch, 64]
+            dims=(mbt, 128),  # [batch, 128] — padded from 64
             dtype=bfloat16,
             name="k_pe_out",
             io_category="cuda_tensor",
@@ -235,12 +244,12 @@ class DeepSeekV3Builder(GraphBuilder):
             name="contiguous_kv",
             io_category="cuda_tensor",
         )
-        # MLA decode partial outputs (float32, for split-KV reduce)
-        max_splits = 1  # DEBUG: single split to test MLA decode
+        # MLA decode partial outputs (PR 651: bf16 for partials)
+        max_splits = 1  # single split for decode
         mbr = self.mpk.max_num_batched_requests
         self.mla_partial_o = self.mpk.new_tensor(
             dims=(mbr * max_splits, self.v_head_dim * self.num_local_q_heads),
-            dtype=float32,
+            dtype=bfloat16,
             name="mla_partial_o",
             io_category="cuda_tensor",
         )
@@ -330,17 +339,59 @@ class DeepSeekV3Builder(GraphBuilder):
         """Attach tensor. FP8 is now natively supported in core.pyx."""
         return self.mpk.attach_input(torch_tensor=tensor, name=name)
 
+    @staticmethod
+    def _convert_scale_inv_to_ue8m0(scale_inv, output_size, reduction_size):
+        """Convert float32 per-block scale_inv to CUTLASS packed UE8M0 per-row uint32.
+
+        The SM100 FP8 GEMM kernel expects weight scales as per-row packed UE8M0:
+        - One uint32 per output row per K-tile (128 elements)
+        - Each uint32 packs 4 UE8M0 bytes (4 sub-scales for 32-element sub-tiles)
+        - Since block-level scale covers all sub-tiles equally, all 4 bytes are identical
+
+        Input: scale_inv [ceil(out/128), ceil(red/128)] float32
+        Output: [output_size, padded_scale_k] int32 (reinterpreted as uint32 by kernel)
+        """
+        group_size = 128
+        scale_k = reduction_size // group_size
+        padded_scale_k = ((scale_k + 3) // 4) * 4
+
+        # scale_inv → scale → UE8M0 exponent
+        scale = 1.0 / scale_inv.float().clamp(min=1e-30)
+        ue8m0_float = torch.ceil(torch.log2(scale.clamp(min=1e-30))) + 127.0
+        ue8m0 = ue8m0_float.clamp(0, 254).to(torch.int32)
+
+        # Expand from per-block to per-row: repeat each row 128 times
+        ue8m0_expanded = ue8m0.repeat_interleave(128, dim=0)[:output_size, :scale_k]
+
+        # Pack 4 identical UE8M0 bytes into one uint32
+        packed = (ue8m0_expanded
+                  | (ue8m0_expanded << 8)
+                  | (ue8m0_expanded << 16)
+                  | (ue8m0_expanded << 24))
+
+        # Pad K dimension to PADDED_SCALE_K
+        if padded_scale_k > scale_k:
+            padding = torch.zeros(output_size, padded_scale_k - scale_k,
+                                  dtype=torch.int32, device=packed.device)
+            packed = torch.cat([packed, padding], dim=1)
+
+        return packed.contiguous()
+
     @property
     def _weights_are_fp8(self):
         """Check if we're working with FP8 weights (vs BF16 post-dequant)."""
         return hasattr(self, '_is_fp8_mode') and self._is_fp8_mode
 
     def _attach_fp8_weight(self, state_dict, key, name):
-        """Attach FP8 weight + scale_inv, or BF16 weight if already dequantized."""
+        """Attach FP8 weight + scale_inv (converted to UE8M0), or BF16 weight."""
         w = self._safe_attach(state_dict[key], name)
         scale_key = f"{key}_scale_inv"
         if scale_key in state_dict:
-            s = self._safe_attach(state_dict[scale_key], f"{name}_scale")
+            weight = state_dict[key]
+            output_size, reduction_size = weight.shape[0], weight.shape[1]
+            scale_ue8m0 = self._convert_scale_inv_to_ue8m0(
+                state_dict[scale_key], output_size, reduction_size)
+            s = self._safe_attach(scale_ue8m0, f"{name}_scale")
         else:
             s = None  # weight is already BF16 (post-dequant)
         return w, s
@@ -350,6 +401,13 @@ class DeepSeekV3Builder(GraphBuilder):
         prefix = f"model.layers.{layer_idx}."
         attn = f"{prefix}self_attn."
 
+        # Step 1: q_a_proj (FP8)
+        w_q_a, s_q_a = self._attach_fp8_weight(
+            state_dict, f"{attn}q_a_proj.weight", f"layer_{layer_idx}_q_a_proj")
+        self._fp8_linear(self.rmsnorm_out, w_q_a, s_q_a, self.q_a_out,
+                         grid_dim=(grid_for_rmsnorm_linear_layer(self.q_lora_rank), 1, 1),
+                         block_dim=(128, 1, 1))
+
         # Step 2: q_a_layernorm (BF16 norm weight)
         w_q_a_ln = self.mpk.attach_input(
             torch_tensor=state_dict[f"{attn}q_a_layernorm.weight"],
@@ -358,17 +416,15 @@ class DeepSeekV3Builder(GraphBuilder):
             input=self.q_a_out, weight=w_q_a_ln, output=self.q_a_out,
             grid_dim=(self.max_num_batched_tokens, 1, 1), block_dim=(128, 1, 1))
 
-        # Step 3: q_b_proj absorbed (FP8)
+        # Step 3: q_b_proj absorbed (BF16 — scale deleted after absorption)
         w_q_b, s_q_b = self._attach_fp8_weight(
             state_dict, f"{attn}q_b_proj.weight", f"layer_{layer_idx}_q_b_proj")
         self._fp8_linear(self.q_a_out, w_q_b, s_q_b, self.q_nope_pe,
                          grid_dim=(grid_for_rmsnorm_linear_layer(w_q_b.dim(0)), 1, 1),
                          block_dim=(128, 1, 1))
 
-        # Step 4: kv_a_proj — two FP8 GEMMs (split weight), both FP8
-        # Per mermaid: kv_a_proj [576, 7168] is FP8. We split into c_latent [512]
-        # and k_pe [64] parts because kv_a_layernorm only applies to c_latent.
-        # Both parts run as FP8 GEMM (quantize input → FP8 matmul).
+        # Step 4: kv_a_proj split — c_latent (FP8) + k_pe (BF16 padded)
+        # k_pe output=64 < MMA_M=128, so dequant to BF16 and pad weight to [128, H]
         kv_a_w = state_dict[f"{attn}kv_a_proj_with_mqa.weight"]
         kv_a_s_key = f"{attn}kv_a_proj_with_mqa.weight_scale_inv"
         has_kv_scale = kv_a_s_key in state_dict
@@ -382,24 +438,35 @@ class DeepSeekV3Builder(GraphBuilder):
             w_kv_latent = self._safe_attach(
                 kv_a_w[:self.kv_lora_rank].contiguous(),
                 f"layer_{layer_idx}_kv_a_latent")
-            s_kv_latent = self._safe_attach(
+            latent_scale_ue8m0 = self._convert_scale_inv_to_ue8m0(
                 kv_a_s[:scale_rows_latent].contiguous(),
+                self.kv_lora_rank, kv_a_w.shape[1])
+            s_kv_latent = self._safe_attach(
+                latent_scale_ue8m0,
                 f"layer_{layer_idx}_kv_a_latent_scale")
-            # k_pe part: [64, hidden] FP8
-            w_kv_rope = self._safe_attach(
-                kv_a_w[self.kv_lora_rank:].contiguous(),
-                f"layer_{layer_idx}_kv_a_rope")
-            s_kv_rope = self._safe_attach(
+            kv_rope_fp8 = kv_a_w[self.kv_lora_rank:].contiguous()
+            kv_rope_padded = torch.zeros(128, kv_rope_fp8.shape[1],
+                                         dtype=kv_rope_fp8.dtype, device=kv_rope_fp8.device)
+            kv_rope_padded[:QK_ROPE_HEAD_DIM] = kv_rope_fp8
+            w_kv_rope = self._safe_attach(kv_rope_padded,
+                                          f"layer_{layer_idx}_kv_a_rope")
+            rope_scale_ue8m0 = self._convert_scale_inv_to_ue8m0(
                 kv_a_s[scale_rows_latent:].contiguous(),
-                f"layer_{layer_idx}_kv_a_rope_scale")
+                128, kv_a_w.shape[1])
+            s_kv_rope = self._safe_attach(rope_scale_ue8m0,
+                                          f"layer_{layer_idx}_kv_a_rope_scale")
         else:
             w_kv_latent = self._safe_attach(
                 kv_a_w[:self.kv_lora_rank].contiguous(),
                 f"layer_{layer_idx}_kv_a_latent")
             s_kv_latent = None
-            w_kv_rope = self._safe_attach(
-                kv_a_w[self.kv_lora_rank:].contiguous(),
-                f"layer_{layer_idx}_kv_a_rope")
+            # Pad FP8 weight to [128, H]
+            kv_rope_raw = kv_a_w[self.kv_lora_rank:].contiguous()
+            kv_rope_padded = torch.zeros(128, kv_rope_raw.shape[1],
+                                         dtype=kv_rope_raw.dtype, device=kv_rope_raw.device)
+            kv_rope_padded[:QK_ROPE_HEAD_DIM] = kv_rope_raw
+            w_kv_rope = self._safe_attach(kv_rope_padded,
+                                          f"layer_{layer_idx}_kv_a_rope")
             s_kv_rope = None
 
         # FP8 GEMM for c_latent [N, 512]
@@ -407,11 +474,10 @@ class DeepSeekV3Builder(GraphBuilder):
                          self.c_latent_out,
                          grid_dim=(grid_for_rmsnorm_linear_layer(self.kv_lora_rank), 1, 1),
                          block_dim=(128, 1, 1))
-        # FP8 GEMM for k_pe [N, 64]
+        # FP8 GEMM for k_pe [N, 128] (padded from 64)
         self._fp8_linear(self.rmsnorm_out, w_kv_rope, s_kv_rope,
                          self.k_pe_out,
-                         grid_dim=(grid_for_rmsnorm_linear_layer(QK_ROPE_HEAD_DIM), 1, 1),
-                         block_dim=(128, 1, 1))
+                         grid_dim=(1, 1, 1), block_dim=(128, 1, 1))
 
         # Step 5: kv_a_layernorm on c_latent ONLY
         w_kv_a_ln = self.mpk.attach_input(
@@ -421,7 +487,20 @@ class DeepSeekV3Builder(GraphBuilder):
             input=self.c_latent_out, weight=w_kv_a_ln, output=self.c_latent_out,
             grid_dim=(self.max_num_batched_tokens, 1, 1), block_dim=(128, 1, 1))
 
-        # Step 6: MLA attention — disabled, zero attn_out (FP8 debug)
+        # Step 6: MLA attention (KV gather + decode + reduce)
+        layer_cache = self.mpk.attach_input(
+            torch_tensor=self.ckv_kpe_cache[layer_idx],
+            name=f"layer_{layer_idx}_kv_cache")
+        self.mpk.mla_kv_gather_layer(
+            c_latent_new=self.c_latent_out,
+            k_pe_new=self.k_pe_out,
+            paged_cache=layer_cache,
+            contiguous_kv=self.contiguous_kv,
+            mla_params=(self.qk_head_dim, self.v_head_dim, self.mpk.page_size),
+            grid_dim=(self.mpk.max_num_batched_requests, 1, 1),
+            block_dim=(128, 1, 1),
+        )
+        # ABLATION: skip MLA decode+reduce, zero attn_out
         self.mpk.tensor_init_layer(
             input=self.attn_out,
             dummy_input=self.rmsnorm_out,
@@ -837,23 +916,28 @@ class DeepSeekV3Builder(GraphBuilder):
 
         w_kv_latent = self._safe_attach(
             kv_a_w[:self.kv_lora_rank].contiguous(), f"mtp_{attn}kv_a_latent")
+        latent_scale_ue8m0 = self._convert_scale_inv_to_ue8m0(
+            kv_a_s[:scale_rows_latent].contiguous(),
+            self.kv_lora_rank, kv_a_w.shape[1])
         s_kv_latent = self._safe_attach(
-            kv_a_s[:scale_rows_latent].contiguous(), f"mtp_{attn}kv_a_latent_scale")
-        # kv_a_rope: dequant to BF16 (output=64, not 128-aligned for FP8)
+            latent_scale_ue8m0, f"mtp_{attn}kv_a_latent_scale")
+        # kv_a_rope: pad FP8 weight to [128, H] for MMA_M alignment
         kv_rope_w_fp8 = kv_a_w[self.kv_lora_rank:].contiguous()
-        kv_rope_s = kv_a_s[scale_rows_latent:].contiguous()
-        kv_rope_w_bf16 = (kv_rope_w_fp8.float() * kv_rope_s.float().repeat_interleave(
-            128, dim=-1)[:, :kv_rope_w_fp8.shape[-1]]).to(torch.bfloat16)
-        w_kv_rope = self.mpk.attach_input(
-            torch_tensor=kv_rope_w_bf16, name=f"mtp_{attn}kv_a_rope")
+        kv_rope_padded = torch.zeros(128, kv_rope_w_fp8.shape[1],
+                                     dtype=kv_rope_w_fp8.dtype, device=kv_rope_w_fp8.device)
+        kv_rope_padded[:QK_ROPE_HEAD_DIM] = kv_rope_w_fp8
+        w_kv_rope = self._safe_attach(kv_rope_padded, f"mtp_{attn}kv_a_rope")
+        rope_scale_ue8m0 = self._convert_scale_inv_to_ue8m0(
+            kv_a_s[scale_rows_latent:].contiguous(),
+            128, kv_a_w.shape[1])
+        s_kv_rope = self._safe_attach(rope_scale_ue8m0, f"mtp_{attn}kv_a_rope_scale")
 
         self._fp8_linear(self.rmsnorm_out, w_kv_latent, s_kv_latent, self.c_latent_out,
                          grid_dim=(grid_for_rmsnorm_linear_layer(self.kv_lora_rank), 1, 1),
                          block_dim=(128, 1, 1))
-        self.mpk.linear_layer(
-            input=self.rmsnorm_out, weight=w_kv_rope, output=self.k_pe_out,
-            grid_dim=(1, 1, 1),
-            block_dim=(128, 1, 1))
+        self._fp8_linear(self.rmsnorm_out, w_kv_rope, s_kv_rope, self.k_pe_out,
+                         grid_dim=(1, 1, 1),
+                         block_dim=(128, 1, 1))
 
         w_kv_a_ln = self.mpk.attach_input(
             torch_tensor=state_dict[f"{attn}kv_a_layernorm.weight"],
