@@ -450,13 +450,15 @@ void register_mugraph(
       }
       // assert that their is at least a single tensor shared between ops
       if (num_shared_tensors < 1) {
-        printf("ERROR: num_shared_tensors=%d for op with %zu inputs, prev had %zu outputs\n",
-               num_shared_tensors, input_ops.size(), pre_output_ops.size());
+        printf("ERROR: num_shared_tensors=%d, task_type=%d\n",
+               num_shared_tensors, task_type);
+        printf("  Current inputs (%zu):\n", input_ops.size());
         for (auto const &input : input_ops) {
-          printf("  input guid=%lu\n", (unsigned long)input->dtensor.guid);
+          printf("    guid=%lu dim0=%d\n", (unsigned long)input->dtensor.guid, input->dtensor.dim[0]);
         }
+        printf("  Prev outputs (%zu):\n", pre_output_ops.size());
         for (auto const &output : pre_output_ops) {
-          printf("  prev_output guid=%lu\n", (unsigned long)output->dtensor.guid);
+          printf("    guid=%lu dim0=%d\n", (unsigned long)output->dtensor.guid, output->dtensor.dim[0]);
         }
       }
       assert(num_shared_tensors >= 1);
