@@ -26,7 +26,7 @@ from libcpp.string cimport string
 class dtype:
     SINT_TYPES = ['int8', 'int16', 'int32', 'int64']
     UINT_TYPES = ['uint8', 'uint16', 'uint32', 'uint64']
-    FP_TYPES = ['fp16', 'bf16', 'fp32', 'fp64']
+    FP_TYPES = ['fp16', 'bf16', 'fp32', 'fp64', 'fp8_e4m3']
 
     def __init__(self, name):
         self.name = name
@@ -101,6 +101,7 @@ float16 = dtype('fp16')
 bfloat16 = dtype('bf16')
 float32 = dtype('fp32')
 float64 = dtype('fp64')
+float8_e4m3 = dtype('fp8_e4m3')
 
 def get_kn_operator_type_string(int op_type):
     if op_type == KN_UNKOWN:
@@ -365,6 +366,8 @@ def convert_torch_type_to_dtype(type):
         return int64
     elif type is torch.float64:
         return float64
+    elif type is torch.float8_e4m3fn:
+        return float8_e4m3
     else:
         raise RuntimeError(f"Unsupported dtype: {type}")
 
