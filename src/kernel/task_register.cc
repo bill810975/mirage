@@ -2956,7 +2956,9 @@ int TaskRegister::register_quantize_fp8_sm100_task(
     batch_size = input_ops[0]->output_tensors[0].dim[0];
     hidden_size = input_ops[0]->output_tensors[0].dim[1];
   }
-  int input_stride = input_ops[0]->dtensor.dim[1];
+  // GLOBAL_STRIDE = hidden_size (stride between rows in linearized layout)
+  int input_stride = (ndims == 3) ? input_ops[0]->dtensor.dim[2]
+                                  : input_ops[0]->dtensor.dim[1];
   constexpr int GROUP_SIZE = 128;
 
   mirage::transpiler::CodeKeeper code;
