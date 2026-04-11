@@ -338,11 +338,13 @@ class DeepSeekV3Builder(GraphBuilder):
 
     def _safe_attach(self, tensor, name):
         """Attach tensor. FP8 is now natively supported in core.pyx.
-        Also keeps a reference to prevent GC from freeing the underlying memory."""
+        Also keeps a reference to prevent GC from freeing the underlying memory.
+        Sanitizes name for C++ codegen (dots → underscores)."""
         if not hasattr(self, '_attached_tensors'):
             self._attached_tensors = []
         self._attached_tensors.append(tensor)
-        return self.mpk.attach_input(torch_tensor=tensor, name=name)
+        safe_name = name.replace('.', '_')
+        return self.mpk.attach_input(torch_tensor=tensor, name=safe_name)
 
     @staticmethod
     def _requantize_fp8_for_ue8m0(weight_fp8, scale_inv):
@@ -1514,8 +1516,8 @@ class DeepSeekV3Builder(GraphBuilder):
             name="mtp_verified_output", io_category="cuda_tensor",
         )
 
-        # Select verification method
-        method = self.mtp_config.rejection_sample_method
+        # Select verification method (default to strict for lookahead)
+        method = getattr(self.mtp_config, 'rejection_sample_method', 'strict')
         if method == "strict":
             self.mpk.mtp_verify_strict_layer(
                 draft_token_ids=all_draft_ids,
@@ -1543,7 +1545,7 @@ class DeepSeekV3Builder(GraphBuilder):
             )
             num_new = self.mpk.new_tensor(
                 dims=(mbt, 1), dtype=int64,
-                name="mtp_num_new_tokens", io_category="cuda_tensor",
+                name="mtp_accept_num_new", io_category="cuda_tensor",
             )
             self.mpk.mtp_accept_commit_layer(
                 accepted_count=accepted_count,

@@ -32,9 +32,6 @@
 #include "tensor_init.cuh"
 #include "topk_sigmoid_sm100.cuh"
 #include "topk_softmax_sm100.cuh"
-// TODO: Speculative decoding / MTP tasks (include paths need fixing for mpk-exp)
-// #include "tasks/speculative_decoding/target_verify.cuh"
-// #include "tasks/speculative_decoding/target_verify_mtp.cuh"
-// #include "tasks/speculative_decoding/prompt_lookup.cuh"
-// #include "tasks/speculative_decoding/mtp_token_ops.cuh"
-// #include "tasks/common/sampling.cuh"
+// Speculative decoding / MTP tasks
+#include "tasks/speculative_decoding/target_verify_mtp.cuh"
+#include "tasks/speculative_decoding/mtp_token_ops.cuh"

@@ -287,7 +287,9 @@ class PersistentKernel:
         t = self.kn_graph.new_input(dims=dims, strides=strides, dtype=dtype)
         # FIXME: currently assert that name is not None
         assert name is not None
-        self.kn_graph.attach_torch_tensor(t, torch_tensor, name)
+        # Sanitize name for C++ codegen (dots are illegal in identifiers)
+        safe_name = name.replace('.', '_')
+        self.kn_graph.attach_torch_tensor(t, torch_tensor, safe_name)
         return t
 
     def new_tensor(
@@ -305,8 +307,9 @@ class PersistentKernel:
         t = self.kn_graph.new_input(dims=dims, strides=strides, dtype=dtype)
         # FIXME: currently assert that name is not None
         assert name is not None
+        safe_name = name.replace('.', '_') if name else name
         if io_category == "cuda_tensor":
-            self.kn_graph.attach_cuda_tensor(t, name)
+            self.kn_graph.attach_cuda_tensor(t, safe_name)
         elif io_category == "nvshmem_tensor":
             self.kn_graph.attach_nvshmem_tensor(t, name)
         else:
@@ -1231,6 +1234,60 @@ class PersistentKernel:
             [input_fp8, input_scale, weight_fp8, weight_scale,
              moe_routing_indices, moe_mask, output], tb_graph)
         self.kn_graph.register_task(tb_graph, "moe_w2_fp8_sm100", params)
+
+    # === MTP (Multi-Token Prediction) Layers ===
+    def mtp_token_scatter_layer(self, src, dst, grid_dim, block_dim,
+                                batch_size, num_slots, slot_idx):
+        params = [batch_size, num_slots, slot_idx]
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(src, (-1, -1, -1), -1, True)
+        tb_graph.new_input(dst, (-1, -1, -1), -1, True)
+        self.kn_graph.customized([src, dst], tb_graph)
+        self.kn_graph.register_task(tb_graph, "mtp_token_scatter", params)
+
+    def mtp_prepare_verify_layer(self, main_token, draft_tokens, tokens_buffer,
+                                  step, num_new_tokens, grid_dim, block_dim,
+                                  num_draft_tokens, max_seq_len):
+        params = [num_draft_tokens, max_seq_len]
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(main_token, (-1, -1, -1), -1, True)
+        tb_graph.new_input(draft_tokens, (-1, -1, -1), -1, True)
+        tb_graph.new_input(tokens_buffer, (-1, -1, -1), -1, True)
+        tb_graph.new_input(step, (-1, -1, -1), -1, True)
+        tb_graph.new_input(num_new_tokens, (-1, -1, -1), -1, True)
+        self.kn_graph.customized(
+            [main_token, draft_tokens, tokens_buffer, step, num_new_tokens], tb_graph)
+        self.kn_graph.register_task(tb_graph, "mtp_prepare_verify", params)
+
+    def mtp_verify_strict_layer(self, draft_token_ids, target_token_ids,
+                                 accepted_count, output_tokens,
+                                 grid_dim, block_dim, num_draft_tokens):
+        params = [num_draft_tokens]
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(draft_token_ids, (-1, -1, -1), -1, True)
+        tb_graph.new_input(target_token_ids, (-1, -1, -1), -1, True)
+        tb_graph.new_input(accepted_count, (-1, -1, -1), -1, True)
+        tb_graph.new_input(output_tokens, (-1, -1, -1), -1, True)
+        self.kn_graph.customized(
+            [draft_token_ids, target_token_ids, accepted_count, output_tokens], tb_graph)
+        self.kn_graph.register_task(tb_graph, "mtp_verify_strict", params)
+
+    def mtp_accept_commit_layer(self, accepted_count, output_tokens,
+                                 current_position, new_position,
+                                 final_output, num_new_tokens,
+                                 grid_dim, block_dim, num_draft_tokens):
+        params = [num_draft_tokens]
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(accepted_count, (-1, -1, -1), -1, True)
+        tb_graph.new_input(output_tokens, (-1, -1, -1), -1, True)
+        tb_graph.new_input(current_position, (-1, -1, -1), -1, True)
+        tb_graph.new_input(new_position, (-1, -1, -1), -1, True)
+        tb_graph.new_input(final_output, (-1, -1, -1), -1, True)
+        tb_graph.new_input(num_new_tokens, (-1, -1, -1), -1, True)
+        self.kn_graph.customized(
+            [accepted_count, output_tokens, current_position,
+             new_position, final_output, num_new_tokens], tb_graph)
+        self.kn_graph.register_task(tb_graph, "mtp_accept_commit", params)
 
     def moe_topk_sigmoid_routing_layer(self, input, bias, output,
                                        grid_dim, block_dim):
