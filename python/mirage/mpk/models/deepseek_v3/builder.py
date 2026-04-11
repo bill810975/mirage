@@ -345,42 +345,61 @@ class DeepSeekV3Builder(GraphBuilder):
         return self.mpk.attach_input(torch_tensor=tensor, name=name)
 
     @staticmethod
-    def _convert_scale_inv_to_ue8m0(scale_inv, output_size, reduction_size):
-        """Convert float32 per-block scale_inv to CUTLASS packed UE8M0 per-row uint32.
+    def _requantize_fp8_for_ue8m0(weight_fp8, scale_inv):
+        """Re-quantize FP8 weight so that scales are exact powers of 2 (UE8M0).
 
-        The SM100 FP8 GEMM kernel expects weight scales as per-row packed UE8M0:
-        - One uint32 per output row per K-tile (128 elements)
-        - Each uint32 packs 4 UE8M0 bytes (4 sub-scales for 32-element sub-tiles)
-        - Since block-level scale covers all sub-tiles equally, all 4 bytes are identical
+        SM100 block-scaled UMMA uses UE8M0 (8-bit exponent-only) scale factors.
+        Checkpoint float32 scales are NOT powers of 2, so directly converting
+        them to UE8M0 introduces up to 2x error per block.
 
-        Input: scale_inv [ceil(out/128), ceil(red/128)] float32
-        Output: [output_size, padded_scale_k] int32 (reinterpreted as uint32 by kernel)
+        Fix (same as SGLang/vLLM): dequant → re-quantize with power-of-2 scales.
+
+        Input:
+            weight_fp8: [M, K] float8_e4m3fn — original checkpoint FP8 weight
+            scale_inv: [ceil(M/128), ceil(K/128)] float32 — original block scale_inv
+
+        Output:
+            new_fp8: [M, K] float8_e4m3fn — re-quantized weight
+            packed_ue8m0: [M, padded_scale_k] int32 — packed UE8M0 per-row scale
         """
+        M, K = weight_fp8.shape
         group_size = 128
-        scale_k = reduction_size // group_size
+        scale_k = K // group_size
         padded_scale_k = ((scale_k + 3) // 4) * 4
 
-        # scale_inv → scale → UE8M0 exponent
-        scale = 1.0 / scale_inv.float().clamp(min=1e-30)
-        ue8m0_float = torch.ceil(torch.log2(scale.clamp(min=1e-30))) + 127.0
-        ue8m0 = ue8m0_float.clamp(0, 254).to(torch.int32)
+        # Step 1: Dequant to float32
+        # Expand block scale_inv [ceil(M/128), ceil(K/128)] to per-element [M, K]
+        scale_inv_expanded = scale_inv.float().repeat_interleave(
+            group_size, dim=0)[:M].repeat_interleave(
+            group_size, dim=1)[:, :K]
+        w_float = weight_fp8.float() * scale_inv_expanded
 
-        # Expand from per-block to per-row: repeat each row 128 times
-        ue8m0_expanded = ue8m0.repeat_interleave(128, dim=0)[:output_size, :scale_k]
+        # Step 2: Compute new UE8M0 scales (per 128-element block)
+        # Reshape to blocks, find max per block
+        w_blocks = w_float.reshape(M, scale_k, group_size)
+        block_amax = w_blocks.abs().amax(dim=2).clamp(min=1e-12)  # [M, scale_k]
+        # New scale = ceil_to_ue8m0(amax / 448)
+        raw_scale = block_amax / 448.0
+        ue8m0_exp = torch.ceil(torch.log2(raw_scale.clamp(min=1e-30)))
+        new_scale = torch.pow(2.0, ue8m0_exp)  # exact power of 2
+        ue8m0_byte = (ue8m0_exp + 127).clamp(0, 254).to(torch.int32)
 
-        # Pack 4 identical UE8M0 bytes into one uint32
-        packed = (ue8m0_expanded
-                  | (ue8m0_expanded << 8)
-                  | (ue8m0_expanded << 16)
-                  | (ue8m0_expanded << 24))
+        # Step 3: Re-quantize to FP8
+        new_scale_expanded = new_scale.unsqueeze(2).expand_as(w_blocks)
+        w_rescaled = (w_blocks / new_scale_expanded).clamp(-448, 448)
+        new_fp8 = w_rescaled.reshape(M, K).to(torch.float8_e4m3fn)
 
-        # Pad K dimension to PADDED_SCALE_K
+        # Step 4: Pack UE8M0 bytes (4 identical per uint32, per-row)
+        packed = (ue8m0_byte
+                  | (ue8m0_byte << 8)
+                  | (ue8m0_byte << 16)
+                  | (ue8m0_byte << 24))
         if padded_scale_k > scale_k:
-            padding = torch.zeros(output_size, padded_scale_k - scale_k,
+            padding = torch.zeros(M, padded_scale_k - scale_k,
                                   dtype=torch.int32, device=packed.device)
             packed = torch.cat([packed, padding], dim=1)
 
-        return packed.contiguous()
+        return new_fp8.contiguous(), packed.contiguous()
 
     @property
     def _weights_are_fp8(self):
@@ -390,8 +409,8 @@ class DeepSeekV3Builder(GraphBuilder):
     def _attach_fp8_weight(self, state_dict, key, name):
         """Attach FP8 weight + scale_inv (converted to UE8M0), or BF16 weight."""
         scale_key = f"{key}_scale_inv"
-        # ABLATION: dequant FP8→BF16 to test if UE8M0 precision causes token=0
         if scale_key in state_dict and os.environ.get("MPK_BF16_BYPASS"):
+            # ABLATION: dequant FP8→BF16 to bypass FP8 precision issues
             raw_w = state_dict[key]
             raw_s = state_dict[scale_key]
             w_bf16 = (raw_w.float() * raw_s.float().repeat_interleave(
@@ -400,12 +419,11 @@ class DeepSeekV3Builder(GraphBuilder):
             w = self._safe_attach(w_bf16, name)
             s = None
         elif scale_key in state_dict:
-            w = self._safe_attach(state_dict[key], name)
-            weight = state_dict[key]
-            output_size, reduction_size = weight.shape[0], weight.shape[1]
-            scale_ue8m0 = self._convert_scale_inv_to_ue8m0(
-                state_dict[scale_key], output_size, reduction_size)
-            s = self._safe_attach(scale_ue8m0, f"{name}_scale")
+            # Requantize: dequant with float32 scale, re-quantize with UE8M0 scale
+            new_fp8, packed_ue8m0 = self._requantize_fp8_for_ue8m0(
+                state_dict[key], state_dict[scale_key])
+            w = self._safe_attach(new_fp8, name)
+            s = self._safe_attach(packed_ue8m0, f"{name}_scale")
         else:
             w = self._safe_attach(state_dict[key], name)
             s = None  # weight is already BF16 (post-dequant)
@@ -466,26 +484,31 @@ class DeepSeekV3Builder(GraphBuilder):
             scale_rows_total = kv_a_s.shape[0]
             latent_ratio = self.kv_lora_rank / (self.kv_lora_rank + QK_ROPE_HEAD_DIM)
             scale_rows_latent = round(scale_rows_total * latent_ratio)
-            # c_latent part: [512, hidden] FP8
-            w_kv_latent = self._safe_attach(
+            # c_latent: requantize [512, hidden] FP8
+            latent_fp8, latent_ue8m0 = self._requantize_fp8_for_ue8m0(
                 kv_a_w[:self.kv_lora_rank].contiguous(),
+                kv_a_s[:scale_rows_latent].contiguous())
+            w_kv_latent = self._safe_attach(latent_fp8,
                 f"layer_{layer_idx}_kv_a_latent")
-            latent_scale_ue8m0 = self._convert_scale_inv_to_ue8m0(
-                kv_a_s[:scale_rows_latent].contiguous(),
-                self.kv_lora_rank, kv_a_w.shape[1])
-            s_kv_latent = self._safe_attach(
-                latent_scale_ue8m0,
+            s_kv_latent = self._safe_attach(latent_ue8m0,
                 f"layer_{layer_idx}_kv_a_latent_scale")
-            kv_rope_fp8 = kv_a_w[self.kv_lora_rank:].contiguous()
-            kv_rope_padded = torch.zeros(128, kv_rope_fp8.shape[1],
-                                         dtype=kv_rope_fp8.dtype, device=kv_rope_fp8.device)
-            kv_rope_padded[:QK_ROPE_HEAD_DIM] = kv_rope_fp8
+            # k_pe: requantize [64, hidden] → pad to [128, hidden]
+            rope_fp8_raw = kv_a_w[self.kv_lora_rank:].contiguous()
+            rope_scale_raw = kv_a_s[scale_rows_latent:].contiguous()
+            rope_fp8_req, rope_ue8m0_req = self._requantize_fp8_for_ue8m0(
+                rope_fp8_raw, rope_scale_raw)
+            # Pad from [64, H] to [128, H]
+            kv_rope_padded = torch.zeros(128, rope_fp8_req.shape[1],
+                                         dtype=rope_fp8_req.dtype, device=rope_fp8_req.device)
+            kv_rope_padded[:QK_ROPE_HEAD_DIM] = rope_fp8_req
             w_kv_rope = self._safe_attach(kv_rope_padded,
                                           f"layer_{layer_idx}_kv_a_rope")
-            rope_scale_ue8m0 = self._convert_scale_inv_to_ue8m0(
-                kv_a_s[scale_rows_latent:].contiguous(),
-                128, kv_a_w.shape[1])
-            s_kv_rope = self._safe_attach(rope_scale_ue8m0,
+            # Pad UE8M0 scale from [64, K] to [128, K]
+            rope_ue8m0_padded = torch.zeros(128, rope_ue8m0_req.shape[1],
+                                            dtype=rope_ue8m0_req.dtype,
+                                            device=rope_ue8m0_req.device)
+            rope_ue8m0_padded[:QK_ROPE_HEAD_DIM] = rope_ue8m0_req
+            s_kv_rope = self._safe_attach(rope_ue8m0_padded,
                                           f"layer_{layer_idx}_kv_a_rope_scale")
         else:
             w_kv_latent = self._safe_attach(
