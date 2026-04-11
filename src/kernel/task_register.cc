@@ -3046,22 +3046,26 @@ int TaskRegister::register_moe_topk_sigmoid_sm100_task(
   output_stride = static_cast<int>(kn_input_op->input_strides[0]);
   mirage::transpiler::CodeKeeper code;
   code.inc_indent();
-  code.e("kernel::topk_sigmoid_task_impl<cute::bfloat16_t, $, $, $, $>(",
+  // DeepSeek V3: no expert groups (NUM_GROUPS=1, TOPK_GROUP=1)
+  code.e("kernel::topk_sigmoid_task_impl<cute::bfloat16_t, $, $, $, $, $, $, $, $>(",
          /*VPT=*/8,
-         /*EXPERTS=*/num_experts,
-         /*WARPS_PER_TB=*/8,
-         /*BYTES_PER_LDG=*/16);
+         /*NUM_EXPERTS=*/num_experts,
+         /*WARPS_PER_CTA=*/8,
+         /*BYTES_PER_LDG=*/16,
+         /*NUM_GROUPS=*/1,
+         /*TOPK_GROUP=*/1,
+         /*EXPERTS_PER_GROUP=*/num_experts,
+         /*TOPK_EXPERTS=*/num_experts_per_tok);
   code.e("    task_desc->input_ptrs[0],");   // logits
   code.e("    task_desc->input_ptrs[1],");   // bias (e_score_correction_bias)
   code.e("    nullptr,");                     // finished
   code.e("    task_desc->output_ptrs[0],");  // topk weights
-  code.e("    $,", batch_size);
-  code.e("    $,", num_experts_per_tok);
+  code.e("    $,", batch_size);              // num_rows
   code.e("    task_desc->output_ptrs[1],");  // routing_indices
   code.e("    task_desc->output_ptrs[2],");  // active_expert_ids
   code.e("    0,");                           // start_expert
   code.e("    $,", num_experts);              // end_expert
-  code.e("    true);");                       // renormalize
+  code.e("    1.0f);");                       // routed_scaling_factor
   return register_task_variant(TASK_MOE_TOPK_SIGMOID_SM100, code.to_string());
 }
 
