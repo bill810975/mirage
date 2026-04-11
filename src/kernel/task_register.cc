@@ -2910,14 +2910,7 @@ int TaskRegister::register_linear_fp8_sm100_task(
   code.e("    static_cast<uint32_t const*>(task_desc->input_ptrs[3]),"); // weight_scale
   code.e("    static_cast<uint32_t const*>(task_desc->input_ptrs[1]),"); // input_scale
   code.e("    mBias, tma_out);");
-  code.e("if (threadIdx.x == 0) {");
-  code.e("  uint32_t *ws = static_cast<uint32_t*>(task_desc->input_ptrs[3]);");
-  code.e("  uint32_t *is_ = static_cast<uint32_t*>(task_desc->input_ptrs[1]);");
-  code.e("  nv_bfloat16 *fout = static_cast<nv_bfloat16*>(task_desc->output_ptrs[0]);");
-  code.e("  printf(\"[FP8] out=$,red=$ ws0=%u is0=%u out0=%f\\n\",",
-         output_size, reduction_size);
-  code.e("         ws[0], is_[0], __bfloat162float(fout[0]));");
-  code.e("}");
+  // Debug printfs removed for clean run
 
   if (with_residual) {
     return register_task_variant(TASK_LINEAR_FP8_WITH_RESIDUAL_SM100,
@@ -3481,14 +3474,6 @@ int TaskRegister::register_mla_decode_sm100_task(
   code.e("  int lp_ = runtime_config.paged_kv_indptr_buffer[bi_ + 1];");
   code.e("  int kv_len_ = (lp_ - fp_ - 1) * MPK_PAGE_SIZE + "
          "runtime_config.paged_kv_last_page_len_buffer[bi_];");
-  // Debug: check Q, KV, and decode output
-  code.e("  if (threadIdx.x == 0) {");
-  code.e("    nv_bfloat16 *q = static_cast<nv_bfloat16*>(task_desc->input_ptrs[0]);");
-  code.e("    nv_bfloat16 *kv = static_cast<nv_bfloat16*>(task_desc->input_ptrs[1]);");
-  code.e("    float qs=0; for(int i=0;i<100;i++) qs+=fabsf(__bfloat162float(q[i]));");
-  code.e("    printf(\"[MLA_D] kvl=%d si=%d Q100=%f KV0=%f\\n\",");
-  code.e("           kv_len_, task_desc->head_group, qs, __bfloat162float(kv[0]));");
-  code.e("  }");
   // PR 651 MLA MTP decode kernel
   code.e("  kernel::mla_mtp_decode_sm100_task_impl<false>(");
   code.e("      static_cast<const "
@@ -3505,15 +3490,6 @@ int TaskRegister::register_mla_decode_sm100_task(
   code.e("      0,");                        // gi (head group 0)
   code.e("      task_desc->head_group,");    // si (split_idx)
   code.e("      bi_);");                     // bi (batch_idx)
-  // Debug: check decode output
-  code.e("  if (threadIdx.x == 0) {");
-  code.e("    nv_bfloat16 *oa = static_cast<nv_bfloat16*>(task_desc->output_ptrs[0]);");
-  code.e("    float *la = static_cast<float*>(task_desc->output_ptrs[1]);");
-  code.e("    int first_nz = -1;");
-  code.e("    for(int i=0;i<65536;i++) { if(__bfloat162float(oa[i])!=0.0f) { first_nz=i; break; } }");
-  code.e("    float v_at = (first_nz>=0) ? __bfloat162float(oa[first_nz]) : 0.0f;");
-  code.e("    printf(\"[MLA_D] first_nz=%d val=%f La[0]=%f\\n\", first_nz, v_at, la[0]);");
-  code.e("  }");
   code.e("}");
   return register_task_variant(TASK_MLA_DECODE_SM100, code.to_string());
 }
@@ -3545,12 +3521,7 @@ int TaskRegister::register_mla_reduce_sm100_task(
   code.e("    $,", d_start);               // dv_base
   code.e("    0,");                        // gi (head group 0)
   code.e("    task_desc->request_id);");   // bi
-  // Debug: check reduce output
-  code.e("if (threadIdx.x == 0) {");
-  code.e("  nv_bfloat16 *out = static_cast<nv_bfloat16*>(task_desc->output_ptrs[0]);");
-  code.e("  printf(\"[MLA_REDUCE] d_start=$, out[0..2]=%f,%f,%f\\n\",", d_start);
-  code.e("         __bfloat162float(out[0]), __bfloat162float(out[1]), __bfloat162float(out[2]));");
-  code.e("}");
+  // Debug printfs removed for clean run
   return register_task_variant(TASK_MLA_REDUCE_SM100, code.to_string());
 }
 
