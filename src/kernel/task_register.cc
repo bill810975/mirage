@@ -2017,7 +2017,10 @@ int TaskRegister::register_moe_topk_softmax_sm100_task(
   }
   assert(output_ops[0]->output_tensors[0].num_dims == 2);
   assert(output_ops[1]->output_tensors[0].num_dims == 2);
-  assert(output_ops[2]->output_tensors[0].num_dims == 1);
+  // moe_mask can be 1D [num_experts+1] or 2D [num_experts+1, 1]
+  assert(output_ops[2]->output_tensors[0].num_dims == 1 ||
+         (output_ops[2]->output_tensors[0].num_dims == 2 &&
+          output_ops[2]->output_tensors[0].dim[1] == 1));
   num_experts = output_ops[1]->output_tensors[0].dim[0];
   batch_size = output_ops[1]->output_tensors[0].dim[1];
   num_experts_per_tok = output_ops[0]->output_tensors[0].dim[1];
@@ -3017,7 +3020,10 @@ int TaskRegister::register_moe_topk_sigmoid_sm100_task(
   }
   assert(output_ops[0]->output_tensors[0].num_dims == 2);
   assert(output_ops[1]->output_tensors[0].num_dims == 2);
-  assert(output_ops[2]->output_tensors[0].num_dims == 1);
+  // moe_mask can be 1D [num_experts+1] or 2D [num_experts+1, 1]
+  assert(output_ops[2]->output_tensors[0].num_dims == 1 ||
+         (output_ops[2]->output_tensors[0].num_dims == 2 &&
+          output_ops[2]->output_tensors[0].dim[1] == 1));
   num_experts = output_ops[1]->output_tensors[0].dim[0];
   batch_size = output_ops[1]->output_tensors[0].dim[1];
   num_experts_per_tok = output_ops[0]->output_tensors[0].dim[1];
@@ -3046,9 +3052,9 @@ int TaskRegister::register_moe_topk_sigmoid_sm100_task(
          /*WARPS_PER_TB=*/8,
          /*BYTES_PER_LDG=*/16);
   code.e("    task_desc->input_ptrs[0],");   // logits
+  code.e("    task_desc->input_ptrs[1],");   // bias (e_score_correction_bias)
   code.e("    nullptr,");                     // finished
   code.e("    task_desc->output_ptrs[0],");  // topk weights
-  code.e("    task_desc->input_ptrs[1],");   // bias (e_score_correction_bias)
   code.e("    $,", batch_size);
   code.e("    $,", num_experts_per_tok);
   code.e("    task_desc->output_ptrs[1],");  // routing_indices
@@ -3154,8 +3160,10 @@ int TaskRegister::register_moe_fp8_sm100_task(
   assert(input_ops[4]->output_tensors[0].dim[0] == num_experts);
   assert(input_ops[4]->output_tensors[0].dim[1] == batch_size);
 
-  // Mask: [num_experts+1]
-  assert(input_ops[5]->output_tensors[0].num_dims == 1);
+  // Mask: [num_experts+1] or [num_experts+1, 1]
+  assert(input_ops[5]->output_tensors[0].num_dims == 1 ||
+         (input_ops[5]->output_tensors[0].num_dims == 2 &&
+          input_ops[5]->output_tensors[0].dim[1] == 1));
   assert(input_ops[5]->output_tensors[0].dim[0] == num_experts + 1);
 
   // Output stride

@@ -1189,13 +1189,21 @@ class PersistentKernel:
                           output, grid_dim, block_dim):
         params = []
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        print(f"[MOE_W13] new_input 0: input_fp8", flush=True)
         tb_graph.new_input(input_fp8, (-1, -1, -1), -1, True)
+        print(f"[MOE_W13] new_input 1: input_scale", flush=True)
         tb_graph.new_input(input_scale, (-1, -1, -1), -1, True)
+        print(f"[MOE_W13] new_input 2: weight_fp8", flush=True)
         tb_graph.new_input(weight_fp8, (-1, -1, -1), -1, True)
+        print(f"[MOE_W13] new_input 3: weight_scale", flush=True)
         tb_graph.new_input(weight_scale, (-1, -1, -1), -1, True)
+        print(f"[MOE_W13] new_input 4: routing_indices", flush=True)
         tb_graph.new_input(moe_routing_indices, (-1, -1, -1), -1, True)
+        print(f"[MOE_W13] new_input 5: moe_mask", flush=True)
         tb_graph.new_input(moe_mask, (-1, -1, -1), -1, True)
+        print(f"[MOE_W13] new_input 6: output", flush=True)
         tb_graph.new_input(output, (-1, -1, -1), -1, True)
+        print(f"[MOE_W13] all new_input done", flush=True)
         self.kn_graph.customized(
             [input_fp8, input_scale, weight_fp8, weight_scale,
              moe_routing_indices, moe_mask, output], tb_graph)

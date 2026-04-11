@@ -721,6 +721,7 @@ class DeepSeekV3Builder(GraphBuilder):
             io_category="cuda_tensor",
         )
         if use_fp8_experts:
+            print(f"[DEBUG] before moe_w13_fp8", flush=True)
             self.mpk.moe_w13_fp8_layer(
                 input_fp8=moe_input_fp8,
                 input_scale=moe_input_scale,
@@ -750,9 +751,10 @@ class DeepSeekV3Builder(GraphBuilder):
             name=f"layer_{layer_idx}_moe_silu",
             io_category="cuda_tensor",
         )
+        # moe_silu_mul input_map=(0,1,-1): grid.x→dim0(batch), grid.y→dim1(topk)
         self.mpk.moe_silu_mul_layer(
             input=moe_mid, output=moe_silu_out,
-            grid_dim=(mbt * NUM_EXPERTS_PER_TOK, 1, 1),
+            grid_dim=(mbt, NUM_EXPERTS_PER_TOK, 1),
             block_dim=(128, 1, 1),
         )
 
@@ -844,6 +846,8 @@ class DeepSeekV3Builder(GraphBuilder):
             name=f"layer_{layer_idx}_shared_mid",
             io_category="cuda_tensor",
         )
+        print(f"[DEBUG] shared gate_up: w_dim0={w_shared_gate_up.dim(0)}, grid={grid_for_rmsnorm_linear_layer(w_shared_gate_up.dim(0))}", flush=True)
+        import sys; sys.stdout.flush()
         self._fp8_linear(self.rmsnorm_out, w_shared_gate_up, s_shared_gate_up,
                          shared_mid,
                          grid_dim=(grid_for_rmsnorm_linear_layer(
@@ -1145,7 +1149,7 @@ class DeepSeekV3Builder(GraphBuilder):
             dtype=bfloat16, name="mtp_moe_silu", io_category="cuda_tensor")
         self.mpk.moe_silu_mul_layer(
             input=moe_mid, output=moe_silu_out,
-            grid_dim=(mbt * NUM_EXPERTS_PER_TOK, 1, 1), block_dim=(128, 1, 1))
+            grid_dim=(mbt, NUM_EXPERTS_PER_TOK, 1), block_dim=(128, 1, 1))
 
         # Expert W2 (FP8) — quantize 3D silu_out first
         w_w2, s_w2 = self._attach_fp8_weight(

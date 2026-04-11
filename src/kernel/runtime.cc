@@ -197,6 +197,10 @@ void register_mugraph(
     int num_outputs = std::get<1>(task_config);
     TaskType task_type = std::get<2>(task_config);
     int variant_id = std::get<3>(task_config);
+    if (bgraph.operators.size() != (size_t)num_inputs + num_outputs) {
+      fprintf(stderr, "[register_mugraph] FAIL: task_type=%d, bgraph.ops=%zu, num_inputs=%d, num_outputs=%d\n",
+              task_type, bgraph.operators.size(), num_inputs, num_outputs);
+    }
     assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
     for (auto const &op : bgraph.operators) {
       assert(op->op_type == mirage::type::TB_INPUT_OP);

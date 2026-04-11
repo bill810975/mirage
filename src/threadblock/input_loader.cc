@@ -98,6 +98,13 @@ TBInputOp::TBInputOp(Graph *_graph,
     }
     if (dim_idx >= 0) {
       assert(tensor.dim[dim_idx] > 0);
+      if (tensor.dim[dim_idx] % dim_div != 0) {
+        fprintf(stderr, "[TBInputOp] FAIL: d=%d dim_idx=%d dim=%d div=%d map=(%d,%d,%d) ndims=%d\n",
+                d, dim_idx, tensor.dim[dim_idx], dim_div,
+                input_map.x, input_map.y, input_map.z, tensor.num_dims);
+        for (int dd = 0; dd < tensor.num_dims; dd++)
+          fprintf(stderr, "  dim[%d]=%d\n", dd, tensor.dim[dd]);
+      }
       assert(tensor.dim[dim_idx] % dim_div == 0);
       tensor.dim[dim_idx] /= dim_div;
     }
