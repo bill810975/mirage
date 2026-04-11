@@ -550,7 +550,11 @@ if __name__ == "__main__":
 
             # Absorb kv_b_proj into q_b_proj (requires dequant for matmul)
             # After absorption, q_b_proj becomes BF16 (absorbed), kv_b_proj is deleted
-            for li in test_layers:
+            # Include MTP layer (61) if --mtp is set
+            absorb_layers = list(test_layers)
+            if args.mtp:
+                absorb_layers.append(num_layers)  # layer 61
+            for li in absorb_layers:
                 attn = f"model.layers.{li}.self_attn."
                 q_key = f"{attn}q_b_proj.weight"
                 kv_key = f"{attn}kv_b_proj.weight"
@@ -612,7 +616,7 @@ if __name__ == "__main__":
                         del state_dict[kv_s_key]
 
             # Fuse gate_proj + up_proj for dense MLP layers (keep FP8)
-            for li in test_layers:
+            for li in absorb_layers:
                 prefix = f"model.layers.{li}.mlp."
                 gate_key = f"{prefix}gate_proj.weight"
                 up_key = f"{prefix}up_proj.weight"
@@ -627,7 +631,7 @@ if __name__ == "__main__":
                             [state_dict.pop(gs_key), state_dict.pop(us_key)], dim=0)
 
             # Fuse per-expert weights into experts.w13/w2 tensors (keep FP8)
-            for li in test_layers:
+            for li in absorb_layers:
                 ep = f"model.layers.{li}.mlp.experts."
                 expert_keys = [k for k in list(state_dict.keys())
                                if k.startswith(ep) and ".gate_proj.weight" in k

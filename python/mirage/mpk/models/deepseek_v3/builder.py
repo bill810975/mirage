@@ -1420,7 +1420,8 @@ class DeepSeekV3Builder(GraphBuilder):
 
             # 6. Full MTP decoder layer (MLA attention + MLP, own weights)
             self.mtp_x = mtp_proj_out
-            self._build_mtp_decoder_layer(state_dict, mtp_block_prefix)
+            if not os.environ.get("MPK_SKIP_MTP_DECODER"):
+                self._build_mtp_decoder_layer(state_dict, mtp_block_prefix)
 
             # 7. Final norm → shared lm_head → argmax → draft_token_ids
             # shared_head.norm is the MTP's output norm
@@ -1463,6 +1464,8 @@ class DeepSeekV3Builder(GraphBuilder):
             )
 
             # Scatter this step's draft token into the collection buffer
+            if os.environ.get("MPK_SKIP_MTP_VERIFY"):
+                continue  # skip scatter too
             self.mpk.mtp_token_scatter_layer(
                 src=draft_token_ids,
                 dst=all_draft_ids,
@@ -1472,6 +1475,10 @@ class DeepSeekV3Builder(GraphBuilder):
                 num_slots=num_draft_steps,
                 slot_idx=step,
             )
+
+        # ABLATION: skip verify/accept for now
+        if os.environ.get("MPK_SKIP_MTP_VERIFY"):
+            return
 
         # ---- Prepare verify: write draft tokens to sequence buffer ----
         # This sets up input for the next iteration's verification forward:
