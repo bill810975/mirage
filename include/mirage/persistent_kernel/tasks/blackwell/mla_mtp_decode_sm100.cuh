@@ -297,8 +297,14 @@ __device__ __noinline__ void
     int P0_smem = work_smem;
     int P1_smem = work_smem + TILE_BYTES;
 
-    // Pass 1: Find global max
+    // Pass 1 + Pass 2: softmax — only active threads (tid < 128)
+    // Threads 128-255 must NOT access TMEM or write to P smem, because:
+    // - tcgen05 with tid>=128 accesses invalid TMEM rows
+    // - P smem writes at row_base = p_base + tid*128 would overflow into V[vc=0]
     float tile_max = -1e30f;
+    float tile_sum = 0.0f;
+    if (active) {
+    // Pass 1: Find global max
     for (int c = 0; c < TILE_S; c += 16) {
       float t16[16];
       int addr = taddr + (tid << 16) + c;
@@ -331,7 +337,6 @@ __device__ __noinline__ void
     }
 
     // Pass 2: Compute exp, write P, accumulate sum
-    float tile_sum = 0.0f;
     for (int half = 0; half < 2; half++) {
       int p_base = (half == 0) ? P0_smem : P1_smem;
       int row_base = p_base + tid * 128;
@@ -410,6 +415,7 @@ __device__ __noinline__ void
         }
       }
     }
+    } // end if (active) for softmax
 
     float nm = fmaxf(row_max, tile_max);
     float corr = __expf(row_max - nm);
@@ -417,7 +423,7 @@ __device__ __noinline__ void
     __syncthreads();
 
     // Scale O[128:511] in TMEM
-    if (tile > t0) {
+    if (active && tile > t0) {
       for (int c = TILE_S; c < D_V; c += 16) {
         float t16[16];
         int addr = taddr + (tid << 16) + c;
