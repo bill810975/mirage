@@ -336,7 +336,11 @@ class DeepSeekV3Builder(GraphBuilder):
         )
 
     def _safe_attach(self, tensor, name):
-        """Attach tensor. FP8 is now natively supported in core.pyx."""
+        """Attach tensor. FP8 is now natively supported in core.pyx.
+        Also keeps a reference to prevent GC from freeing the underlying memory."""
+        if not hasattr(self, '_attached_tensors'):
+            self._attached_tensors = []
+        self._attached_tensors.append(tensor)
         return self.mpk.attach_input(torch_tensor=tensor, name=name)
 
     @staticmethod
