@@ -708,7 +708,7 @@ class DeepSeekV3Builder(GraphBuilder):
         # Expert W1+W3 (gate + up projection)
         # Check if weights are FP8 (have scale_inv) or BF16 (post-dequant)
         w13_scale_key = f"{prefix}experts.w13.weight_scale_inv"
-        use_fp8_experts = w13_scale_key in state_dict
+        use_fp8_experts = w13_scale_key in state_dict and not os.environ.get("MPK_BF16_BYPASS")
         w_experts_w13 = self._safe_attach(
             state_dict[f"{prefix}experts.w13.weight"],
             f"layer_{layer_idx}_experts_w13")
