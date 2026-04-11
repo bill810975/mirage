@@ -1145,14 +1145,20 @@ class PersistentKernel:
 
     # === FP8 Layers ===
     def quantize_fp8_layer(self, input, output_fp8, output_scale,
-                           grid_dim, block_dim):
+                           grid_dim, block_dim, scale_ue8m0=True):
+        """Quantize BF16 input to FP8 with block-wise scale.
+
+        scale_ue8m0=True: output scale is packed UE8M0 uint32 (for FP8 linear GEMM)
+        scale_ue8m0=False: output scale is float32 (for MoE group GEMM)
+        """
         params = []
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         tb_graph.new_input(input, (-1, -1, -1), -1, True)
         tb_graph.new_input(output_fp8, (-1, -1, -1), -1, True)
         tb_graph.new_input(output_scale, (-1, -1, -1), -1, True)
         self.kn_graph.customized([input, output_fp8, output_scale], tb_graph)
-        self.kn_graph.register_task(tb_graph, "quantize_fp8_sm100", params)
+        task_name = "quantize_fp8_sm100" if scale_ue8m0 else "quantize_fp8_f32scale_sm100"
+        self.kn_graph.register_task(tb_graph, task_name, params)
 
     def linear_fp8_layer(self, input_fp8, input_scale, weight_fp8,
                          weight_scale, output, grid_dim, block_dim):

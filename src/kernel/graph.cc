@@ -638,7 +638,11 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
   // FP8 tasks
   else if (name == "quantize_fp8_sm100") {
     int variant_id = task_register->register_quantize_fp8_sm100_task(
-        customized->bgraph, params);
+        customized->bgraph, params, true /*scale_ue8m0*/);
+    task_config[op] = std::make_tuple(1, 2, TASK_QUANTIZE_FP8_SM100, variant_id);
+  } else if (name == "quantize_fp8_f32scale_sm100") {
+    int variant_id = task_register->register_quantize_fp8_sm100_task(
+        customized->bgraph, params, false /*scale_ue8m0*/);
     task_config[op] = std::make_tuple(1, 2, TASK_QUANTIZE_FP8_SM100, variant_id);
   } else if (name == "linear_fp8_sm100") {
     int variant_id = task_register->register_linear_fp8_sm100_task(

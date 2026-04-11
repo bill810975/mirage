@@ -114,7 +114,8 @@ public:
   int register_moe_topk_sigmoid_sm100_task(threadblock::Graph const &bgraph,
                                             std::vector<int> const &params);
   int register_quantize_fp8_sm100_task(threadblock::Graph const &bgraph,
-                                       std::vector<int> const &params);
+                                       std::vector<int> const &params,
+                                       bool scale_ue8m0 = true);
   int register_linear_fp8_sm100_task(threadblock::Graph const &bgraph,
                                      std::vector<int> const &params,
                                      bool with_residual);

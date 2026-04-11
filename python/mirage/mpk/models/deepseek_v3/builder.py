@@ -18,7 +18,7 @@ from ..utils import grid_for_rmsnorm_linear_layer
 from ..graph_builder import GraphBuilder, MirageModelConfig
 from ...persistent_kernel import PersistentKernel
 from ...model_registry import register_model_builder
-from ....core import bfloat16, float8_e4m3, float32, int64
+from ....core import bfloat16, float8_e4m3, float32, int32, int64
 
 
 # DeepSeek V3 architecture constants
@@ -608,11 +608,26 @@ class DeepSeekV3Builder(GraphBuilder):
                          block_dim=(128, 1, 1))
 
     def _build_moe_mlp(self, layer_idx: int, state_dict: dict):
-        """Build MoE MLP for layers 3-60.
+        """Build MoE MLP for layers 3-60."""
+        # ABLATION: skip MoE at various stages
+        skip_level = int(os.environ.get("MPK_SKIP_MOE_EXPERTS", "0"))
+        # 0=no skip, 1=skip at start, 2=skip after routing, 3=skip after shared expert
+        if skip_level == 1:
+            self.mlp_out = self.mpk.new_tensor(
+                dims=(self.max_num_batched_tokens, self.hidden_size),
+                dtype=bfloat16,
+                name=f"layer_{layer_idx}_moe_output_zero",
+                io_category="cuda_tensor",
+            )
+            self.mpk.tensor_init_layer(
+                input=self.mlp_out,
+                dummy_input=self.rmsnorm_out,
+                dummy_output=self.rmsnorm_out,
+                grid_dim=(self.max_num_batched_tokens, 1, 1),
+                block_dim=(128, 1, 1),
+            )
+            return
 
-        Uses existing MoE task infrastructure:
-        moe_topk_softmax → moe_w13_linear → silu_mul → moe_w2_linear → mul_sum_add
-        """
         prefix = f"model.layers.{layer_idx}.mlp."
 
         # Router
@@ -621,22 +636,22 @@ class DeepSeekV3Builder(GraphBuilder):
             name=f"layer_{layer_idx}_moe_gate",
         )
 
-        # MoE routing tensors
+        # MoE routing tensors — topk_sigmoid outputs float32 weights and int32 indices/mask
         moe_topk_weights = self.mpk.new_tensor(
             dims=(self.max_num_batched_tokens, NUM_EXPERTS_PER_TOK),
-            dtype=bfloat16,
+            dtype=float32,
             name=f"layer_{layer_idx}_moe_topk_weights",
             io_category="cuda_tensor",
         )
         moe_routing_indices = self.mpk.new_tensor(
             dims=(NUM_EXPERTS, self.max_num_batched_tokens),
-            dtype=bfloat16,
+            dtype=int32,
             name=f"layer_{layer_idx}_moe_routing_indices",
             io_category="cuda_tensor",
         )
         moe_mask = self.mpk.new_tensor(
             dims=(NUM_EXPERTS + 1, 1),
-            dtype=bfloat16,
+            dtype=int32,
             name=f"layer_{layer_idx}_moe_mask",
             io_category="cuda_tensor",
         )
@@ -686,6 +701,10 @@ class DeepSeekV3Builder(GraphBuilder):
             block_dim=(256, 1, 1),  # 8 warps required by topk kernel
         )
 
+        if skip_level == 2:
+            self.mlp_out = moe_output
+            return
+
         # Expert W1+W3 (gate + up projection)
         # Check if weights are FP8 (have scale_inv) or BF16 (post-dequant)
         w13_scale_key = f"{prefix}experts.w13.weight_scale_inv"
@@ -693,9 +712,21 @@ class DeepSeekV3Builder(GraphBuilder):
         w_experts_w13 = self._safe_attach(
             state_dict[f"{prefix}experts.w13.weight"],
             f"layer_{layer_idx}_experts_w13")
-        s_experts_w13 = self._safe_attach(
-            state_dict[w13_scale_key],
-            f"layer_{layer_idx}_experts_w13_scale") if use_fp8_experts else None
+        # Group GEMM expects per-row weight_scale (not per-block scale_inv)
+        # Checkpoint: scale_inv [num_experts, out/128, K/128]
+        # Kernel expects: scale [num_experts*out, K/128] (per-row, float32)
+        if use_fp8_experts:
+            raw_scale_inv = state_dict[w13_scale_key].float().clamp(min=1e-30)
+            w13_scale = 1.0 / raw_scale_inv  # [num_experts, out/128, K/128]
+            # Expand per-block to per-row: repeat each block row 128 times
+            w13_scale_expanded = w13_scale.repeat_interleave(128, dim=1)
+            # Flatten to [num_experts*out, K/128]
+            ne, out_rows, sk = w13_scale_expanded.shape
+            w13_scale_flat = w13_scale_expanded.reshape(ne * out_rows, sk).contiguous().to(torch.float32)
+            s_experts_w13 = self._safe_attach(
+                w13_scale_flat, f"layer_{layer_idx}_experts_w13_scale")
+        else:
+            s_experts_w13 = None
         mbt = self.max_num_batched_tokens
         if use_fp8_experts:
             # Quantize input for MoE FP8
@@ -707,11 +738,13 @@ class DeepSeekV3Builder(GraphBuilder):
                 dims=(mbt, self.hidden_size // 128), dtype=float32,
                 name=f"layer_{layer_idx}_moe_input_scale", io_category="cuda_tensor",
             )
+            # MoE group GEMM expects float32 scale (does internal UE8M0 conversion)
             self.mpk.quantize_fp8_layer(
                 input=self.rmsnorm_out,
                 output_fp8=moe_input_fp8,
                 output_scale=moe_input_scale,
                 grid_dim=(mbt, 1, 1), block_dim=(128, 1, 1),
+                scale_ue8m0=False,
             )
 
         moe_mid = self.mpk.new_tensor(
@@ -720,6 +753,10 @@ class DeepSeekV3Builder(GraphBuilder):
             name=f"layer_{layer_idx}_moe_mid",
             io_category="cuda_tensor",
         )
+        if skip_level == 5:
+            self.mlp_out = moe_output
+            return
+
         if use_fp8_experts:
             print(f"[DEBUG] before moe_w13_fp8", flush=True)
             self.mpk.moe_w13_fp8_layer(
@@ -744,6 +781,10 @@ class DeepSeekV3Builder(GraphBuilder):
                 block_dim=(128, 1, 1),
             )
 
+        if skip_level == 4:
+            self.mlp_out = moe_output
+            return
+
         # SiLU activation
         moe_silu_out = self.mpk.new_tensor(
             dims=(mbt, NUM_EXPERTS_PER_TOK, self.moe_intermediate_size),
@@ -763,9 +804,17 @@ class DeepSeekV3Builder(GraphBuilder):
         w_experts_w2 = self._safe_attach(
             state_dict[f"{prefix}experts.w2.weight"],
             f"layer_{layer_idx}_experts_w2")
-        s_experts_w2 = self._safe_attach(
-            state_dict[w2_scale_key],
-            f"layer_{layer_idx}_experts_w2_scale") if use_fp8_experts else None
+        # Group GEMM expects per-row weight_scale
+        if use_fp8_experts:
+            raw_scale_inv = state_dict[w2_scale_key].float().clamp(min=1e-30)
+            w2_scale = 1.0 / raw_scale_inv
+            w2_scale_expanded = w2_scale.repeat_interleave(128, dim=1)
+            ne, out_rows, sk = w2_scale_expanded.shape
+            w2_scale_flat = w2_scale_expanded.reshape(ne * out_rows, sk).contiguous().to(torch.float32)
+            s_experts_w2 = self._safe_attach(
+                w2_scale_flat, f"layer_{layer_idx}_experts_w2_scale")
+        else:
+            s_experts_w2 = None
 
         if use_fp8_experts:
             moe_silu_fp8 = self.mpk.new_tensor(
@@ -785,6 +834,7 @@ class DeepSeekV3Builder(GraphBuilder):
                 output_fp8=moe_silu_fp8,
                 output_scale=moe_silu_scale,
                 grid_dim=(mbt * NUM_EXPERTS_PER_TOK, 1, 1),
+                scale_ue8m0=False,  # MoE group GEMM expects float32 scale
                 block_dim=(128, 1, 1),
             )
 
@@ -817,29 +867,32 @@ class DeepSeekV3Builder(GraphBuilder):
                 block_dim=(128, 1, 1),
             )
 
+        if skip_level == 3:
+            self.mlp_out = moe_output
+            return
+
         # ---- Shared Expert (1 expert, TP parallel, same as dense MLP) ----
         # Shared expert runs on ALL tokens independently of routing.
         # Its output is added to the residual before the routed expert reduction:
         #   final = sum(routed * weights) + (residual + shared_expert_out)
         shared_prefix = f"{prefix}shared_experts."
 
-        # gate_proj + up_proj fused (FP8)
-        # Concatenate gate and up FP8 weights + scales
+        # gate_proj + up_proj fused (FP8) — use _attach_fp8_weight for requantize
         shared_gate_w = state_dict[f"{shared_prefix}gate_proj.weight"]
         shared_up_w = state_dict[f"{shared_prefix}up_proj.weight"]
         gate_scale_key = f"{shared_prefix}gate_proj.weight_scale_inv"
         has_shared_scale = gate_scale_key in state_dict
-        w_shared_gate_up = self._safe_attach(
-            torch.cat([shared_gate_w, shared_up_w], dim=0),
-            f"layer_{layer_idx}_shared_expert_gate_up")
+        # Fuse gate+up weights and scales in state_dict temporarily
+        fused_key = f"layer_{layer_idx}_shared_expert_gate_up"
+        state_dict[f"{fused_key}.weight"] = torch.cat([shared_gate_w, shared_up_w], dim=0)
         if has_shared_scale:
             shared_gate_s = state_dict[gate_scale_key]
             shared_up_s = state_dict[f"{shared_prefix}up_proj.weight_scale_inv"]
-            s_shared_gate_up = self._safe_attach(
-                torch.cat([shared_gate_s, shared_up_s], dim=0),
-                f"layer_{layer_idx}_shared_expert_gate_up_scale")
-        else:
-            s_shared_gate_up = None
+            state_dict[f"{fused_key}.weight_scale_inv"] = torch.cat(
+                [shared_gate_s, shared_up_s], dim=0)
+        w_shared_gate_up, s_shared_gate_up = self._attach_fp8_weight(
+            state_dict, f"{fused_key}.weight",
+            f"layer_{layer_idx}_shared_expert_gate_up")
         shared_mid = self.mpk.new_tensor(
             dims=(self.max_num_batched_tokens, 2 * self.moe_intermediate_size),
             dtype=bfloat16,
@@ -1128,12 +1181,13 @@ class DeepSeekV3Builder(GraphBuilder):
             dims=(mbt, self.hidden_size), dtype=bfloat16,
             name="mtp_moe_input_fp8", io_category="cuda_tensor")
         moe_input_scale = self.mpk.new_tensor(
-            dims=(mbt, self.hidden_size // 128), dtype=bfloat16,
+            dims=(mbt, self.hidden_size // 128), dtype=float32,
             name="mtp_moe_input_scale", io_category="cuda_tensor")
         self.mpk.quantize_fp8_layer(
             input=self.rmsnorm_out, output_fp8=moe_input_fp8,
             output_scale=moe_input_scale,
-            grid_dim=(mbt, 1, 1), block_dim=(128, 1, 1))
+            grid_dim=(mbt, 1, 1), block_dim=(128, 1, 1),
+            scale_ue8m0=False)  # MoE group GEMM expects float32 scale
 
         moe_mid = self.mpk.new_tensor(
             dims=(mbt, NUM_EXPERTS_PER_TOK, 2 * self.moe_intermediate_size),
@@ -1164,7 +1218,8 @@ class DeepSeekV3Builder(GraphBuilder):
         self.mpk.quantize_fp8_layer(
             input=moe_silu_out, output_fp8=mtp_silu_fp8,
             output_scale=mtp_silu_scale,
-            grid_dim=(mbt * NUM_EXPERTS_PER_TOK, 1, 1), block_dim=(128, 1, 1))
+            grid_dim=(mbt * NUM_EXPERTS_PER_TOK, 1, 1), block_dim=(128, 1, 1),
+            scale_ue8m0=False)  # MoE group GEMM expects float32 scale
         moe_down_out = self.mpk.new_tensor(
             dims=(mbt, NUM_EXPERTS_PER_TOK, self.hidden_size),
             dtype=bfloat16, name="mtp_moe_down", io_category="cuda_tensor")

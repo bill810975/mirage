@@ -2925,9 +2925,12 @@ int TaskRegister::register_linear_fp8_sm100_task(
 
 
 int TaskRegister::register_quantize_fp8_sm100_task(
-    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+    threadblock::Graph const &bgraph, std::vector<int> const &params,
+    bool scale_ue8m0) {
   // Input: bf16 [batch, hidden] or [batch, topk, hidden] (3D flattened)
   // Output: fp8 same shape, scale [..., hidden/group_size]
+  // scale_ue8m0=true: packed UE8M0 uint32 scale (for FP8 linear GEMM)
+  // scale_ue8m0=false: float32 scale (for MoE group GEMM)
   assert(params.size() == 0);
   int batch_size = 0, hidden_size = 0;
   std::vector<tb::TBInputOp *> input_ops;
@@ -2946,7 +2949,6 @@ int TaskRegister::register_quantize_fp8_sm100_task(
   int ndims = input_ops[0]->dtensor.num_dims;
   assert(ndims == 2 || ndims == 3);
   if (ndims == 3) {
-    // Flatten first two dims: [batch, topk, hidden] → batch_size = batch*topk
     batch_size = input_ops[0]->output_tensors[0].dim[0] *
                  input_ops[0]->output_tensors[0].dim[1];
     hidden_size = input_ops[0]->output_tensors[0].dim[2];
@@ -2961,11 +2963,12 @@ int TaskRegister::register_quantize_fp8_sm100_task(
   code.inc_indent();
   code.e("kernel::per_token_group_quantize_fp8_task_impl<$, $, $, $,",
          batch_size, hidden_size, GROUP_SIZE, input_stride);
-  code.e("    cute::bfloat16_t, __nv_fp8_e4m3, true>(");
+  code.e("    cute::bfloat16_t, __nv_fp8_e4m3, $>(",
+         scale_ue8m0 ? "true" : "false");
   code.e("    task_desc->input_ptrs[0],");   // input bf16
   code.e("    task_desc->output_ptrs[0],");  // output fp8
   code.e("    task_desc->output_ptrs[1],");  // output scale
-  code.e("    1e-10f, -448.0f, 448.0f);");   // eps, min_8bit, max_8bit for e4m3
+  code.e("    1e-10f, -448.0f, 448.0f);");
   return register_task_variant(TASK_QUANTIZE_FP8_SM100, code.to_string());
 }
 
