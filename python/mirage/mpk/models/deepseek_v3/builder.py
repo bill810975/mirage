@@ -515,15 +515,18 @@ class DeepSeekV3Builder(GraphBuilder):
             grid_dim=(num_splits, 1, 1),
             block_dim=(128, 1, 1),
         )
-        self.mpk.mla_reduce_layer(
-            input_partial=self.mla_partial_o,
-            input_lse=self.mla_partial_lse,
-            output=self.attn_out,
-            mla_params=(self.num_local_q_heads, self.v_head_dim,
-                        num_splits, 0, self.v_head_dim),
-            grid_dim=(self.mpk.max_num_batched_requests, 1, 1),
-            block_dim=(128, 1, 1),
-        )
+        # PR 651 reduce: 256 threads handle 2 V-dims per call (256/128=2 lanes)
+        lanes_per_reduce = 256 // 128  # 2
+        for d_start in range(0, self.v_head_dim, lanes_per_reduce):
+            self.mpk.mla_reduce_layer(
+                input_partial=self.mla_partial_o,
+                input_lse=self.mla_partial_lse,
+                output=self.attn_out,
+                mla_params=(self.num_local_q_heads, self.v_head_dim,
+                            num_splits, d_start, lanes_per_reduce),
+                grid_dim=(self.mpk.max_num_batched_requests, 1, 1),
+                block_dim=(128, 1, 1),
+            )
 
         # Step 7: O projection (V un-absorption fused into o_proj during conversion)
         # o_proj_fused: [7168, H*kv_lora_rank] — directly takes attn_out [N, H*kv_lora_rank]

@@ -656,6 +656,7 @@ TaskGraphResult print_task_graph(
     code.e("            task.at(\"variant_id\"));");
     code.e("task_desc.request_id = task.at(\"request_id\").get<int>();");
     code.e("task_desc.expert_offset = task.at(\"expert_offset\").get<int>();");
+    code.e("task_desc.head_group = task.at(\"head_group\").get<int>();");
     code.e("if (task.at(\"trigger_event\").is_number_integer()) {");
     code.e("task_desc.trigger_event = task.at(\"trigger_event\").get<unsigned "
            "long long int>();");
@@ -870,7 +871,8 @@ TaskGraphResult print_task_graph(
              {"trigger_event", EVENT_INVALID_ID},
              {"dependent_event", EVENT_INVALID_ID},
              {"request_id", -1},
-             {"expert_offset", -1}});
+             {"expert_offset", -1},
+             {"head_group", -1}});
   }
   // generate task[1]
   {
@@ -884,7 +886,8 @@ TaskGraphResult print_task_graph(
               get_event_id(my_gpu_id, 1 /*event_pos*/, false /*is_nvshmem*/)},
              {"dependent_event", EVENT_INVALID_ID},
              {"request_id", -1},
-             {"expert_offset", -1}});
+             {"expert_offset", -1},
+             {"head_group", -1}});
   }
   // generate all other tasks
   size_t task_pos = 2;
@@ -1104,7 +1107,8 @@ TaskGraphResult print_task_graph(
                    {"trigger_event", task_desc.trigger_event},
                    {"dependent_event", task_desc.dependent_event},
                    {"request_id", task_desc.request_id},
-                   {"expert_offset", task_desc.expert_offset}};
+                   {"expert_offset", task_desc.expert_offset},
+                   {"head_group", task_desc.head_group}};
       for (int i = 0; i < task_desc.num_inputs; i++) {
         if (input_ops[i]->dtensor == kernel::DTensor::EMPTY_TENSOR) {
           json json_dims = json::array();
