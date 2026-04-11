@@ -1041,23 +1041,24 @@ class DeepSeekV3Builder(GraphBuilder):
         latent_ratio = self.kv_lora_rank / (self.kv_lora_rank + QK_ROPE_HEAD_DIM)
         scale_rows_latent = round(scale_rows_total * latent_ratio)
 
-        w_kv_latent = self._safe_attach(
-            kv_a_w[:self.kv_lora_rank].contiguous(), f"mtp_{attn}kv_a_latent")
-        latent_scale_ue8m0 = self._convert_scale_inv_to_ue8m0(
-            kv_a_s[:scale_rows_latent].contiguous(),
-            self.kv_lora_rank, kv_a_w.shape[1])
-        s_kv_latent = self._safe_attach(
-            latent_scale_ue8m0, f"mtp_{attn}kv_a_latent_scale")
-        # kv_a_rope: pad FP8 weight to [128, H] for MMA_M alignment
-        kv_rope_w_fp8 = kv_a_w[self.kv_lora_rank:].contiguous()
-        kv_rope_padded = torch.zeros(128, kv_rope_w_fp8.shape[1],
-                                     dtype=kv_rope_w_fp8.dtype, device=kv_rope_w_fp8.device)
-        kv_rope_padded[:QK_ROPE_HEAD_DIM] = kv_rope_w_fp8
+        # c_latent: requantize
+        latent_fp8, latent_ue8m0 = self._requantize_fp8_for_ue8m0(
+            kv_a_w[:self.kv_lora_rank].contiguous(),
+            kv_a_s[:scale_rows_latent].contiguous())
+        w_kv_latent = self._safe_attach(latent_fp8, f"mtp_{attn}kv_a_latent")
+        s_kv_latent = self._safe_attach(latent_ue8m0, f"mtp_{attn}kv_a_latent_scale")
+        # kv_a_rope: requantize + pad to [128, H]
+        rope_fp8_req, rope_ue8m0_req = self._requantize_fp8_for_ue8m0(
+            kv_a_w[self.kv_lora_rank:].contiguous(),
+            kv_a_s[scale_rows_latent:].contiguous())
+        kv_rope_padded = torch.zeros(128, rope_fp8_req.shape[1],
+                                     dtype=rope_fp8_req.dtype, device=rope_fp8_req.device)
+        kv_rope_padded[:QK_ROPE_HEAD_DIM] = rope_fp8_req
         w_kv_rope = self._safe_attach(kv_rope_padded, f"mtp_{attn}kv_a_rope")
-        rope_scale_ue8m0 = self._convert_scale_inv_to_ue8m0(
-            kv_a_s[scale_rows_latent:].contiguous(),
-            128, kv_a_w.shape[1])
-        s_kv_rope = self._safe_attach(rope_scale_ue8m0, f"mtp_{attn}kv_a_rope_scale")
+        rope_ue8m0_padded = torch.zeros(128, rope_ue8m0_req.shape[1],
+                                        dtype=rope_ue8m0_req.dtype, device=rope_ue8m0_req.device)
+        rope_ue8m0_padded[:QK_ROPE_HEAD_DIM] = rope_ue8m0_req
+        s_kv_rope = self._safe_attach(rope_ue8m0_padded, f"mtp_{attn}kv_a_rope_scale")
 
         self._fp8_linear(self.rmsnorm_out, w_kv_latent, s_kv_latent, self.c_latent_out,
                          grid_dim=(grid_for_rmsnorm_linear_layer(self.kv_lora_rank), 1, 1),
@@ -1133,8 +1134,21 @@ class DeepSeekV3Builder(GraphBuilder):
 
     def _build_moe_mlp_with_prefix(self, prefix: str, state_dict: dict):
         """Build MoE MLP using a custom weight prefix (FP8, for MTP reuse)."""
-        mlp_prefix = f"{prefix}mlp."
         mbt = self.max_num_batched_tokens
+
+        # Skip MoE if flagged (group GEMM kernel has batch_size issues)
+        skip_level = int(os.environ.get("MPK_SKIP_MOE_EXPERTS", "0"))
+        if skip_level >= 1:
+            self.mlp_out = self.mpk.new_tensor(
+                dims=(mbt, self.hidden_size), dtype=bfloat16,
+                name=f"mtp_moe_output_zero", io_category="cuda_tensor")
+            self.mpk.tensor_init_layer(
+                input=self.mlp_out, dummy_input=self.rmsnorm_out,
+                dummy_output=self.rmsnorm_out,
+                grid_dim=(mbt, 1, 1), block_dim=(128, 1, 1))
+            return
+
+        mlp_prefix = f"{prefix}mlp."
 
         # Router (BF16 — gate.weight is BF16)
         w_gate = self.mpk.attach_input(
@@ -1282,11 +1296,11 @@ class DeepSeekV3Builder(GraphBuilder):
         if self.mtp_config is None:
             return
 
-        from ...speculative import MTPConfig
-        if not isinstance(self.mtp_config, MTPConfig):
+        from ...speculative import LookaheadConfig
+        if not isinstance(self.mtp_config, LookaheadConfig):
             return
 
-        num_draft_steps = self.mtp_config.num_speculative_tokens
+        num_draft_steps = self.mtp_config.spec_length
         # Checkpoint stores MTP layer at model.layers.{num_hidden_layers}
         # (e.g., model.layers.61 for DeepSeek V3 with 61 main layers)
         mtp_layer_idx = self.num_layers  # 61

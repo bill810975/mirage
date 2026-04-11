@@ -382,7 +382,7 @@ if __name__ == "__main__":
 
         # MTP speculative decoding config
         if args.mtp:
-            spec_decode_config = mi.mpk.spec_decode_class(
+            spec_decode_config = mi.speculative.spec_decode_class(
                 "lookahead",
                 ngram_size=3,
                 spec_length=args.num_speculative_tokens,
