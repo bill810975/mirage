@@ -10,6 +10,7 @@ Weight absorption: at load time, kv_b_proj is absorbed into q_b_proj so that
 runtime only needs compressed KV cache [c_latent(512), k_pe(64)] = 576 dims.
 """
 
+import os
 import torch
 from typing import Optional
 
@@ -388,15 +389,25 @@ class DeepSeekV3Builder(GraphBuilder):
 
     def _attach_fp8_weight(self, state_dict, key, name):
         """Attach FP8 weight + scale_inv (converted to UE8M0), or BF16 weight."""
-        w = self._safe_attach(state_dict[key], name)
         scale_key = f"{key}_scale_inv"
-        if scale_key in state_dict:
+        # ABLATION: dequant FP8→BF16 to test if UE8M0 precision causes token=0
+        if scale_key in state_dict and os.environ.get("MPK_BF16_BYPASS"):
+            raw_w = state_dict[key]
+            raw_s = state_dict[scale_key]
+            w_bf16 = (raw_w.float() * raw_s.float().repeat_interleave(
+                128, dim=0)[:raw_w.shape[0]].repeat_interleave(
+                128, dim=1)[:, :raw_w.shape[1]]).to(torch.bfloat16)
+            w = self._safe_attach(w_bf16, name)
+            s = None
+        elif scale_key in state_dict:
+            w = self._safe_attach(state_dict[key], name)
             weight = state_dict[key]
             output_size, reduction_size = weight.shape[0], weight.shape[1]
             scale_ue8m0 = self._convert_scale_inv_to_ue8m0(
                 state_dict[scale_key], output_size, reduction_size)
             s = self._safe_attach(scale_ue8m0, f"{name}_scale")
         else:
+            w = self._safe_attach(state_dict[key], name)
             s = None  # weight is already BF16 (post-dequant)
         return w, s
 
@@ -433,7 +444,24 @@ class DeepSeekV3Builder(GraphBuilder):
         kv_a_s_key = f"{attn}kv_a_proj_with_mqa.weight_scale_inv"
         has_kv_scale = kv_a_s_key in state_dict
 
-        if has_kv_scale:
+        if has_kv_scale and os.environ.get("MPK_BF16_BYPASS"):
+            # ABLATION: dequant kv_a to BF16
+            kv_a_s = state_dict[kv_a_s_key]
+            kv_bf16 = (kv_a_w.float() * kv_a_s.float().repeat_interleave(
+                128, dim=0)[:kv_a_w.shape[0]].repeat_interleave(
+                128, dim=1)[:, :kv_a_w.shape[1]]).to(torch.bfloat16)
+            w_kv_latent = self._safe_attach(
+                kv_bf16[:self.kv_lora_rank].contiguous(),
+                f"layer_{layer_idx}_kv_a_latent")
+            s_kv_latent = None
+            kv_rope_bf16 = kv_bf16[self.kv_lora_rank:].contiguous()
+            kv_rope_padded = torch.zeros(128, kv_rope_bf16.shape[1],
+                                         dtype=torch.bfloat16, device=kv_rope_bf16.device)
+            kv_rope_padded[:QK_ROPE_HEAD_DIM] = kv_rope_bf16
+            w_kv_rope = self._safe_attach(kv_rope_padded,
+                                          f"layer_{layer_idx}_kv_a_rope")
+            s_kv_rope = None
+        elif has_kv_scale:
             kv_a_s = state_dict[kv_a_s_key]
             scale_rows_total = kv_a_s.shape[0]
             latent_ratio = self.kv_lora_rank / (self.kv_lora_rank + QK_ROPE_HEAD_DIM)
