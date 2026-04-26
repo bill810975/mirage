@@ -3916,6 +3916,7 @@ int TaskRegister::register_mla_mtp_decode_sm100_task(
   code.e("  int qo_lp_ = runtime_config.qo_indptr_buffer[bi_ + 1];");
   code.e("  int q_len_rt_ = qo_lp_ - qo_fp_;");
   code.e("  if (q_len_rt_ < 1) q_len_rt_ = 1;");
+  code.e("  if (q_len_rt_ > 8) return;");
   code.e("  if (q_len_rt_ > $) q_len_rt_ = $;", q_len, q_len);
   // Template dispatch on SINGLE_TILE
   if (single_tile) {
@@ -3969,6 +3970,7 @@ int TaskRegister::register_mla_mtp_reduce_sm100_task(
   code.e("  int qo_lp_ = runtime_config.qo_indptr_buffer[bi_ + 1];");
   code.e("  int q_len_rt_ = qo_lp_ - qo_fp_;");
   code.e("  if (q_len_rt_ < 1) q_len_rt_ = 1;");
+  code.e("  if (q_len_rt_ > 8) return;");
   code.e("  if (q_len_rt_ > $) q_len_rt_ = $;", q_len, q_len);
   // 256 threads for MPK workers (default template is 512 for standalone)
   code.e("  kernel::mla_mtp_reduce_sm100_task_impl<256>(");
@@ -4463,6 +4465,69 @@ int TaskRegister::register_mla_kv_gather_split_sm100_task(
                                code.to_string());
 }
 
+int TaskRegister::register_mla_kv_gather_unified_sm100_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  // Unified variant for the chunked-prefill flow. It appends new KV to the
+  // paged cache once, then writes either the decode layout (contiguous_kv) or
+  // the prefill layout (ckv_sep/kpe_sep) based on runtime Q_LEN.
+  (void)bgraph;
+  assert(params.size() == 3);
+
+  int d_k = params[0];
+  int d_v = params[1];
+  int page_size = params[2];
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  constexpr int k_pe_row_stride = 128;
+  code.e("{");
+  code.e("  int bi_ = task_desc->task_metadata.request_id;");
+  code.e("  int qo_fp_ = runtime_config.qo_indptr_buffer[bi_];");
+  code.e("  int fp_ = runtime_config.paged_kv_indptr_buffer[bi_];");
+  code.e("  int lp_ = runtime_config.paged_kv_indptr_buffer[bi_ + 1];");
+  code.e("  int S_ = (lp_ - fp_ - 1) * MPK_PAGE_SIZE + "
+         "runtime_config.paged_kv_last_page_len_buffer[bi_];");
+  code.e("  auto *c_latent_new_ptr_ = static_cast<const "
+         "nv_bfloat16*>(task_desc->input_ptrs[0]) + "
+         "qo_fp_ * $;",
+         d_v);
+  code.e("  auto *k_pe_new_ptr_ = static_cast<const "
+         "nv_bfloat16*>(task_desc->input_ptrs[1]) + "
+         "qo_fp_ * $;",
+         k_pe_row_stride);
+  code.e("  auto *contiguous_kv_ptr_ = "
+         "static_cast<nv_bfloat16*>(task_desc->input_ptrs[3]) + "
+         "bi_ * S_ * $;",
+         d_k);
+  code.e("  auto *ckv_sep_ptr_ = "
+         "static_cast<nv_bfloat16*>(task_desc->input_ptrs[4]) + "
+         "bi_ * MPK_MAX_SEQ_LENGTH * $;",
+         d_v);
+  code.e("  auto *kpe_sep_ptr_ = "
+         "static_cast<nv_bfloat16*>(task_desc->input_ptrs[5]) + "
+         "bi_ * MPK_MAX_SEQ_LENGTH * $;",
+         d_k - d_v);
+  code.e("kernel::mla_kv_cache_gather_unified_sm100_task_impl<$, $, $, $>(",
+         d_k,
+         d_v,
+         page_size,
+         k_pe_row_stride);
+  code.e("    c_latent_new_ptr_,");
+  code.e("    k_pe_new_ptr_,");
+  code.e("    task_desc->input_ptrs[2],"); // paged_cache
+  code.e("    contiguous_kv_ptr_,");
+  code.e("    ckv_sep_ptr_,");
+  code.e("    kpe_sep_ptr_,");
+  code.e("    runtime_config.qo_indptr_buffer,");
+  code.e("    runtime_config.paged_kv_indptr_buffer,");
+  code.e("    runtime_config.paged_kv_indices_buffer,");
+  code.e("    runtime_config.paged_kv_last_page_len_buffer,");
+  code.e("    task_desc->task_metadata.request_id);");
+  code.e("}");
+  return register_task_variant(TASK_MLA_KV_GATHER_UNIFIED_SM100,
+                               code.to_string());
+}
+
 int TaskRegister::register_mtp_verify_strict_task(
     threadblock::Graph const &bgraph, std::vector<int> const &params) {
   // params[0]: num_draft_tokens (1-7)
@@ -4595,6 +4660,7 @@ int TaskRegister::register_mla_mtp_decode_tp2_sm100_task(
   code.e("  int qo_lp_ = runtime_config.qo_indptr_buffer[bi_ + 1];");
   code.e("  int q_len_rt_ = qo_lp_ - qo_fp_;");
   code.e("  if (q_len_rt_ < 1) q_len_rt_ = 1;");
+  code.e("  if (q_len_rt_ > 8) return;");
   code.e("  if (q_len_rt_ > $) q_len_rt_ = $;", q_len, q_len);
   if (single_tile) {
     code.e("  kernel::mla_mtp_tp2::mla_mtp_tp2_main<true>(");
@@ -4640,6 +4706,7 @@ int TaskRegister::register_mla_mtp_decode_tp2_reduce_sm100_task(
   code.e("  int qo_lp_ = runtime_config.qo_indptr_buffer[bi_ + 1];");
   code.e("  int q_len_rt_ = qo_lp_ - qo_fp_;");
   code.e("  if (q_len_rt_ < 1) q_len_rt_ = 1;");
+  code.e("  if (q_len_rt_ > 8) return;");
   code.e("  if (q_len_rt_ > $) q_len_rt_ = $;", q_len, q_len);
   code.e("  kernel::mla_mtp_tp2::mla_mtp_tp2_reduce(");
   code.e("      static_cast<const nv_bfloat16*>(task_desc->input_ptrs[0]),");
@@ -4682,6 +4749,7 @@ int TaskRegister::register_mla_mtp_decode_tp4_sm100_task(
   code.e("  int qo_lp_ = runtime_config.qo_indptr_buffer[bi_ + 1];");
   code.e("  int q_len_rt_ = qo_lp_ - qo_fp_;");
   code.e("  if (q_len_rt_ < 1) q_len_rt_ = 1;");
+  code.e("  if (q_len_rt_ > 8) return;");
   code.e("  if (q_len_rt_ > $) q_len_rt_ = $;", q_len, q_len);
   if (single_tile) {
     code.e("  kernel::mla_mtp_tp4::mla_mtp_tp4_main<true>(");
@@ -4730,6 +4798,7 @@ int TaskRegister::register_mla_mtp_decode_tp4_reduce_sm100_task(
   code.e("  int qo_lp_ = runtime_config.qo_indptr_buffer[bi_ + 1];");
   code.e("  int q_len_rt_ = qo_lp_ - qo_fp_;");
   code.e("  if (q_len_rt_ < 1) q_len_rt_ = 1;");
+  code.e("  if (q_len_rt_ > 8) return;");
   code.e("  if (q_len_rt_ > $) q_len_rt_ = $;", q_len, q_len);
   code.e("  kernel::mla_mtp_tp4::mla_mtp_tp4_reduce(");
   code.e("      static_cast<const nv_bfloat16*>(task_desc->input_ptrs[0]),");
@@ -4773,6 +4842,7 @@ int TaskRegister::register_mla_mtp_decode_tp8_sm100_task(
   code.e("  int qo_lp_ = runtime_config.qo_indptr_buffer[bi_ + 1];");
   code.e("  int q_len_real_rt_ = qo_lp_ - qo_fp_;");
   code.e("  if (q_len_real_rt_ < 1) q_len_real_rt_ = 1;");
+  code.e("  if (q_len_real_rt_ > 8) return;");
   code.e(
       "  if (q_len_real_rt_ > $) q_len_real_rt_ = $;", q_len_real, q_len_real);
   code.e("  int q_len_padded_rt_ = q_len_real_rt_ + (q_len_real_rt_ & 1);");
@@ -4821,6 +4891,7 @@ int TaskRegister::register_mla_mtp_decode_tp8_reduce_sm100_task(
   code.e("  int qo_lp_ = runtime_config.qo_indptr_buffer[bi_ + 1];");
   code.e("  int q_len_real_rt_ = qo_lp_ - qo_fp_;");
   code.e("  if (q_len_real_rt_ < 1) q_len_real_rt_ = 1;");
+  code.e("  if (q_len_real_rt_ > 8) return;");
   code.e("  if (q_len_real_rt_ > $) q_len_real_rt_ = $;",
          q_len_padded,
          q_len_padded);

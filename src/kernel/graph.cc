@@ -813,6 +813,11 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
         customized->bgraph, params);
     task_config[op] =
         std::make_tuple(5, 0, TASK_MLA_KV_GATHER_SPLIT_SM100, variant_id);
+  } else if (name == "mla_kv_gather_unified_sm100") {
+    int variant_id = task_register->register_mla_kv_gather_unified_sm100_task(
+        customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(6, 0, TASK_MLA_KV_GATHER_UNIFIED_SM100, variant_id);
   }
   // MTP tasks
   else if (name == "mtp_verify_strict") {

@@ -486,6 +486,11 @@ void register_mugraph(
             if (task_type == TASK_MLA_KV_GATHER_SM100) {
               task.task_metadata.request_id = bid.x;
             }
+            // Unified MLA KV gather: same grid/request mapping as both
+            // split and non-split variants.
+            if (task_type == TASK_MLA_KV_GATHER_UNIFIED_SM100) {
+              task.task_metadata.request_id = bid.x;
+            }
             // Set request_id for FP8 quantize (row index for column-major scale
             // output)
             if (task_type == TASK_QUANTIZE_FP8_SM100) {
@@ -1354,6 +1359,8 @@ TaskGraphResult print_task_graph(
   task_type_to_name[TASK_MLA_KV_GATHER_SM100] = "TASK_MLA_KV_GATHER_SM100";
   task_type_to_name[TASK_MLA_KV_GATHER_SPLIT_SM100] =
       "TASK_MLA_KV_GATHER_SPLIT_SM100";
+  task_type_to_name[TASK_MLA_KV_GATHER_UNIFIED_SM100] =
+      "TASK_MLA_KV_GATHER_UNIFIED_SM100";
   task_type_to_name[TASK_MTP_VERIFY_STRICT] = "TASK_MTP_VERIFY_STRICT";
   task_type_to_name[TASK_MTP_ACCEPT_COMMIT] = "TASK_MTP_ACCEPT_COMMIT";
   task_type_to_name[TASK_MTP_TOKEN_SCATTER] = "TASK_MTP_TOKEN_SCATTER";

@@ -693,26 +693,27 @@ class DeepSeekV3Builder(GraphBuilder):
         decode_q_len_mla = min(q_len_mla, 8)
         kv_len_max = self.mpk.max_seq_length
         if self._use_prefill:
-            self.mpk.mla_kv_gather_split_layer(
+            self.mpk.mla_kv_gather_unified_layer(
                 c_latent_new=self.c_latent_out,
                 k_pe_new=self.k_pe_out,
                 paged_cache=layer_cache,
+                contiguous_kv=self.contiguous_kv,
                 ckv_sep=self.ckv_sep,
                 kpe_sep=self.kpe_sep,
                 mla_params=(self.qk_head_dim, self.v_head_dim, self.mpk.page_size),
                 grid_dim=(self.mpk.max_num_batched_requests, 1, 1),
                 block_dim=(128, 1, 1),
             )
-
-        self.mpk.mla_kv_gather_layer(
-            c_latent_new=self.c_latent_out,
-            k_pe_new=self.k_pe_out,
-            paged_cache=layer_cache,
-            contiguous_kv=self.contiguous_kv,
-            mla_params=(self.qk_head_dim, self.v_head_dim, self.mpk.page_size),
-            grid_dim=(self.mpk.max_num_batched_requests, 1, 1),
-            block_dim=(128, 1, 1),
-        )
+        else:
+            self.mpk.mla_kv_gather_layer(
+                c_latent_new=self.c_latent_out,
+                k_pe_new=self.k_pe_out,
+                paged_cache=layer_cache,
+                contiguous_kv=self.contiguous_kv,
+                mla_params=(self.qk_head_dim, self.v_head_dim, self.mpk.page_size),
+                grid_dim=(self.mpk.max_num_batched_requests, 1, 1),
+                block_dim=(128, 1, 1),
+            )
         if self._use_prefill:
             self.mpk.mla_unified_layer(
                 self.q_nope, self.q_pe,
@@ -1343,25 +1344,27 @@ class DeepSeekV3Builder(GraphBuilder):
         decode_q_len_mla = min(q_len_mla, 8)
         kv_len_max = self.mpk.max_seq_length
         if self._use_prefill:
-            self.mpk.mla_kv_gather_split_layer(
+            self.mpk.mla_kv_gather_unified_layer(
                 c_latent_new=self.c_latent_out,
                 k_pe_new=self.k_pe_out,
                 paged_cache=self.mtp_ckv_kpe_cache_tensor,
+                contiguous_kv=self.contiguous_kv,
                 ckv_sep=self.ckv_sep,
                 kpe_sep=self.kpe_sep,
                 mla_params=(self.qk_head_dim, self.v_head_dim, self.mpk.page_size),
                 grid_dim=(self.mpk.max_num_batched_requests, 1, 1),
                 block_dim=(128, 1, 1),
             )
-        self.mpk.mla_kv_gather_layer(
-            c_latent_new=self.c_latent_out,
-            k_pe_new=self.k_pe_out,
-            paged_cache=self.mtp_ckv_kpe_cache_tensor,
-            contiguous_kv=self.contiguous_kv,
-            mla_params=(self.qk_head_dim, self.v_head_dim, self.mpk.page_size),
-            grid_dim=(self.mpk.max_num_batched_requests, 1, 1),
-            block_dim=(128, 1, 1),
-        )
+        else:
+            self.mpk.mla_kv_gather_layer(
+                c_latent_new=self.c_latent_out,
+                k_pe_new=self.k_pe_out,
+                paged_cache=self.mtp_ckv_kpe_cache_tensor,
+                contiguous_kv=self.contiguous_kv,
+                mla_params=(self.qk_head_dim, self.v_head_dim, self.mpk.page_size),
+                grid_dim=(self.mpk.max_num_batched_requests, 1, 1),
+                block_dim=(128, 1, 1),
+            )
         if self._use_prefill:
             self.mpk.mla_unified_layer(
                 self.q_nope, self.q_pe,

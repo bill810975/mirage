@@ -952,6 +952,35 @@ class PersistentKernel:
             [c_latent_new, k_pe_new, paged_cache, ckv_sep, kpe_sep], tb_graph)
         self.kn_graph.register_task(tb_graph, "mla_kv_gather_split_sm100", params)
 
+    def mla_kv_gather_unified_layer(
+        self,
+        c_latent_new: DTensor,
+        k_pe_new: DTensor,
+        paged_cache: DTensor,
+        contiguous_kv: DTensor,
+        ckv_sep: DTensor,
+        kpe_sep: DTensor,
+        mla_params: tuple,
+        grid_dim: tuple,
+        block_dim: tuple,
+    ):
+        """Append paged KV once, then gather the layout needed by runtime Q_LEN."""
+        d_k, d_v, page_size = mla_params
+        params = [d_k, d_v, page_size]
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(c_latent_new, (-1, 1, -1), -1, True)
+        tb_graph.new_input(k_pe_new, (-1, 1, -1), -1, True)
+        tb_graph.new_input(paged_cache, (-1, 2, -1), 1, True)
+        tb_graph.new_input(contiguous_kv, (-1, -1, -1), -1, True)
+        tb_graph.new_input(ckv_sep, (-1, -1, -1), -1, True)
+        tb_graph.new_input(kpe_sep, (-1, -1, -1), -1, True)
+        self.kn_graph.customized(
+            [c_latent_new, k_pe_new, paged_cache,
+             contiguous_kv, ckv_sep, kpe_sep],
+            tb_graph,
+        )
+        self.kn_graph.register_task(tb_graph, "mla_kv_gather_unified_sm100", params)
+
     def mla_decode_layer(
         self,
         q_input: DTensor,         # Q tensor (attached with TMA desc)

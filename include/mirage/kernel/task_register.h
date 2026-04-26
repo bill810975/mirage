@@ -174,6 +174,8 @@ public:
                                         std::vector<int> const &params);
   int register_mla_kv_gather_split_sm100_task(threadblock::Graph const &bgraph,
                                               std::vector<int> const &params);
+  int register_mla_kv_gather_unified_sm100_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
   // MTP tasks
   int register_mtp_verify_strict_task(threadblock::Graph const &bgraph,
                                       std::vector<int> const &params);
