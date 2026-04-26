@@ -237,6 +237,15 @@ class DeepSeekV3Builder(GraphBuilder):
         # chunk size, so any graph with mbt > 8 must include the prefill-capable
         # unified MLA path. For mbt <= 8, every chunk fits the decode kernel.
         self._use_prefill = mbt > 8
+        # Direct-paged decode treats the physical page cache as sequence order.
+        # That is only guaranteed for the single-GPU, single-request demo path:
+        # with multiple total requests, even max batch 1 can recycle pages in a
+        # non-zero order after the first request completes.
+        self._direct_paged_decode_kv = (
+            self.world_size == 1
+            and self.mpk.max_num_batched_requests == 1
+            and self.mpk.total_num_requests == 1
+        )
         if self._use_prefill:
             print(f"  [MLA path] Q_LEN={mbt} -> mla_unified_sm100")
         else:
@@ -688,12 +697,15 @@ class DeepSeekV3Builder(GraphBuilder):
         kv_len_max = self.mpk.max_seq_length
         single_split_mla = kv_len_max <= self.mpk.page_size
         mla_decode_out = self.attn_out if single_split_mla else self.mla_partial_o
+        mla_decode_kv = (
+            layer_cache if self._direct_paged_decode_kv else self.contiguous_kv
+        )
         if self._use_prefill:
             self.mpk.mla_kv_gather_unified_layer(
                 c_latent_new=self.c_latent_out,
                 k_pe_new=self.k_pe_out,
                 paged_cache=layer_cache,
-                contiguous_kv=self.contiguous_kv,
+                contiguous_kv=mla_decode_kv,
                 ckv_sep=self.ckv_sep,
                 kpe_sep=self.kpe_sep,
                 mla_params=(self.qk_head_dim, self.v_head_dim, self.mpk.page_size),
@@ -705,7 +717,7 @@ class DeepSeekV3Builder(GraphBuilder):
                 c_latent_new=self.c_latent_out,
                 k_pe_new=self.k_pe_out,
                 paged_cache=layer_cache,
-                contiguous_kv=self.contiguous_kv,
+                contiguous_kv=mla_decode_kv,
                 mla_params=(self.qk_head_dim, self.v_head_dim, self.mpk.page_size),
                 grid_dim=(self.mpk.max_num_batched_requests, 1, 1),
                 block_dim=(128, 1, 1),
@@ -714,7 +726,7 @@ class DeepSeekV3Builder(GraphBuilder):
             self.mpk.mla_unified_layer(
                 self.q_nope, self.q_pe,
                 self.ckv_sep, self.kpe_sep, self.attn_out,
-                self.q_nope_pe, self.contiguous_kv,
+                self.q_nope_pe, mla_decode_kv,
                 mla_decode_out, self.mla_partial_lse,
                 q_len_mla, kv_len_max, self.num_local_q_heads,
                 self.world_size, self.kv_lora_rank,
@@ -739,7 +751,7 @@ class DeepSeekV3Builder(GraphBuilder):
         else:
             if self.world_size == 2:
                 self.mpk.mla_mtp_decode_tp2_layer(
-                    self.q_nope_pe, self.contiguous_kv,
+                    self.q_nope_pe, mla_decode_kv,
                     mla_decode_out, self.mla_partial_lse,
                     q_len_mla, kv_len_max)
                 if not single_split_mla:
@@ -748,7 +760,7 @@ class DeepSeekV3Builder(GraphBuilder):
                         self.attn_out, q_len_mla, kv_len_max)
             elif self.world_size == 4:
                 self.mpk.mla_mtp_decode_tp4_layer(
-                    self.q_nope_pe, self.contiguous_kv,
+                    self.q_nope_pe, mla_decode_kv,
                     mla_decode_out, self.mla_partial_lse,
                     q_len_mla, kv_len_max)
                 if not single_split_mla:
@@ -757,7 +769,7 @@ class DeepSeekV3Builder(GraphBuilder):
                         self.attn_out, q_len_mla, kv_len_max)
             elif self.world_size == 8:
                 self.mpk.mla_mtp_decode_tp8_layer(
-                    self.q_nope_pe, self.contiguous_kv,
+                    self.q_nope_pe, mla_decode_kv,
                     mla_decode_out, self.mla_partial_lse,
                     q_len_mla, kv_len_max)
                 if not single_split_mla:
@@ -766,7 +778,7 @@ class DeepSeekV3Builder(GraphBuilder):
                         self.attn_out, q_len_mla, kv_len_max)
             else:
                 self.mpk.mla_mtp_decode_layer(
-                    self.q_nope_pe, self.contiguous_kv,
+                    self.q_nope_pe, mla_decode_kv,
                     mla_decode_out, self.mla_partial_lse,
                     q_len_mla, kv_len_max)
                 if not single_split_mla:
@@ -1346,12 +1358,17 @@ class DeepSeekV3Builder(GraphBuilder):
         kv_len_max = self.mpk.max_seq_length
         single_split_mla = kv_len_max <= self.mpk.page_size
         mla_decode_out = self.attn_out if single_split_mla else self.mla_partial_o
+        mla_decode_kv = (
+            self.mtp_ckv_kpe_cache_tensor
+            if self._direct_paged_decode_kv
+            else self.contiguous_kv
+        )
         if self._use_prefill:
             self.mpk.mla_kv_gather_unified_layer(
                 c_latent_new=self.c_latent_out,
                 k_pe_new=self.k_pe_out,
                 paged_cache=self.mtp_ckv_kpe_cache_tensor,
-                contiguous_kv=self.contiguous_kv,
+                contiguous_kv=mla_decode_kv,
                 ckv_sep=self.ckv_sep,
                 kpe_sep=self.kpe_sep,
                 mla_params=(self.qk_head_dim, self.v_head_dim, self.mpk.page_size),
@@ -1363,7 +1380,7 @@ class DeepSeekV3Builder(GraphBuilder):
                 c_latent_new=self.c_latent_out,
                 k_pe_new=self.k_pe_out,
                 paged_cache=self.mtp_ckv_kpe_cache_tensor,
-                contiguous_kv=self.contiguous_kv,
+                contiguous_kv=mla_decode_kv,
                 mla_params=(self.qk_head_dim, self.v_head_dim, self.mpk.page_size),
                 grid_dim=(self.mpk.max_num_batched_requests, 1, 1),
                 block_dim=(128, 1, 1),
@@ -1372,7 +1389,7 @@ class DeepSeekV3Builder(GraphBuilder):
             self.mpk.mla_unified_layer(
                 self.q_nope, self.q_pe,
                 self.ckv_sep, self.kpe_sep, self.attn_out,
-                self.q_nope_pe, self.contiguous_kv,
+                self.q_nope_pe, mla_decode_kv,
                 mla_decode_out, self.mla_partial_lse,
                 q_len_mla, kv_len_max, self.num_local_q_heads,
                 self.world_size, self.kv_lora_rank,
@@ -1397,7 +1414,7 @@ class DeepSeekV3Builder(GraphBuilder):
         else:
             if self.world_size == 2:
                 self.mpk.mla_mtp_decode_tp2_layer(
-                    self.q_nope_pe, self.contiguous_kv,
+                    self.q_nope_pe, mla_decode_kv,
                     mla_decode_out, self.mla_partial_lse,
                     q_len_mla, kv_len_max)
                 if not single_split_mla:
@@ -1406,7 +1423,7 @@ class DeepSeekV3Builder(GraphBuilder):
                         self.attn_out, q_len_mla, kv_len_max)
             elif self.world_size == 4:
                 self.mpk.mla_mtp_decode_tp4_layer(
-                    self.q_nope_pe, self.contiguous_kv,
+                    self.q_nope_pe, mla_decode_kv,
                     mla_decode_out, self.mla_partial_lse,
                     q_len_mla, kv_len_max)
                 if not single_split_mla:
@@ -1415,7 +1432,7 @@ class DeepSeekV3Builder(GraphBuilder):
                         self.attn_out, q_len_mla, kv_len_max)
             elif self.world_size == 8:
                 self.mpk.mla_mtp_decode_tp8_layer(
-                    self.q_nope_pe, self.contiguous_kv,
+                    self.q_nope_pe, mla_decode_kv,
                     mla_decode_out, self.mla_partial_lse,
                     q_len_mla, kv_len_max)
                 if not single_split_mla:
@@ -1424,7 +1441,7 @@ class DeepSeekV3Builder(GraphBuilder):
                         self.attn_out, q_len_mla, kv_len_max)
             else:
                 self.mpk.mla_mtp_decode_layer(
-                    self.q_nope_pe, self.contiguous_kv,
+                    self.q_nope_pe, mla_decode_kv,
                     mla_decode_out, self.mla_partial_lse,
                     q_len_mla, kv_len_max)
                 if not single_split_mla:

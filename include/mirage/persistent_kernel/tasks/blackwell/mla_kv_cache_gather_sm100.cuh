@@ -107,6 +107,10 @@ __device__ __forceinline__ void mla_kv_cache_gather_sm100_task_impl(
   }
   __syncthreads();
 
+  if (contiguous_kv_ptr == paged_cache_ptr) {
+    return;
+  }
+
   // Step 2: Gather all pages into contiguous buffer
   // For each sequence position, copy D_K elements from the paged cache
   // to the contiguous buffer
@@ -200,6 +204,9 @@ __device__ __forceinline__ void mla_kv_cache_gather_unified_sm100_task_impl(
   // prefill. Only materialize the layout the selected attention branch will
   // consume.
   bool const use_prefill_layout = num_new_tokens >= 9;
+  if (!use_prefill_layout && contiguous_kv_ptr == paged_cache_ptr) {
+    return;
+  }
   for (int seq_pos = 0; seq_pos < seq_len; seq_pos++) {
     int const page_idx = page_indices[seq_pos / PAGE_SIZE];
     int const pos_in_page = seq_pos % PAGE_SIZE;
