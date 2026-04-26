@@ -4,6 +4,7 @@
 # Default case mirrors the local stress/profile workflow.  Set
 # CASE=tiny_nomtp_decode to reproduce the small-QLen non-MTP decode regression:
 #   CASE=tiny_nomtp_decode TP=4 GPUS=0,1,4,6 bash demo/deepseek_v3/stress_tp.sh
+# CASE=tiny_nomtp_prefill_tail covers the sub-128 prefill-tail shape.
 set -euo pipefail
 
 CASE="${CASE:-stress}"
@@ -59,6 +60,18 @@ case "$CASE" in
   tiny_nomtp_decode)
     LAYERS="${LAYERS:-0-0}"
     MBT="${MBT:-1}"
+    MTP="${MTP:-0}"
+    MAX_SEQ="${MAX_SEQ:-16}"
+    CASE_ARGS=(
+      --layers "$LAYERS"
+      --mtp "$MTP"
+      --max-num-batched-tokens "$MBT"
+      --max-seq-length "$MAX_SEQ"
+    )
+    ;;
+  tiny_nomtp_prefill_tail)
+    LAYERS="${LAYERS:-0-0}"
+    MBT="${MBT:-127}"
     MTP="${MTP:-0}"
     MAX_SEQ="${MAX_SEQ:-16}"
     CASE_ARGS=(
