@@ -11,30 +11,32 @@ static constexpr int kPrefillMinQLen = 9;
 static constexpr int kDecodeMaxQLen = 8;
 
 template <bool SINGLE_TILE, int TP_SIZE>
-__device__ __noinline__ void mla_unified_sm100_task_impl(
-    nv_bfloat16 const *__restrict__ q_nope,
-    nv_bfloat16 const *__restrict__ q_pe,
-    nv_bfloat16 const *__restrict__ ckv,
-    nv_bfloat16 const *__restrict__ kpe,
-    nv_bfloat16 *__restrict__ out,
-    CUtensorMap const *q_tm_ptr,
-    CUtensorMap const *kv_tm_ptr,
-    nv_bfloat16 *__restrict__ partial_o,
-    float *__restrict__ partial_lse,
-    int prefill_s,
-    int decode_kv_len,
-    int prefill_q_len,
-    int decode_q_len,
-    int decode_q_len_padded,
-    int num_heads,
-    float sm_scale_log2,
-    float sm_scale,
-    int num_splits,
-    int num_decode_groups,
-    int qpg,
-    int meta_x,
-    int meta_y,
-    int meta_z) {
+__device__ __noinline__ void
+    mla_unified_sm100_task_impl(nv_bfloat16 const *__restrict__ q_nope,
+                                nv_bfloat16 const *__restrict__ q_pe,
+                                nv_bfloat16 const *__restrict__ ckv,
+                                nv_bfloat16 const *__restrict__ kpe,
+                                nv_bfloat16 *__restrict__ out,
+                                CUtensorMap const *q_tm_ptr,
+                                CUtensorMap const *kv_tm_ptr,
+                                nv_bfloat16 *__restrict__ partial_o,
+                                float *__restrict__ partial_lse,
+                                int prefill_s,
+                                int decode_kv_len,
+                                int prefill_q_len,
+                                int decode_q_len,
+                                int decode_q_len_padded,
+                                int num_heads,
+                                float sm_scale_log2,
+                                float sm_scale,
+                                int num_splits,
+                                int num_decode_groups,
+                                int qpg,
+                                int const *__restrict__ page_indices,
+                                int first_page_pos,
+                                int meta_x,
+                                int meta_y,
+                                int meta_z) {
   if (prefill_q_len >= kPrefillMinQLen) {
     if (meta_x < num_heads) {
       kernel::mla_prefill_sm100_task_impl(q_nope,
@@ -82,6 +84,8 @@ __device__ __noinline__ void mla_unified_sm100_task_impl(
                                                        num_splits,
                                                        decode_q_len,
                                                        qpg,
+                                                       page_indices,
+                                                       first_page_pos,
                                                        meta_x,
                                                        meta_y);
   } else if constexpr (TP_SIZE == 4) {
@@ -94,6 +98,8 @@ __device__ __noinline__ void mla_unified_sm100_task_impl(
                                                        num_splits,
                                                        decode_q_len,
                                                        qpg,
+                                                       page_indices,
+                                                       first_page_pos,
                                                        meta_x,
                                                        meta_y);
   } else if constexpr (TP_SIZE == 8) {
@@ -106,6 +112,8 @@ __device__ __noinline__ void mla_unified_sm100_task_impl(
                                                        num_splits,
                                                        decode_q_len_padded,
                                                        qpg,
+                                                       page_indices,
+                                                       first_page_pos,
                                                        decode_q_len,
                                                        meta_x,
                                                        meta_y);

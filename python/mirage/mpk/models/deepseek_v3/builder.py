@@ -244,14 +244,19 @@ class DeepSeekV3Builder(GraphBuilder):
         # chunk size, so any graph with mbt > 8 must include the prefill-capable
         # unified MLA path. For mbt <= 8, every chunk fits the decode kernel.
         self._use_prefill = mbt > 8
-        # Direct-paged decode treats the physical page cache as sequence order.
-        # That is only guaranteed for the single-GPU, single-request demo path:
-        # with multiple total requests, even max batch 1 can recycle pages in a
-        # non-zero order after the first request completes.
-        self._direct_paged_decode_kv = (
+        # Direct-paged decode skips the dense KV gather copy. TP decode kernels
+        # consume the runtime page table directly; TP1 still relies on physical
+        # page order, so only enable that legacy shortcut for the single-request
+        # demo path.
+        direct_paged_tp_decode = self.world_size in (2, 4, 8)
+        direct_paged_tp1_decode = (
             self.world_size == 1
             and self.mpk.max_num_batched_requests == 1
             and self.mpk.total_num_requests == 1
+        )
+        self._direct_paged_decode_kv = (
+            self.mpk.page_size == 128
+            and (direct_paged_tp_decode or direct_paged_tp1_decode)
         )
         if self._use_prefill:
             print(f"  [MLA path] Q_LEN={mbt} -> mla_unified_sm100")
