@@ -1449,13 +1449,19 @@ __host__ inline void fill_tma_desc_by_task(CUtensorMap *tma_desc,
         if (num_heads < 1) {
           num_heads = 128;
         }
-        int q_len = total_rows / num_heads;
-        if (q_len < 1) {
-          q_len = 1;
-        }
         int q_box_rows = num_heads;
         if (num_heads == 128) {
-          q_box_rows = num_heads / q_len;
+          // The unified task compiles the TP1 decode branch for Q_LEN<=8 even
+          // when the backing tensor is sized for a larger prefill MBT. Match
+          // the decode kernel's hpb instead of deriving it from the full MBT.
+          int decode_q_len = tensor_desc.dim[0];
+          if (decode_q_len < 1) {
+            decode_q_len = 1;
+          }
+          if (decode_q_len > 8) {
+            decode_q_len = 8;
+          }
+          q_box_rows = num_heads / decode_q_len;
           while (q_box_rows > 0 && num_heads % q_box_rows != 0) {
             q_box_rows--;
           }
