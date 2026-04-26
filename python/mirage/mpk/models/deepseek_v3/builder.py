@@ -232,17 +232,11 @@ class DeepSeekV3Builder(GraphBuilder):
         """Allocate intermediate computation buffers."""
         mbt = self.max_num_batched_tokens
 
-        # Pick the MLA kernel at compile time based on max_num_batched_tokens.
-        # Large Q_LEN uses the mla_prefill_sm100 chunked-prefill kernel (which
-        # is designed for that regime); runtime Q_LEN <= 8 uses the MLA decode
-        # / MTP decode kernels. The compile-time threshold of 32 keeps MTP
-        # decode graphs on the decode path, while chunked-prefill tails with
-        # runtime Q_LEN > 8 still go through prefill. The MPK scheduler still
-        # dynamically caps per-iter
-        # num_new_tokens via paged_kv_indptr — prefill phase uses chunk=mbt,
-        # decode phase uses chunk=1 — so a single compiled graph handles both
-        # phases correctly at the same mbt budget.
-        self._use_prefill = mbt >= 32
+        # Runtime Q_LEN decides the MLA algorithm: Q_LEN <= 8 is decode/MTP
+        # verify, Q_LEN >= 9 is prefill. MBT only caps the maximum prefill
+        # chunk size, so any graph with mbt > 8 must include the prefill-capable
+        # unified MLA path. For mbt <= 8, every chunk fits the decode kernel.
+        self._use_prefill = mbt > 8
         if self._use_prefill:
             print(f"  [MLA path] Q_LEN={mbt} -> mla_unified_sm100")
         else:

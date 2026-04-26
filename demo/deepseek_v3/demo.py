@@ -168,14 +168,6 @@ if __name__ == "__main__":
           f"ckv_kpe_dim={ckv_kpe_dim}")
 
     total_num_requests = 1 if not args.use_mirage else args.max_num_batched_requests
-    requested_mbt = args.max_num_batched_tokens
-    if args.use_mirage and args.mtp == 0 and args.max_num_batched_tokens < 128:
-        args.max_num_batched_tokens = 128
-        print(
-            "[deepseek_v3] MTP=0 requires an internal "
-            f"max_num_batched_tokens >= 128 on the current MPK kernels; "
-            f"using 128 instead of requested {requested_mbt}."
-        )
 
     # Allocate token buffers
     tokens = torch.full(

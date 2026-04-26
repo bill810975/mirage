@@ -6,6 +6,7 @@
 #   CASE=tiny_nomtp_decode TP=4 GPUS=0,1,4,6 bash demo/deepseek_v3/stress_tp.sh
 # CASE=tiny_nomtp_prefill_tail covers the sub-128 prefill-tail shape.
 # CASE=tiny_nomtp_prompt1 covers the single-token prompt MTP=0 regression.
+# CASE=tiny_nomtp_mbt16_prefill covers the 8<MBT<32 prefill path.
 set -euo pipefail
 
 CASE="${CASE:-stress}"
@@ -90,6 +91,29 @@ case "$CASE" in
     BATCH="${BATCH:-1}"
     MTP="${MTP:-0}"
     MAX_SEQ="${MAX_SEQ:-32}"
+    PAGES_PER_REQ=$(((MAX_SEQ + 127) / 128))
+    MAX_PAGES="${MAX_PAGES:-$((PAGES_PER_REQ * BATCH + 16))}"
+    CASE_ARGS=(
+      --layers "$LAYERS"
+      --mtp "$MTP"
+      --max-num-batched-tokens "$MBT"
+      --max-num-batched-requests "$BATCH"
+      --prompt-length "$PROMPT_LEN"
+      --max-new-tokens "$DECODE"
+      --max-seq-length "$MAX_SEQ"
+      --max-num-pages "$MAX_PAGES"
+      --page-size 128
+      --ignore-eos
+    )
+    ;;
+  tiny_nomtp_mbt16_prefill)
+    LAYERS="${LAYERS:-0-0}"
+    PROMPT_LEN="${PROMPT_LEN:-16}"
+    DECODE="${DECODE:-2}"
+    MBT="${MBT:-16}"
+    BATCH="${BATCH:-1}"
+    MTP="${MTP:-0}"
+    MAX_SEQ="${MAX_SEQ:-64}"
     PAGES_PER_REQ=$(((MAX_SEQ + 127) / 128))
     MAX_PAGES="${MAX_PAGES:-$((PAGES_PER_REQ * BATCH + 16))}"
     CASE_ARGS=(
