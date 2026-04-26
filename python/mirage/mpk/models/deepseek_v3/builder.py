@@ -60,6 +60,13 @@ def _moe_fp8_m_split(output_size: int, preferred: int) -> int:
     return 1
 
 
+def _moe_expert_grid_x(max_num_batched_tokens: int) -> int:
+    # The MoE kernels iterate over the compact activated-expert list with a
+    # stride equal to grid_dim.x. A batch can activate at most top_k experts per
+    # token, so smaller MBT graphs do not need one CTA per model expert.
+    return min(NUM_EXPERTS, max_num_batched_tokens * NUM_EXPERTS_PER_TOK)
+
+
 @register_model_builder("deepseek-v3", "DeepSeek-V3", "deepseek-ai/DeepSeek-V3")
 class DeepSeekV3Builder(GraphBuilder):
     def __init__(self, mpk: PersistentKernel, weights: Optional[dict] = None):
@@ -945,6 +952,7 @@ class DeepSeekV3Builder(GraphBuilder):
         else:
             s_experts_w13 = None
         mbt = self.max_num_batched_tokens
+        moe_expert_grid_x = _moe_expert_grid_x(mbt)
         if use_fp8_experts:
             # Quantize input for MoE FP8
             moe_input_fp8 = self.mpk.new_tensor(
@@ -982,7 +990,7 @@ class DeepSeekV3Builder(GraphBuilder):
                 moe_routing_indices=moe_routing_indices,
                 moe_mask=moe_mask,
                 output=moe_mid,
-                grid_dim=(NUM_EXPERTS, w13_m_split, 1),
+                grid_dim=(moe_expert_grid_x, w13_m_split, 1),
                 block_dim=(128, 1, 1),
             )
         else:
@@ -992,7 +1000,7 @@ class DeepSeekV3Builder(GraphBuilder):
                 moe_routing_indices=moe_routing_indices,
                 moe_mask=moe_mask,
                 output=moe_mid,
-                grid_dim=(NUM_EXPERTS, 1, 1),
+                grid_dim=(moe_expert_grid_x, 1, 1),
                 block_dim=(128, 1, 1),
             )
 
@@ -1060,7 +1068,7 @@ class DeepSeekV3Builder(GraphBuilder):
                 moe_routing_indices=moe_routing_indices,
                 moe_mask=moe_mask,
                 output=moe_down_out,
-                grid_dim=(NUM_EXPERTS, w2_m_split, 1),
+                grid_dim=(moe_expert_grid_x, w2_m_split, 1),
                 block_dim=(128, 1, 1),
             )
         else:
@@ -1070,7 +1078,7 @@ class DeepSeekV3Builder(GraphBuilder):
                 moe_routing_indices=moe_routing_indices,
                 moe_mask=moe_mask,
                 output=moe_down_out,
-                grid_dim=(NUM_EXPERTS, 1, 1),
+                grid_dim=(moe_expert_grid_x, 1, 1),
                 block_dim=(128, 1, 1),
             )
 
@@ -1565,12 +1573,13 @@ class DeepSeekV3Builder(GraphBuilder):
             dtype=bfloat16, name="mtp_moe_mid", io_category="cuda_tensor")
         mtp_w13_m_split = _moe_fp8_m_split(2 * self.moe_intermediate_size,
                                            preferred=2)
+        mtp_moe_expert_grid_x = _moe_expert_grid_x(mbt)
         self.mpk.moe_w13_fp8_layer(
             input_fp8=moe_input_fp8, input_scale=moe_input_scale,
             weight_fp8=w_w13, weight_scale=s_w13,
             moe_routing_indices=moe_routing_indices, moe_mask=moe_mask,
             output=moe_mid,
-            grid_dim=(NUM_EXPERTS, mtp_w13_m_split, 1),
+            grid_dim=(mtp_moe_expert_grid_x, mtp_w13_m_split, 1),
             block_dim=(128, 1, 1))
 
         moe_silu_out = self._cached_new_tensor(
@@ -1611,7 +1620,7 @@ class DeepSeekV3Builder(GraphBuilder):
             weight_fp8=w_w2, weight_scale=s_w2,
             moe_routing_indices=moe_routing_indices, moe_mask=moe_mask,
             output=moe_down_out,
-            grid_dim=(NUM_EXPERTS, mtp_w2_m_split, 1),
+            grid_dim=(mtp_moe_expert_grid_x, mtp_w2_m_split, 1),
             block_dim=(128, 1, 1))
 
         # Shared expert (FP8) — same pattern as main MoE shared expert:
