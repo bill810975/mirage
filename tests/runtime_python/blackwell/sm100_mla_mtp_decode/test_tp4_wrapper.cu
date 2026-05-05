@@ -34,20 +34,21 @@ __global__ __launch_bounds__(TB) void shim_main(
     int Q_LEN,
     int qpg) {
   // Pack the V split (blockIdx.z) into block_x — Mirage MPK has no z-dim.
+  // blockIdx.x already includes the optional head-group field.
   int block_x_packed = blockIdx.x * V_SPLITS + blockIdx.z;
-  mla_mtp_tp4_main<SINGLE_TILE>(&Q_tm,
-                                &KV_tm,
-                                Oa,
-                                La,
-                                ss,
-                                kv_len,
-                                sk,
-                                Q_LEN,
-                                qpg,
-                                nullptr,
-                                0,
-                                block_x_packed,
-                                blockIdx.y);
+  mla_mtp_tp4_main<SINGLE_TILE, false>(&Q_tm,
+                                       &KV_tm,
+                                       Oa,
+                                       La,
+                                       ss,
+                                       kv_len,
+                                       sk,
+                                       Q_LEN,
+                                       qpg,
+                                       nullptr,
+                                       0,
+                                       block_x_packed,
+                                       blockIdx.y);
 }
 
 __global__ __launch_bounds__(RD_TB, 4) void shim_reduce(nv_bfloat16 const *Oa,
@@ -268,7 +269,7 @@ int main(int argc, char **argv) {
                          SMEM_SIZE);
 
     auto run_main = [&]() {
-      dim3 g(num_groups * sk, B, V_SPLITS);
+      dim3 g(num_groups * sk * HEAD_GROUPS, B, V_SPLITS);
       if (single_tile) {
         shim_main<true>
             <<<g, TB, SMEM_SIZE>>>(Qtm, KVtm, dOa, dLa, ss, KL, sk, Q_LEN, qpg);

@@ -2645,18 +2645,22 @@ class DeepSeekV3Builder(GraphBuilder):
             )
 
         # ---- Verification + Accept/Commit ----
-        # After target model re-runs on draft tokens (managed by scheduler),
-        # the target token IDs are available. Wire up verification here.
-        target_token_ids = self.mpk.new_tensor(
-            dims=(mbt, num_draft_steps + 1), dtype=int64,
-            name="mtp_target_token_ids", io_category="cuda_tensor",
-        )
+        # The verification round is scheduled with input tokens
+        # [main_token, draft_0, ... draft_{K-1}]. The target model argmax for
+        # those K+1 positions is in the runtime output_tokens buffer. Strict
+        # verify compares draft_i against target_argmax_i, then writes the
+        # accepted prefix plus bonus token back to runtime output_tokens.
+        target_token_ids = self.argmax_out_dtensor
+        verify_input_tokens = self.mpk.attach_input(
+            torch_tensor=self.mpk.meta_tensors["input_tokens"],
+            name="mtp_verify_input_tokens")
         accepted_count = self.mpk.new_tensor(
-            dims=(mbt, 1), dtype=int64,
+            dims=(self.mpk.max_num_batched_requests, 1), dtype=int32,
             name="mtp_accepted_count", io_category="cuda_tensor",
         )
         verified_output_tokens = self.mpk.new_tensor(
-            dims=(mbt, num_draft_steps + 1), dtype=int64,
+            dims=(self.mpk.max_num_batched_requests, num_draft_steps + 1),
+            dtype=int64,
             name="mtp_verified_output", io_category="cuda_tensor",
         )
 
@@ -2664,11 +2668,11 @@ class DeepSeekV3Builder(GraphBuilder):
         method = getattr(self.mtp_config, 'rejection_sample_method', 'strict')
         if method == "strict":
             self.mpk.mtp_verify_strict_layer(
-                draft_token_ids=all_draft_ids,
+                draft_token_ids=verify_input_tokens,
                 target_token_ids=target_token_ids,
                 accepted_count=accepted_count,
                 output_tokens=verified_output_tokens,
-                grid_dim=(mbt, 1, 1),
+                grid_dim=(self.mpk.max_num_batched_requests, 1, 1),
                 block_dim=(128, 1, 1),
                 num_draft_tokens=num_draft_steps,
             )
@@ -2724,14 +2728,14 @@ class DeepSeekV3Builder(GraphBuilder):
 
             # Probabilistic verify
             self.mpk.mtp_verify_probabilistic_layer(
-                draft_token_ids=all_draft_ids,
+                draft_token_ids=verify_input_tokens,
                 target_token_ids=target_token_ids,
                 target_probs=target_probs,
                 draft_probs=self._draft_prob_buffer,
                 seed=rng_seed,
                 accepted_count=accepted_count,
                 output_tokens=verified_output_tokens,
-                grid_dim=(mbt, 1, 1),
+                grid_dim=(self.mpk.max_num_batched_requests, 1, 1),
                 block_dim=(128, 1, 1),
                 num_draft_tokens=num_draft_steps,
             )
@@ -2742,17 +2746,12 @@ class DeepSeekV3Builder(GraphBuilder):
             current_position = self.mpk.attach_input(
                 torch_tensor=step_raw, name="mtp_accept_step")
             new_position = self.mpk.new_tensor(
-                dims=(mbt, 1), dtype=int64,
+                dims=(self.mpk.max_num_batched_requests, 1), dtype=int32,
                 name="mtp_new_position", io_category="cuda_tensor",
             )
-            final_output = self.mpk.new_tensor(
-                dims=(mbt, num_draft_steps + 1), dtype=int64,
-                name="mtp_final_output", io_category="cuda_tensor",
-            )
-            num_new = self.mpk.new_tensor(
-                dims=(mbt, 1), dtype=int64,
-                name="mtp_accept_num_new", io_category="cuda_tensor",
-            )
+            final_output = self.argmax_out_dtensor
+            num_new = self.mpk.attach_input(
+                torch_tensor=num_new_raw, name="mtp_accept_num_new_meta")
             self.mpk.mtp_accept_commit_layer(
                 accepted_count=accepted_count,
                 output_tokens=verified_output_tokens,
@@ -2760,7 +2759,7 @@ class DeepSeekV3Builder(GraphBuilder):
                 new_position=new_position,
                 final_output=final_output,
                 num_new_tokens=num_new,
-                grid_dim=(mbt, 1, 1),
+                grid_dim=(self.mpk.max_num_batched_requests, 1, 1),
                 block_dim=(128, 1, 1),
                 num_draft_tokens=num_draft_steps,
             )

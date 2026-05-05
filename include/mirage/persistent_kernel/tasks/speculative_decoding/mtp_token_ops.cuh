@@ -120,10 +120,10 @@ __device__ __forceinline__ void
     qo_start = qo_indptr_ptr[request_slot];
     qo_len = qo_indptr_ptr[request_slot + 1] - qo_start;
   }
-  // MTP draft scheduling is only valid for decode/verify widths. During
-  // chunk prefill (Q_LEN >= 9), the main model should keep consuming prompt
-  // chunks and the predictor must not overwrite runtime decode metadata.
-  if (qo_len < 1 || qo_len > 8) {
+  // Preparing speculative verification is only valid after a normal decode
+  // step. During prefill or during the verification pass itself, this task
+  // must not overwrite the accepted count produced by verify/commit.
+  if (qo_len != 1) {
     return;
   }
 

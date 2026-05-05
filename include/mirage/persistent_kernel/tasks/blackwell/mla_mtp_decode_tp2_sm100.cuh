@@ -38,7 +38,14 @@ namespace mla_mtp_tp2 {
 #define MLA_TP_SYNC_ACTIVE() asm volatile("bar.sync 12, 128;" ::: "memory")
 
 static constexpr int NUM_HEADS = 64;
-static constexpr int HEAD_GROUPS = 2;
+#ifndef MIRAGE_MLA_TP2_HEAD_GROUPS
+#define MIRAGE_MLA_TP2_HEAD_GROUPS 2
+#endif
+static constexpr int HEAD_GROUPS = MIRAGE_MLA_TP2_HEAD_GROUPS;
+static_assert(HEAD_GROUPS == 1 || HEAD_GROUPS == 2,
+              "MIRAGE_MLA_TP2_HEAD_GROUPS must be 1 or 2");
+static_assert(NUM_HEADS % HEAD_GROUPS == 0,
+              "TP2 MLA head groups must divide NUM_HEADS");
 static constexpr int HEADS_PER_GROUP = NUM_HEADS / HEAD_GROUPS;
 static constexpr int D_K = 576;
 static constexpr int D_V = 512;

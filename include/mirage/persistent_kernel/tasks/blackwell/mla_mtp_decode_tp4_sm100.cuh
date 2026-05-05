@@ -35,7 +35,7 @@ static constexpr int MMA_K = 16;
 static constexpr int K_ITERS = D_K / BK;  // 9 for QK
 static constexpr int V_CHUNKS = D_V / BK; // 8
 #ifndef MIRAGE_MLA_TP4_V_SPLITS
-#define MIRAGE_MLA_TP4_V_SPLITS 8
+#define MIRAGE_MLA_TP4_V_SPLITS 2
 #endif
 static constexpr int V_SPLITS = MIRAGE_MLA_TP4_V_SPLITS;
 static_assert(V_SPLITS == 1 || V_SPLITS == 2 || V_SPLITS == 4 ||
@@ -47,9 +47,8 @@ static_assert(V_CHUNKS % V_SPLITS == 0,
 #define MIRAGE_MLA_TP4_HEAD_GROUPS 1
 #endif
 static constexpr int HEAD_GROUPS = MIRAGE_MLA_TP4_HEAD_GROUPS;
-static_assert(HEAD_GROUPS == 1 || HEAD_GROUPS == 2 || HEAD_GROUPS == 4 ||
-                  HEAD_GROUPS == 8,
-              "MIRAGE_MLA_TP4_HEAD_GROUPS must be one of 1, 2, 4, 8");
+static_assert(HEAD_GROUPS == 1,
+              "MIRAGE_MLA_TP4_HEAD_GROUPS must be 1 with the current kernel");
 static_assert(NUM_HEADS % HEAD_GROUPS == 0,
               "TP4 MLA head groups must divide NUM_HEADS");
 static constexpr int HEADS_PER_GROUP = NUM_HEADS / HEAD_GROUPS;

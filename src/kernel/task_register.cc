@@ -2219,7 +2219,10 @@ int TaskRegister::register_mtp_verify_probabilistic_task(
   code.e("    task_desc->input_ptrs[3],");   // draft_probs
   code.e("    task_desc->input_ptrs[4],");   // seed
   code.e("    task_desc->output_ptrs[0],");  // accepted_count
-  code.e("    task_desc->output_ptrs[1]);"); // output_tokens
+  code.e("    task_desc->output_ptrs[1],");  // output_tokens
+  code.e("    runtime_config.qo_indptr_buffer,");
+  code.e("    runtime_config.request_ids,");
+  code.e("    task_desc->task_metadata.request_id);");
   return register_task_variant(TASK_MTP_VERIFY_PROBABILISTIC, code.to_string());
 }
 
@@ -5125,7 +5128,10 @@ int TaskRegister::register_mtp_verify_strict_task(
   code.e("    task_desc->input_ptrs[0],");   // draft_token_ids
   code.e("    task_desc->input_ptrs[1],");   // target_token_ids
   code.e("    task_desc->output_ptrs[0],");  // accepted_count
-  code.e("    task_desc->output_ptrs[1]);"); // output_tokens
+  code.e("    task_desc->output_ptrs[1],");  // output_tokens
+  code.e("    runtime_config.qo_indptr_buffer,");
+  code.e("    runtime_config.request_ids,");
+  code.e("    task_desc->task_metadata.request_id);");
   return register_task_variant(TASK_MTP_VERIFY_STRICT, code.to_string());
 }
 
@@ -5143,7 +5149,10 @@ int TaskRegister::register_mtp_accept_commit_task(
   code.e("    task_desc->input_ptrs[2],");   // current_position
   code.e("    task_desc->output_ptrs[0],");  // new_position
   code.e("    task_desc->output_ptrs[1],");  // final_output
-  code.e("    task_desc->output_ptrs[2]);"); // num_new_tokens
+  code.e("    task_desc->output_ptrs[2],");  // num_new_tokens
+  code.e("    runtime_config.qo_indptr_buffer,");
+  code.e("    runtime_config.request_ids,");
+  code.e("    task_desc->task_metadata.request_id);");
   return register_task_variant(TASK_MTP_ACCEPT_COMMIT, code.to_string());
 }
 

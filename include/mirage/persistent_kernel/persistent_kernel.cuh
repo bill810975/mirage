@@ -217,6 +217,13 @@ __device__ __forceinline__ bool
       int qo_indptr = config.qo_indptr_buffer[i];
       int num_tokens = config.qo_indptr_buffer[i + 1] - qo_indptr;
       int prompt_len = config.prompt_length[request_id];
+      bool const decode_multi_token_finalize =
+          (step >= prompt_len && num_tokens > 1);
+      if (decode_multi_token_finalize &&
+          config.new_token_nums[request_id] > 0 &&
+          config.new_token_nums[request_id] <= num_tokens) {
+        num_tokens = config.new_token_nums[request_id];
+      }
       for (int j = 0; j < num_tokens; j++) {
         if (step + j + 1 >= prompt_len &&
             step + j + 1 < config.max_seq_length) {
@@ -225,6 +232,9 @@ __device__ __forceinline__ bool
         }
       }
       config.step[request_id] = step + num_tokens;
+      if (decode_multi_token_finalize) {
+        config.new_token_nums[request_id] = 1;
+      }
 #ifdef MPK_DEBUG_BATCH
       printf("[BATCH finalize] slot=%d req=%d old_step=%d num_tokens=%d "
              "prompt_len=%d new_step=%d last_token=%lld eos=%lld\n",

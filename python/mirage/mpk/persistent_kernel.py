@@ -183,15 +183,27 @@ def _detect_cxx_standard():
     return "-std=c++17"
 
 def _mla_tp4_v_splits():
-    value = int(os.environ.get("MPK_MLA_TP4_V_SPLITS", "8"))
+    value = int(os.environ.get("MPK_MLA_TP4_V_SPLITS", "2"))
     if value not in (1, 2, 4, 8):
         raise ValueError("MPK_MLA_TP4_V_SPLITS must be one of 1, 2, 4, 8")
     return value
 
+def _mla_tp2_head_groups():
+    value = int(os.environ.get("MPK_MLA_TP2_HEAD_GROUPS", "2"))
+    if value not in (1, 2):
+        raise ValueError("MPK_MLA_TP2_HEAD_GROUPS must be 1 or 2")
+    return value
+
 def _mla_tp4_head_groups():
     value = int(os.environ.get("MPK_MLA_TP4_HEAD_GROUPS", "1"))
-    if value not in (1, 2, 4, 8):
-        raise ValueError("MPK_MLA_TP4_HEAD_GROUPS must be one of 1, 2, 4, 8")
+    if value != 1:
+        raise ValueError("MPK_MLA_TP4_HEAD_GROUPS must be 1 with the current kernel")
+    return value
+
+def _mtp_force_accept_drafts():
+    value = int(os.environ.get("MPK_MTP_FORCE_ACCEPT_DRAFTS", "-1"))
+    if value < -1 or value > 8:
+        raise ValueError("MPK_MTP_FORCE_ACCEPT_DRAFTS must be in [-1, 8]")
     return value
 
 def get_compile_command(
@@ -249,8 +261,10 @@ def get_compile_command(
         f"-I{os.path.join(mirage_deps_path, 'json/include')}",
         f"-DMAX_WORKER_PER_SCHEDULER={max_worker_per_scheduler}",
         f"-DMIRAGE_USE_CUTLASS_KERNEL={'1' if use_cutlass_kernel else '0'}",
+        f"-DMIRAGE_MLA_TP2_HEAD_GROUPS={_mla_tp2_head_groups()}",
         f"-DMIRAGE_MLA_TP4_V_SPLITS={_mla_tp4_v_splits()}",
         f"-DMIRAGE_MLA_TP4_HEAD_GROUPS={_mla_tp4_head_groups()}",
+        f"-DMIRAGE_MTP_FORCE_ACCEPT_DRAFTS={_mtp_force_accept_drafts()}",
     ]
 
     # rdc=true is the default on every NVSHMEM build. The old Blackwell
@@ -1511,7 +1525,7 @@ class PersistentKernel:
             q_input, kv_input, output_partial, output_lse,
             q_len, kv_len, num_heads=64,
             task_name="mla_mtp_decode_tp2_sm100",
-            head_groups=2,
+            head_groups=_mla_tp2_head_groups(),
             num_splits_override=num_splits_override,
         )
 

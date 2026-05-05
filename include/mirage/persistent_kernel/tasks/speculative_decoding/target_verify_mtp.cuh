@@ -17,6 +17,10 @@
 
 namespace kernel {
 
+#ifndef MIRAGE_MTP_FORCE_ACCEPT_DRAFTS
+#define MIRAGE_MTP_FORCE_ACCEPT_DRAFTS -1
+#endif
+
 // ============================================================================
 // MTP Verification Kernels
 //
@@ -46,7 +50,10 @@ __device__ __forceinline__ void
     target_verify_strict_kernel(void const *__restrict__ draft_token_ids_ptr,
                                 void const *__restrict__ target_token_ids_ptr,
                                 void *__restrict__ accepted_count_ptr,
-                                void *__restrict__ output_tokens_ptr) {
+                                void *__restrict__ output_tokens_ptr,
+                                int const *__restrict__ qo_indptr_ptr,
+                                int const *__restrict__ request_ids_ptr,
+                                int request_slot) {
 
   long long const *__restrict__ draft_ids =
       static_cast<long long const *>(draft_token_ids_ptr);
@@ -57,19 +64,46 @@ __device__ __forceinline__ void
       static_cast<long long *>(output_tokens_ptr);
 
   int t_id = threadIdx.x;
+  if (request_slot < 0) {
+    return;
+  }
+  int req = request_slot;
+  if (request_ids_ptr != nullptr) {
+    req = static_cast<int>(request_ids_ptr[request_slot]);
+  }
+  if (req < 0) {
+    return;
+  }
+  int qo_start = 0;
+  int qo_len = NUM_DRAFT_TOKENS + 1;
+  if (qo_indptr_ptr != nullptr) {
+    qo_start = qo_indptr_ptr[request_slot];
+    qo_len = qo_indptr_ptr[request_slot + 1] - qo_start;
+  }
+  if (qo_len != NUM_DRAFT_TOKENS + 1) {
+    return;
+  }
+  int const output_offset = request_slot * (NUM_DRAFT_TOKENS + 1);
 
   __shared__ int accepted_num_smem;
 
   if (t_id == 0) {
+#if MIRAGE_MTP_FORCE_ACCEPT_DRAFTS >= 0
+    int accepted = MIRAGE_MTP_FORCE_ACCEPT_DRAFTS;
+    if (accepted > NUM_DRAFT_TOKENS) {
+      accepted = NUM_DRAFT_TOKENS;
+    }
+#else
     int accepted = NUM_DRAFT_TOKENS;
     for (int i = 0; i < NUM_DRAFT_TOKENS; i++) {
       // draft_ids[i] is the draft token for position i
       // target_ids[i] is the target model's prediction for position i
-      if (draft_ids[i] != target_ids[i]) {
+      if (draft_ids[qo_start + i + 1] != target_ids[qo_start + i]) {
         accepted = i;
         break;
       }
     }
+#endif
     accepted_num_smem = accepted;
   }
   __syncthreads();
@@ -80,13 +114,16 @@ __device__ __forceinline__ void
   // output[0..final_accepted-1] = target_ids[0..final_accepted-1]
   // (these match draft_ids)
   // output[final_accepted] = target_ids[final_accepted] (bonus token)
-  if (t_id < final_accepted + 1) {
-    output_tokens[t_id] = target_ids[t_id];
+  if (t_id < final_accepted) {
+    output_tokens[output_offset + t_id] = draft_ids[qo_start + t_id + 1];
+  }
+  if (t_id == final_accepted) {
+    output_tokens[output_offset + t_id] = target_ids[qo_start + t_id];
   }
 
   if (t_id == 0) {
     // accepted_count = num accepted + 1 (for bonus token)
-    accepted_count[0] = final_accepted + 1;
+    accepted_count[request_slot] = final_accepted + 1;
   }
 }
 
@@ -117,7 +154,10 @@ __device__ __forceinline__ void target_verify_probabilistic_kernel(
     void const *__restrict__ draft_probs_ptr,
     void const *__restrict__ seed_ptr,
     void *__restrict__ accepted_count_ptr,
-    void *__restrict__ output_tokens_ptr) {
+    void *__restrict__ output_tokens_ptr,
+    int const *__restrict__ qo_indptr_ptr,
+    int const *__restrict__ request_ids_ptr,
+    int request_slot) {
 
   long long const *__restrict__ draft_ids =
       static_cast<long long const *>(draft_token_ids_ptr);
@@ -134,8 +174,40 @@ __device__ __forceinline__ void target_verify_probabilistic_kernel(
       static_cast<long long *>(output_tokens_ptr);
 
   int t_id = threadIdx.x;
+  if (request_slot < 0) {
+    return;
+  }
+  int req = request_slot;
+  if (request_ids_ptr != nullptr) {
+    req = static_cast<int>(request_ids_ptr[request_slot]);
+  }
+  if (req < 0) {
+    return;
+  }
+  int qo_start = 0;
+  int qo_len = NUM_DRAFT_TOKENS + 1;
+  if (qo_indptr_ptr != nullptr) {
+    qo_start = qo_indptr_ptr[request_slot];
+    qo_len = qo_indptr_ptr[request_slot + 1] - qo_start;
+  }
+  if (qo_len != NUM_DRAFT_TOKENS + 1) {
+    return;
+  }
+  int const output_offset = request_slot * (NUM_DRAFT_TOKENS + 1);
 
   if (t_id == 0) {
+#if MIRAGE_MTP_FORCE_ACCEPT_DRAFTS >= 0
+    int accepted = MIRAGE_MTP_FORCE_ACCEPT_DRAFTS;
+    if (accepted > NUM_DRAFT_TOKENS) {
+      accepted = NUM_DRAFT_TOKENS;
+    }
+    for (int i = 0; i < accepted; i++) {
+      output_tokens[output_offset + i] = draft_ids[qo_start + i + 1];
+    }
+    output_tokens[output_offset + accepted] = target_ids[qo_start + accepted];
+    accepted_count[request_slot] = accepted + 1;
+    return;
+#else
     unsigned long long rng_state = seed[0];
     int accepted = 0;
     bool still_accepting = true;
@@ -143,13 +215,15 @@ __device__ __forceinline__ void target_verify_probabilistic_kernel(
     for (int i = 0; i < NUM_DRAFT_TOKENS && still_accepting; i++) {
       float p_target = target_probs[i];
       float p_draft = draft_probs[i];
+      long long const draft_id = draft_ids[qo_start + i + 1];
+      long long const target_id = target_ids[qo_start + i];
 
       if (p_draft == 0.0f) {
         // Draft probability is zero — greedy fallback: check if tokens match
-        if (draft_ids[i] != target_ids[i]) {
+        if (draft_id != target_id) {
           still_accepting = false;
         } else {
-          output_tokens[i] = draft_ids[i];
+          output_tokens[output_offset + i] = draft_id;
           accepted++;
         }
       } else {
@@ -159,7 +233,7 @@ __device__ __forceinline__ void target_verify_probabilistic_kernel(
                   static_cast<float>(1ULL << 31);
 
         if (p_target > u * p_draft) {
-          output_tokens[i] = draft_ids[i];
+          output_tokens[output_offset + i] = draft_id;
           accepted++;
         } else {
           still_accepting = false;
@@ -168,8 +242,9 @@ __device__ __forceinline__ void target_verify_probabilistic_kernel(
     }
 
     // Bonus token = target model's token at the rejected position
-    output_tokens[accepted] = target_ids[accepted];
-    accepted_count[0] = accepted + 1;
+    output_tokens[output_offset + accepted] = target_ids[qo_start + accepted];
+    accepted_count[request_slot] = accepted + 1;
+#endif
   }
 }
 
@@ -259,7 +334,10 @@ __device__ __forceinline__ void
                              void const *__restrict__ current_position_ptr,
                              void *__restrict__ new_position_ptr,
                              void *__restrict__ final_output_ptr,
-                             void *__restrict__ num_new_tokens_ptr) {
+                             void *__restrict__ num_new_tokens_ptr,
+                             int const *__restrict__ qo_indptr_ptr,
+                             int const *__restrict__ request_ids_ptr,
+                             int request_slot) {
 
   int const *__restrict__ accepted_count =
       static_cast<int const *>(accepted_count_ptr);
@@ -273,17 +351,37 @@ __device__ __forceinline__ void
   int *__restrict__ num_new_tokens = static_cast<int *>(num_new_tokens_ptr);
 
   int t_id = threadIdx.x;
+  if (request_slot < 0) {
+    return;
+  }
+  int req = request_slot;
+  if (request_ids_ptr != nullptr) {
+    req = static_cast<int>(request_ids_ptr[request_slot]);
+  }
+  if (req < 0) {
+    return;
+  }
+  int qo_start = 0;
+  int qo_len = NUM_DRAFT_TOKENS + 1;
+  if (qo_indptr_ptr != nullptr) {
+    qo_start = qo_indptr_ptr[request_slot];
+    qo_len = qo_indptr_ptr[request_slot + 1] - qo_start;
+  }
+  if (qo_len != NUM_DRAFT_TOKENS + 1) {
+    return;
+  }
+  int const output_offset = request_slot * (NUM_DRAFT_TOKENS + 1);
 
   if (t_id == 0) {
-    int count = accepted_count[0]; // includes bonus token
-    new_position[0] = current_position[0] + count;
-    num_new_tokens[0] = count;
+    int count = accepted_count[request_slot]; // includes bonus token
+    new_position[request_slot] = current_position[req] + count;
+    num_new_tokens[req] = count;
   }
 
   // Copy accepted + bonus tokens to final output
-  int count = accepted_count[0];
+  int count = accepted_count[request_slot];
   if (t_id < count && t_id <= NUM_DRAFT_TOKENS) {
-    final_output[t_id] = output_tokens[t_id];
+    final_output[qo_start + t_id] = output_tokens[output_offset + t_id];
   }
 }
 

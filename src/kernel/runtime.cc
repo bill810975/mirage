@@ -450,7 +450,10 @@ void register_mugraph(
             // MTP token-management helpers use grid.x as the active request
             // slot so they can map slot -> global request id at runtime.
             if (task_type == TASK_MTP_PREPARE_VERIFY ||
-                task_type == TASK_MTP_BUILD_EMBED_INPUT) {
+                task_type == TASK_MTP_BUILD_EMBED_INPUT ||
+                task_type == TASK_MTP_VERIFY_STRICT ||
+                task_type == TASK_MTP_VERIFY_PROBABILISTIC ||
+                task_type == TASK_MTP_ACCEPT_COMMIT) {
               task.task_metadata.request_id = bid.x;
             }
             // FP8 quantize uses grid=(group_tile, row, 1). request_id is the
