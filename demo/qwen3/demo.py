@@ -8,6 +8,8 @@ import os, json
 
 from models.qwen3_shard_loader import Qwen3ShardLoader
 from mirage.mpk.base_dynamic_shard_loader import ShardType
+from mirage.mpk.persistent_kernel import add_v2_region_smem_plan
+from mirage.mpk.v2_task_schedule import build_v2_worker_task_queues
 
 
 mapping = {
@@ -116,6 +118,13 @@ if __name__ == "__main__":
         help="Not use the cutlass version kernel.",
     )
     parser.add_argument("--ignore-eos", action="store_true", help="Ignore eos token during generation")
+    parser.add_argument("--no-chat-template", action="store_true",
+        help="Tokenize --prompt directly without the chat template "
+             "(benchmarking: enables exact prompt lengths, e.g. 1 token)")
+    parser.add_argument("--prof-dump", type=str, default=None,
+        help="With --profiling: also dump the raw profiler buffer to this "
+             ".npy path for offline analysis")
+    parser.add_argument("--use-v2", action="store_true", help="Use v2 runtime (static per-SM task plan, no scheduler)")
 
     # -------- Args for CI tests ----------
     parser.add_argument("--max-new-tokens", type=int, default=None, help="Decode cap for CI determinism")
@@ -227,16 +236,19 @@ if __name__ == "__main__":
                 """
     #question = "Can you please change x axis to start from 0"
     #prompt = code_text + "\n" + question
-    messages = [
-        {
-            "role": "system",
-            "content": "You are Qwen, created by Alibaba Cloud. You are a helpful assistant.",
-        },
-        {"role": "user", "content": prompt},
-    ]
-    text = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
+    if args.no_chat_template:
+        text = prompt
+    else:
+        messages = [
+            {
+                "role": "system",
+                "content": "You are Qwen, created by Alibaba Cloud. You are a helpful assistant.",
+            },
+            {"role": "user", "content": prompt},
+        ]
+        text = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
     model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
     for r in range(total_num_requests):
         for i in range(model_inputs.input_ids.shape[-1]):
@@ -283,8 +295,12 @@ if __name__ == "__main__":
         num_kv_cache_chunks = max(1, args.max_seq_length // 256)
 
         if args.profiling:
+            # MUST match V2_PROF_BUF_ENTRIES in runtime_v2.cuh. Sized for v2
+            # traces: 8 tracks/SM (5 roles + 3 phase tracks) over 25 windowed
+            # decode steps; the consumer-phase track alone can write ~12-17k
+            # entries (dep + tmem + mainloop waits) + the accumulator tail.
             profiler_tensor = torch.zeros(
-                3000 * 128, dtype=torch.uint64, device="cuda"
+                120000 * 128, dtype=torch.uint64, device="cuda"
             ).contiguous()
         else:
             profiler_tensor = None
@@ -332,7 +348,8 @@ if __name__ == "__main__":
             profiler_tensor=profiler_tensor,
             trace_name=args.trace_name,
             spec_decode_config=spec_decode_config,
-            use_cutlass_kernel=args.use_cutlass_kernel
+            use_cutlass_kernel=args.use_cutlass_kernel,
+            use_v2_runtime=args.use_v2,
         )
         
         if spec_decode_config and spec_decode_config.method == "promptlookup":
@@ -524,13 +541,21 @@ if __name__ == "__main__":
                 grid_dim=(mpk.max_num_batched_tokens, 1, 1),
                 block_dim=(128, 1, 1),
             )
-            mpk.linear_layer(
-                input=rmsnorm_out,
-                weight=w_qkv,
-                output=attn_in,
-                grid_dim=(grid_for_rmsnorm_linear_layer(w_qkv.dim(0), args.use_cutlass_kernel), 1, 1),
-                block_dim=(128, 1, 1),
-            )
+            if args.use_v2:
+                mpk.linear_layer_v3(
+                    input=rmsnorm_out,
+                    weight=w_qkv,
+                    output=attn_in,
+                    tiles_per_task=1,
+                )
+            else:
+                mpk.linear_layer(
+                    input=rmsnorm_out,
+                    weight=w_qkv,
+                    output=attn_in,
+                    grid_dim=(grid_for_rmsnorm_linear_layer(w_qkv.dim(0), args.use_cutlass_kernel), 1, 1),
+                    block_dim=(128, 1, 1),
+                )
             #mpk.rmsnorm_linear_layer(
             #    input=x,
             #    weight_norm=w_norm,
@@ -609,7 +634,15 @@ if __name__ == "__main__":
             w = mpk.attach_input(
                 torch_tensor=layer.self_attn.o_proj.weight, name=f"layer_{i}_o_proj"
             )
-            if use_splitk:
+            if args.use_v2:
+                mpk.linear_with_residual_layer_v3(
+                    input=attn_out,
+                    weight=w,
+                    residual=x,
+                    output=attn_proj_out,
+                    tiles_per_task=1,
+                )
+            elif use_splitk:
                 attn_proj_out = x
                 mpk.splitk_linear_layer(
                     input=attn_out,
@@ -665,13 +698,31 @@ if __name__ == "__main__":
                 grid_dim=(mpk.max_num_batched_tokens, 1, 1),
                 block_dim=(128, 1, 1),
             )
-            mpk.linear_layer(
-                input=rmsnorm_out,
-                weight=w_gatedup,
-                output=mlp_mid,
-                grid_dim=(rmsnorm_num_tasks, 1, 1),
-                block_dim=(128, 1, 1),
-            )
+            # # GateUp: keep v1 (v2 variant hangs in mirage integration context —
+            # # still under investigation; v2 linear_v2 works standalone).
+            # mpk.linear_layer(
+            #     input=rmsnorm_out,
+            #     weight=w_gatedup,
+            #     output=mlp_mid,
+            #     grid_dim=(rmsnorm_num_tasks, 1, 1),
+            #     block_dim=(128, 1, 1),
+            # )
+
+            if args.use_v2:
+                mpk.linear_layer_v3(
+                    input=rmsnorm_out,
+                    weight=w_gatedup,
+                    output=mlp_mid,
+                    tiles_per_task=1,
+                )
+            else:
+                mpk.linear_layer(
+                    input=rmsnorm_out,
+                    weight=w_gatedup,
+                    output=mlp_mid,
+                    grid_dim=(rmsnorm_num_tasks, 1, 1),
+                    block_dim=(128, 1, 1),
+                )
             #mpk.rmsnorm_linear_layer(
             #    input=x,
             #    weight_norm=w_norm,
@@ -690,7 +741,15 @@ if __name__ == "__main__":
             w = mpk.attach_input(
                 torch_tensor=layer.mlp.down_proj.weight, name=f"layer_{i}_down_proj"
             )
-            if use_splitk:
+            if args.use_v2:
+                mpk.linear_with_residual_layer_v3(
+                    input=silu_mul_out,
+                    weight=w,
+                    residual=x,
+                    output=mlp_out,
+                    tiles_per_task=1,
+                )
+            elif use_splitk:
                 mlp_out = x
                 mpk.splitk_linear_layer(
                     input=silu_mul_out,
@@ -733,13 +792,21 @@ if __name__ == "__main__":
             grid_dim=(mpk.max_num_batched_tokens, 1, 1),
             block_dim=(128, 1, 1),
         )
-        mpk.linear_layer(
-            input=rmsnorm_out,
-            weight=w_proj,
-            output=argmax_in,
-            grid_dim=(lm_head_workers, 1, 1),
-            block_dim=(128, 1, 1),
-        )
+        if args.use_v2:
+            mpk.linear_layer_v3(
+                input=rmsnorm_out,
+                weight=w_proj,
+                output=argmax_in,
+                tiles_per_task=1,
+            )
+        else:
+            mpk.linear_layer(
+                input=rmsnorm_out,
+                weight=w_proj,
+                output=argmax_in,
+                grid_dim=(lm_head_workers, 1, 1),
+                block_dim=(128, 1, 1),
+            )
         #mpk.rmsnorm_linear_layer(
         #    input=x,
         #    weight_norm=w_norm,
@@ -779,8 +846,24 @@ if __name__ == "__main__":
             )
 
         results = mpk.kn_graph.generate_task_graph(num_gpus=world_size, my_gpu_id=rank)
+        task_graph_json = results["json_file"]
+        if args.use_v2:
+            task_graph = json.loads(task_graph_json)
+            task_graph["v2_worker_task_queues"] = build_v2_worker_task_queues(
+                task_graph, mpk.num_workers)
+            task_graph_json = add_v2_region_smem_plan(json.dumps(task_graph))
+            if args.profiling:
+                # --profiling also emits a per-SM SMEM page-usage figure:
+                # rows = SM 0's tasks in execution order, columns = physical
+                # pages — shows which pages each task occupies.
+                from mirage.mpk.page_plan_viz import save_page_plan_figure
+                save_page_plan_figure(
+                    task_graph_json,
+                    out_path=os.path.join(args.output_dir or ".",
+                                          f"page_plan_sm0_rank{rank}.png"),
+                    worker=0)
         with open(f"task_graph_{rank}.json", "w") as f:
-            f.write(results["json_file"])
+            f.write(task_graph_json)
         with open(f"kernel_{rank}.cu", "w") as f:
             f.write(results["cuda_code"])
 
@@ -872,6 +955,11 @@ if __name__ == "__main__":
               prompt_lengths[0], tokens_generated, per_tok_ms
             )
         )
+
+        if args.prof_dump and profiler_tensor is not None:
+            import numpy as np
+            np.save(args.prof_dump, profiler_tensor.cpu().numpy())
+            print(f"[prof] dumped raw profiler buffer to {args.prof_dump}")
 
         # -------- CI dumps outputs to json files ----------
         if save_path and rank == 0:

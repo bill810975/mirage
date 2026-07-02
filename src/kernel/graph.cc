@@ -592,6 +592,51 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
     int variant_id = task_register->register_linear_sm100_task(
         customized->bgraph, params, false /*with_residual*/);
     task_config[op] = std::make_tuple(2, 1, TASK_LINEAR_SM100, variant_id);
+  } else if (name == "linear_sm100_v2") {
+    int variant_id = task_register->register_linear_sm100_v2_task(
+        customized->bgraph, params, false /*with_residual*/);
+    task_config[op] = std::make_tuple(2, 1, TASK_LINEAR_SM100_V2, variant_id);
+  } else if (name == "linear_with_residual_sm100_v2") {
+    int variant_id = task_register->register_linear_sm100_v2_task(
+        customized->bgraph, params, true /*with_residual*/);
+    task_config[op] =
+        std::make_tuple(3, 1, TASK_LINEAR_WITH_RESIDUAL_SM100_V2, variant_id);
+  } else if (name == "linear_sm100_v3") {
+    int variant_id = task_register->register_linear_sm100_v3_task(
+        customized->bgraph, params, false /*with_residual*/);
+    task_config[op] = std::make_tuple(2, 1, TASK_LINEAR_SM100_V3, variant_id);
+  } else if (name == "linear_with_residual_sm100_v3") {
+    int variant_id = task_register->register_linear_sm100_v3_task(
+        customized->bgraph, params, true /*with_residual*/);
+    task_config[op] =
+        std::make_tuple(3, 1, TASK_LINEAR_WITH_RESIDUAL_SM100_V3, variant_id);
+  } else if (name == "rmsnorm_hopper_v2") {
+    int variant_id = task_register->register_rmsnorm_hopper_v2_task(
+        customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(2, 1, TASK_RMS_NORM_HOPPER_V2, variant_id);
+  } else if (name == "silu_mul_v2") {
+    int variant_id =
+        task_register->register_silu_mul_v2_task(customized->bgraph, params);
+    task_config[op] = std::make_tuple(1, 1, TASK_SILU_MUL_V2, variant_id);
+  } else if (name == "embedding_v2") {
+    int variant_id =
+        task_register->register_embedding_v2_task(customized->bgraph, params);
+    task_config[op] = std::make_tuple(2, 1, TASK_EMBEDDING_V2, variant_id);
+  } else if (name == "paged_attention_sm100_v2") {
+    int variant_id = task_register->register_paged_attention_sm100_v2_task(
+        customized->bgraph, params);
+    task_config[op] = std::make_tuple(7, 1, TASK_ATTN_SM100_V2, variant_id);
+  } else if (name == "argmax_partial_sm100_v2") {
+    int variant_id = task_register->register_argmax_partial_sm100_v2_task(
+        customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(1, 2, TASK_ARGMAX_PARTIAL_SM100_V2, variant_id);
+  } else if (name == "argmax_reduce_sm100_v2") {
+    int variant_id = task_register->register_argmax_reduce_sm100_v2_task(
+        customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(2, 1, TASK_ARGMAX_REDUCE_SM100_V2, variant_id);
   } else if (name == "splitk_linear_sm100") {
     int variant_id = task_register->register_splitk_linear_sm100_task(
         customized->bgraph, params, false /*with_residual*/);
@@ -1158,7 +1203,7 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
   }
 
   else {
-    printf("Unsupported task name: %s\n", name);
+    printf("Unsupported task name: %s\n", name.c_str());
     assert(false && "Unsupported task type");
   }
   // Loud guard: a task whose declared input/output count exceeds the fixed

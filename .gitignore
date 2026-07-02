@@ -9,6 +9,8 @@
 *.dylib
 *.dll
 
+*.md
+
 # Compiled executables
 *.exe
 
@@ -86,3 +88,10 @@ ncu_tmp
 /CLAUDE.md
 /pr.md
 *.log
+
+# MPK v3 docs/figures/scratch — kept local, not in PR
+docs/mpk/figures/
+docs/mpk/V2_CODEBASE.md
+docs/mpk/V2_TODO.md
+demo/linear_v3_unittest.py
+*.perfetto-trace*

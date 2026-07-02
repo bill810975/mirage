@@ -290,15 +290,24 @@ __device__ __forceinline__ bool
       config.step[request_id] = step + num_tokens;
       int step_advance = num_tokens;
 #endif
-#if defined(MPK_ENABLE_PROFILING) || defined(MPK_TEST_MODE)
-      if (true)
-#else
-      if ((step + step_advance + 1 >= config.max_seq_length) ||
+      // Production completion: max sequence length, or EOS after the prompt.
+      bool request_done =
+          (step + step_advance + 1 >= config.max_seq_length) ||
           ((config.tokens[request_id * MPK_MAX_SEQ_LENGTH + step +
                           step_advance] == config.eos_token_id) &&
-           (step + step_advance >= prompt_len)))
+           (step + step_advance >= prompt_len));
+#ifdef MPK_TEST_MODE
+      // Test mode always completes after one iteration (v1 semantics).
+      request_done = true;
 #endif
-      {
+#ifdef MPK_ENABLE_PROFILING
+      // Profiling-only override: the v1 profiler traces exactly one decode
+      // step, so it forces every request done after the first iteration. The
+      // v2 profiler traces a trailing window (runtime_v2.cuh gates the events),
+      // so v2 must let generation proceed normally. No effect on normal builds.
+      request_done = request_done || !config.v2_enabled;
+#endif
+      if (request_done) {
         // Request is done
         config.request_ids[i] = -1;
         // Free pages

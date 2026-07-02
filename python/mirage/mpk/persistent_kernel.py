@@ -19,6 +19,10 @@ from .multigpu import (
 )
 from typing import Optional
 
+
+from .v2_smem_planner import add_v2_region_smem_plan
+from .v2_task_schedule import build_v2_worker_task_queues
+
 HARD_CODE = """
 #include <Python.h>
 #include <cuda_runtime.h>
@@ -115,6 +119,25 @@ static PyObject *launch_func(PyObject *self, PyObject *args) {
   Py_RETURN_NONE;
 }
 
+#ifdef USE_RUNTIME_V2
+static PyObject *init_v2_func(PyObject *self, PyObject *args) {
+  init_persistent_kernel_v2();
+  Py_RETURN_NONE;
+}
+
+static PyObject *launch_v2_func(PyObject *self, PyObject *args) {
+  PyObject *py_stream;
+  cudaStream_t stream;
+  if (!PyArg_ParseTuple(args, "O", &py_stream)) {
+    PyErr_SetString(PyExc_TypeError, "Invalid parameters");
+    return NULL;
+  }
+  stream = (cudaStream_t)PyLong_AsVoidPtr(py_stream);
+  launch_persistent_kernel_v2(stream);
+  Py_RETURN_NONE;
+}
+#endif
+
 static PyObject *finalize_func(PyObject *self, PyObject *args) {
   finalize_persistent_kernel();
 
@@ -125,6 +148,10 @@ static PyMethodDef ModuleMethods[] = {
   {"init_func", init_func, METH_VARARGS, "initialize persistent kernel"},
   {"init_request_func", init_request_func, METH_VARARGS, "initialize request resources"},
   {"launch_func", launch_func, METH_VARARGS, "launch persistent kernel"},
+#ifdef USE_RUNTIME_V2
+  {"init_v2_func", init_v2_func, METH_NOARGS, "initialize v2 static task plan"},
+  {"launch_v2_func", launch_v2_func, METH_VARARGS, "launch v2 persistent kernel"},
+#endif
   {"finalize_func", finalize_func, METH_VARARGS, "finalize persistent kernel"},
   {NULL, NULL, 0, NULL} // sentinel
 };
@@ -377,6 +404,8 @@ def get_compile_command(
     spec_cfg = getattr(mpk, 'spec_decode_config', None)
     if spec_cfg is not None and getattr(spec_cfg, 'method', None) == 'eagle3':
         flags = flags + ["-DMPK_SPEC_DECODE"]
+    if getattr(mpk, "use_v2_runtime", False):
+        flags = flags + ["-DUSE_RUNTIME_V2"]
 
     if use_nvshmem:
         nvshmem_cmd = [
@@ -402,6 +431,9 @@ def get_compile_command(
         ] + (["-DMIRAGE_ENABLE_PROFILER"] if profiling else [])
     elif target_cc == 100:
         specific_cmd = [
+            # NOTE: do NOT also pass -arch=sm_100a. On CUDA 13.2 that combo
+            # silently downgrades the virtual target to compute_100 (no 'a'),
+            # breaking tcgen05.* and other sm_100a-only PTX.
             "-gencode=arch=compute_100a,code=sm_100a",
             "-DMPK_ENABLE_TMA",
             "-DMIRAGE_GRACE_BLACKWELL",
@@ -452,6 +484,7 @@ class PersistentKernel:
         eos_token_id: int64 = -1,
         pinned_ring_capacity: int = 0,
         test_mode: bool = False,
+        use_v2_runtime: bool = False,
     ):
         self.__finalized__ = False
         self._is_compiled = False
@@ -488,6 +521,7 @@ class PersistentKernel:
         self.use_cutlass_kernel = use_cutlass_kernel
         # Dictionary to track attached model tensors for kernel reuse
         self._model_tensors = {}
+        self.use_v2_runtime = use_v2_runtime
         self._spec_decode_handlers = {
             "promptlookup": self.prompt_lookup_spec_handler,
         }
@@ -772,7 +806,11 @@ class PersistentKernel:
         tb_graph.new_input(weight, (1, -1, -1), -1, True)
         tb_graph.new_input(output, (1, 0, -1), -1, True)
         self.kn_graph.customized([input, weight, output], tb_graph)
-        self.kn_graph.register_task(tb_graph, "embedding" if self.target_cc == 90 else "embedding", [input_source])
+        self.kn_graph.register_task(
+            tb_graph,
+            "embedding_v2" if self.use_v2_runtime else "embedding",
+            [input_source],
+        )
 
     def rmsnorm_layer(
         self,
@@ -795,11 +833,14 @@ class PersistentKernel:
         tb_graph.new_input(weight, (-1, -1, -1), 0, True)
         tb_graph.new_input(output, (0, -1, -1), 1, True)
         self.kn_graph.customized([input, weight, output], tb_graph)
-        task_name = "rmsnorm_hopper" if self.target_cc >= 90 else "rmsnorm"
-        if process_dim is None:
-            self.kn_graph.register_task(tb_graph, task_name)
+        if self.use_v2_runtime:
+            self.kn_graph.register_task(tb_graph, "rmsnorm_hopper_v2")
         else:
-            self.kn_graph.register_task(tb_graph, task_name, [process_dim])
+            task_name = "rmsnorm_hopper" if self.target_cc >= 90 else "rmsnorm"
+            if process_dim is None:
+                self.kn_graph.register_task(tb_graph, task_name)
+            else:
+                self.kn_graph.register_task(tb_graph, task_name, [process_dim])
 
     def fused_rmsnorm_quantize_fp8_layer(
         self,
@@ -1150,7 +1191,11 @@ class PersistentKernel:
         if self.target_cc == 90:
             self.kn_graph.register_task(tb_graph, "paged_attention_hopper", params)
         elif self.target_cc == 100:
-            self.kn_graph.register_task(tb_graph, "paged_attention_sm100", params)
+            self.kn_graph.register_task(
+                tb_graph,
+                "paged_attention_sm100_v2" if self.use_v2_runtime else "paged_attention_sm100",
+                params,
+            )
         else:
             self.kn_graph.register_task(tb_graph, "paged_attention", params)
 
@@ -3854,6 +3899,120 @@ class PersistentKernel:
         self.kn_graph.register_task(
             tb_graph, "dsv3_router_gate_gemv_sm100", params)
 
+    def linear_layer_v2(
+        self,
+        input: DTensor,
+        weight: DTensor,
+        output: DTensor,
+        block_dim: tuple = (192, 1, 1),
+        tiles_per_task: int = 1,
+    ):
+        """v2 linear: BLOCK_M=128. With tiles_per_task=1, one tile per task.
+        With tiles_per_task>1, each task processes that many contiguous tiles
+        (reducing dispatch overhead). grid_dim derived from N/128/tiles_per_task."""
+        assert input.num_dims == 2
+        assert weight.num_dims == 2
+        assert output.num_dims == 2
+        N = weight.dim(0)
+        assert N % 128 == 0, f"linear_layer_v2 requires N divisible by 128, got {N}"
+        num_tiles = N // 128
+        # ceil(num_tiles / tiles_per_task) — last task clamps if not divisible
+        num_tasks = (num_tiles + tiles_per_task - 1) // tiles_per_task
+        grid_dim = (num_tasks, 1, 1)
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        # No partitioning — each task sees the full weight and output
+        tb_graph.new_input(input,  (-1, -1, -1), 1, True)
+        tb_graph.new_input(weight, (-1, -1, -1), 1, True)
+        tb_graph.new_input(output, (-1, -1, -1), -1, True)
+        self.kn_graph.customized([input, weight, output], tb_graph)
+        # params: [M_real, SPLIT_K, TILES_PER_TASK] — defaults -1, 1, 1
+        # M_real = -1 means task_register uses batch_size from bgraph
+        self.kn_graph.register_task(tb_graph, "linear_sm100_v2",
+                                     [-1, 1, tiles_per_task])
+
+    def linear_layer_v3(
+        self,
+        input: DTensor,
+        weight: DTensor,
+        output: DTensor,
+        block_dim: tuple = (192, 1, 1),
+        tiles_per_task: int = 1,
+    ):
+        """v3 linear: same shape contract as linear_layer_v2 but emits the
+        Channel/TmemChannel-based kernel in linear_sm100_v3.cuh."""
+        assert input.num_dims == 2
+        assert weight.num_dims == 2
+        assert output.num_dims == 2
+        N = weight.dim(0)
+        assert N % 128 == 0, f"linear_layer_v3 requires N divisible by 128, got {N}"
+        num_tiles = N // 128
+        num_tasks = (num_tiles + tiles_per_task - 1) // tiles_per_task
+        grid_dim = (num_tasks, 1, 1)
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(input,  (-1, -1, -1), 1, True)
+        tb_graph.new_input(weight, (-1, -1, -1), 1, True)
+        tb_graph.new_input(output, (-1, -1, -1), -1, True)
+        self.kn_graph.customized([input, weight, output], tb_graph)
+        self.kn_graph.register_task(tb_graph, "linear_sm100_v3",
+                                     [-1, 1, tiles_per_task])
+
+    def linear_with_residual_layer_v3(
+        self,
+        input: DTensor,
+        weight: DTensor,
+        residual: DTensor,
+        output: DTensor,
+        block_dim: tuple = (192, 1, 1),
+        tiles_per_task: int = 1,
+    ):
+        """v3 linear + residual: Channel/TmemChannel kernel
+        (linear_sm100_v3.cuh) with the HAS_RESIDUAL consumer path. Same shape
+        contract as linear_with_residual_layer_v2. Inputs are ordered
+        (input, weight, residual) so the consumer reads residual from
+        input_ptrs[2]; grid is sized exactly like linear_layer_v3."""
+        assert input.num_dims == 2
+        assert weight.num_dims == 2
+        assert residual.num_dims == 2
+        assert output.num_dims == 2
+        N = weight.dim(0)
+        assert N % 128 == 0, f"linear_with_residual_layer_v3 requires N divisible by 128, got {N}"
+        num_tiles = N // 128
+        num_tasks = (num_tiles + tiles_per_task - 1) // tiles_per_task
+        grid_dim = (num_tasks, 1, 1)
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(input,    (-1, -1, -1), 1, True)
+        tb_graph.new_input(weight,   (-1, -1, -1), 1, True)
+        tb_graph.new_input(residual, (-1, -1, -1), -1, True)
+        tb_graph.new_input(output,   (-1, -1, -1), -1, True)
+        self.kn_graph.customized([input, weight, residual, output], tb_graph)
+        self.kn_graph.register_task(tb_graph, "linear_with_residual_sm100_v3",
+                                     [-1, 1, tiles_per_task])
+
+    def linear_with_residual_layer_v2(
+        self,
+        input: DTensor,
+        weight: DTensor,
+        residual: DTensor,
+        output: DTensor,
+        block_dim: tuple = (192, 1, 1),
+    ):
+        """v2 linear with residual."""
+        assert input.num_dims == 2
+        assert weight.num_dims == 2
+        assert residual.num_dims == 2
+        assert output.num_dims == 2
+        N = weight.dim(0)
+        assert N % 128 == 0, f"linear_with_residual_layer_v2 requires N divisible by 128, got {N}"
+        grid_dim = (N // 128, 1, 1)
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(input,    (-1, -1, -1), 1, True)
+        tb_graph.new_input(weight,   (-1, -1, -1), 1, True)
+        tb_graph.new_input(residual, (-1, -1, -1), -1, True)
+        tb_graph.new_input(output,   (-1, -1, -1), -1, True)
+        self.kn_graph.customized([input, weight, residual, output], tb_graph)
+        self.kn_graph.register_task(tb_graph, "linear_with_residual_sm100_v2", [])
+
+
     def linear_with_residual_layer(
         self,
         input: DTensor,
@@ -3957,7 +4116,9 @@ class PersistentKernel:
         tb_graph.new_input(input, (1, -1, -1), 1, True)
         tb_graph.new_input(output, (1, -1, -1), 1, True)
         self.kn_graph.customized([input, output], tb_graph)
-        self.kn_graph.register_task(tb_graph, "silu_mul" if self.target_cc == 90 else "silu_mul")
+        self.kn_graph.register_task(
+            tb_graph, "silu_mul_v2" if self.use_v2_runtime else "silu_mul"
+        )
 
     def identity_layer(
         self,
@@ -4068,7 +4229,11 @@ class PersistentKernel:
         tb_graph.new_input(output_index, (1, 0, -1), -1, True)
         self.kn_graph.customized([input, output_value, output_index], tb_graph)
         if self.target_cc == 100 or self.target_cc == 90:
-            self.kn_graph.register_task(tb_graph, "argmax_partial_sm100", [num_tasks])
+            self.kn_graph.register_task(
+                tb_graph,
+                "argmax_partial_sm100_v2" if self.use_v2_runtime else "argmax_partial_sm100",
+                [num_tasks],
+            )
         else:
             self.kn_graph.register_task(tb_graph, "argmax_partial", [num_tasks])
 
@@ -4092,7 +4257,9 @@ class PersistentKernel:
         self.kn_graph.customized([input_value, input_index, output], tb_graph)
         if self.target_cc == 100:
             self.kn_graph.register_task(
-                tb_graph, "argmax_reduce_sm100", [self.argmax_partial_output_size]
+                tb_graph,
+                "argmax_reduce_sm100_v2" if self.use_v2_runtime else "argmax_reduce_sm100",
+                [self.argmax_partial_output_size],
             )
         else:
             self.kn_graph.register_task(
@@ -4633,11 +4800,45 @@ class PersistentKernel:
         json_file_path = os.path.join(tempdir, "task_graph.json")
         # build if files are not exist
             
+        task_graph_json = results["json_file"]
+        if self.use_v2_runtime:
+            task_graph = json.loads(task_graph_json)
+            task_graph["v2_worker_task_queues"] = build_v2_worker_task_queues(
+                task_graph, self.num_workers)
+            task_graph_json = add_v2_region_smem_plan(json.dumps(task_graph))
+            if self.profiler_tensor is not None:
+                # kept for the trace exporter: lets it label slices with the
+                # global task index (t<pos>) by joining trace order with the
+                # per-SM queues.
+                self._v2_task_graph_for_prof = {
+                    "queues": task_graph["v2_worker_task_queues"],
+                    "task_types": [t.get("task_type", -1)
+                                   for t in task_graph.get("all_tasks", [])],
+                }
         with open(json_file_path, "w") as f:
-            f.write(results["json_file"])
-        hard_code = HARD_CODE
+            f.write(task_graph_json)
+        v2_include = '#include "persistent_kernel_v2.cuh"\n' if self.use_v2_runtime else ""
+        # Disambiguate "kernel::" in generated code so it always resolves to
+        # the global ::kernel namespace. On the mla branch, cutlass pulls in
+        # another "kernel" namespace that makes unqualified "kernel::" ambiguous.
+        import re
+        cuda_code_fixed = re.sub(r'\bkernel::', '::kernel::', results["cuda_code"])
+        # Avoid double-prefixing anything that was already ::kernel::
+        cuda_code_fixed = cuda_code_fixed.replace("::::kernel::", "::kernel::")
+        # Inject v2 include RIGHT AFTER the top persistent_kernel.cuh include so
+        # that namespaces like kernel::linear_v2 are in scope when generated
+        # _execute_task function body references them.
+        if v2_include:
+            cuda_code_fixed = cuda_code_fixed.replace(
+                '#include "persistent_kernel.cuh"\n',
+                '#include "persistent_kernel.cuh"\n' + v2_include,
+                1,
+            )
+            v2_include_at_end = ""
+        else:
+            v2_include_at_end = v2_include
         with open(cuda_code_path, "w") as f:
-            f.write(results["cuda_code"] + hard_code)
+            f.write(cuda_code_fixed + v2_include_at_end + HARD_CODE)
 
         if output_dir is not None:
             os.makedirs(output_dir, exist_ok=True)
@@ -4776,6 +4977,9 @@ class PersistentKernel:
         self.init_func = getattr(mod, "init_func")
         self.launch_func = getattr(mod, "launch_func")
         self.finalize_func = getattr(mod, "finalize_func")
+        if self.use_v2_runtime:
+            self.init_v2_func = getattr(mod, "init_v2_func")
+            self.launch_v2_func = getattr(mod, "launch_v2_func")
         print("Finished megakernel compilation...")
 
         expected_order = [
@@ -4842,6 +5046,9 @@ class PersistentKernel:
             model_tensor_ptrs,
             "",  # Empty JSON path = use __FILE__ based path during initial compile
         )
+
+        if self.use_v2_runtime:
+            self.init_v2_func()
 
         self._is_compiled = True
 
@@ -4975,7 +5182,10 @@ class PersistentKernel:
             stream_ptr = stream
         else:
             raise ValueError("Invalid stream object")
-        self.launch_func(stream_ptr)
+        if self.use_v2_runtime:
+            self.launch_v2_func(stream_ptr)
+        else:
+            self.launch_func(stream_ptr)
         if self.profiler_tensor is not None:
             from .profiler_persistent import export_to_csv, export_to_perfetto_trace
 
@@ -4985,9 +5195,14 @@ class PersistentKernel:
                 stem = f"mirage_{self.mpi_rank}"
 
             export_to_perfetto_trace(
-                self.profiler_tensor, stem + ".perfetto-trace"
+                self.profiler_tensor, stem + ".perfetto-trace",
+                task_graph=getattr(self, "_v2_task_graph_for_prof", None),
             )
             export_to_csv(self.profiler_tensor, stem + ".csv")
+
+            if self.use_v2_runtime:
+                from .prof import print_run_summary
+                print_run_summary(self.profiler_tensor)
 
     def __del__(self):
         if not self.__finalized__:

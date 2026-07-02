@@ -80,6 +80,12 @@ int const MAX_INPUTS_PER_TASK = 14;
 int const MAX_OUTPUTS_PER_TASK = 3;
 // B200 has 148 SMs — need more workers than the default 128
 int const MAX_NUM_WORKERS = 160;
+int const MAX_SMEM_REGIONS_PER_TASK = 16;
+// Must match v2_smem_planner.NUM_PAGES. The planner partitions a CTA's
+// dynamic SMEM into TASK_SMEM_PAGE_SIZE-sized pages; this is the per-task
+// page-id space and the size of the runtime page_finished mbarrier array.
+int const MAX_SMEM_PAGES_PER_TASK = 14;
+int const TASK_SMEM_PAGE_SIZE = 16 * 1024;
 
 enum TaskType {
   TASK_TERMINATE = 0,
@@ -135,6 +141,19 @@ enum TaskType {
   TASK_MOE_W13_FP8_SM100 = 248,
   TASK_MOE_W2_FP8_SM100 = 249,
   TASK_LINEAR_FP8_SWAPAB_WITH_RESIDUAL_SM100 = 250,
+  // v2 hand-written linear (blackwell_v2/linear_sm100_v2.cuh).
+  // Uses rank=3 TMA descriptors and runtime tile_idx from task_metadata.
+  // Values placed inside TASK_SM100_TMA range (231..256) so
+  // create_tma_desc_by_task fires via the range check in the generated .cu.
+  // NOTE (v2-merge renumber): upstream used 246/247, which collide with
+  // TASK_SPLITK_LINEAR_FP8_SWAPAB_SM100/TASK_LINEAR_FP8_SWAPAB_SM100 on this
+  // branch — moved to the free 242/243 slots (still inside the TMA range).
+  TASK_LINEAR_SM100_V2 = 242,
+  TASK_LINEAR_WITH_RESIDUAL_SM100_V2 = 243,
+  // v3 linear (blackwell_v2/linear_sm100_v3.cuh): Channel+drain primitives.
+  // Same TMA-range trigger as v2 (231..256).
+  TASK_LINEAR_SM100_V3 = 244,
+  TASK_LINEAR_WITH_RESIDUAL_SM100_V3 = 245,
   TASK_SPLITK_LINEAR_SM100 = 251,
   TASK_LINEAR_WITH_RESIDUAL_SM100 = 252,
   TASK_LINEAR_SM100 = 253,
@@ -215,12 +234,28 @@ enum TaskType {
   // Fully-fused FFN megakernel (the default decode MoE-FFN path): absorbs
   // rmsnorm + router-gate-GEMV + topk-sigmoid + the whole MoE chain.
   TASK_FFN_FULL_MEGAKERNEL_SM100 = 325,
-  // Fully-fused DENSE-MLP megakernel (env-gated MPK_DSV3_DENSE_MLP_MEGAKERNEL=1):
-  // dense layers 0-2 = post-attn RMSNorm + W13(gate+up) GEMV + silu(gate)*up +
-  // W2(down) GEMV -> bf16 (pre-AllReduce). Uses the free 307 slot so
-  // TASK_SM100_TASK_END need not shift.
+  // Fully-fused DENSE-MLP megakernel (env-gated
+  // MPK_DSV3_DENSE_MLP_MEGAKERNEL=1): dense layers 0-2 = post-attn RMSNorm +
+  // W13(gate+up) GEMV + silu(gate)*up + W2(down) GEMV -> bf16 (pre-AllReduce).
+  // Uses the free 307 slot so TASK_SM100_TASK_END need not shift.
   TASK_DSV3_DENSE_MLP_FUSED_SM100 = 307,
-  TASK_SM100_TASK_END = 326, // SM100 end placeholder, not a real task
+  // v2 dispatch enums for non-linear Qwen3 tasks. Emit the same kernel calls
+  // as v1 (the blackwell_v2/ variants are near-identical), just through the
+  // v2 codegen path so the whole pipeline is dispatched uniformly. See
+  // register_X_v2_task functions in task_register.cc.
+  // NOTE (v2-merge renumber): upstream used 281..286, which collide with
+  // TASK_ELEMENTWISE_ADD_SM100..TASK_PROB_EXTRACT_SM100 on this branch —
+  // moved to 326..331 (deliberately OUTSIDE the TMA range 231..256:
+  // create_tma_desc_by_task's default asserts on unknown task types).
+  // TASK_SM100_TASK_END shifted 326 -> 335 to make room (placeholder only;
+  // nothing references its numeric value).
+  TASK_RMS_NORM_HOPPER_V2 = 326,
+  TASK_SILU_MUL_V2 = 327,
+  TASK_EMBEDDING_V2 = 328,
+  TASK_ATTN_SM100_V2 = 329,
+  TASK_ARGMAX_PARTIAL_SM100_V2 = 330,
+  TASK_ARGMAX_REDUCE_SM100_V2 = 331,
+  TASK_SM100_TASK_END = 335, // SM100 end placeholder, not a real task
   TASK_SCHD_TASKS = 200,
   TASK_SCHD_EVENTS = 201,
   TASK_GET_EVENT = 202,
@@ -266,13 +301,20 @@ struct EventDesc {
   TaskId first_task_id, last_task_id;
 };
 
+struct SmemPageRegionDesc {
+  int physical_page_start;
+  int page_count;
+  int byte_offset;
+};
+
 struct FullTaskDesc {
   FullTaskDesc(TaskType t, int _variant_id)
       : task_type(t), variant_id(_variant_id), num_inputs(0), num_outputs(0),
-        trigger_event(EVENT_INVALID_ID), dependent_event(EVENT_INVALID_ID) {
+        trigger_event(EVENT_INVALID_ID), dependent_event(EVENT_INVALID_ID),
+        num_smem_regions(0) {
     task_metadata.raw_payload = ~0ull;
   }
-  FullTaskDesc() {
+  FullTaskDesc() : num_smem_regions(0) {
     task_metadata.raw_payload = ~0ull;
   }
   TaskType task_type;
@@ -282,6 +324,8 @@ struct FullTaskDesc {
   EventId dependent_event;
   TensorDesc inputs[MAX_INPUTS_PER_TASK];
   TensorDesc outputs[MAX_OUTPUTS_PER_TASK];
+  int num_smem_regions;
+  SmemPageRegionDesc smem_regions[MAX_SMEM_REGIONS_PER_TASK];
   union TaskMetadata {
     struct {
       int expert_offset; // Used for MoE
@@ -306,7 +350,7 @@ struct alignas(16) TaskDesc {
   TaskDesc(FullTaskDesc t)
       : task_type(t.task_type), variant_id(t.variant_id),
         trigger_event(t.trigger_event), dependent_event(t.dependent_event),
-        task_metadata(t.task_metadata) {
+        num_smem_regions(t.num_smem_regions), task_metadata(t.task_metadata) {
     for (int i = 0; i < t.num_inputs; i++) {
       input_ptrs[i] = t.inputs[i].base_ptr;
     }
@@ -325,8 +369,11 @@ struct alignas(16) TaskDesc {
       }
     }
 #endif
+    for (int i = 0; i < t.num_smem_regions; i++) {
+      smem_regions[i] = t.smem_regions[i];
+    }
   }
-  TaskDesc() {
+  TaskDesc() : num_smem_regions(0) {
     task_metadata.raw_payload = ~0ull;
   }
   TaskType task_type;
@@ -341,7 +388,22 @@ struct alignas(16) TaskDesc {
   void *output_tma_desc_ptrs[MAX_OUTPUTS_PER_TASK]
                             [mirage::config::MAX_TMA_DESC_PER_TENSOR];
 #endif
+  int num_smem_regions;
+  SmemPageRegionDesc smem_regions[MAX_SMEM_REGIONS_PER_TASK];
   FullTaskDesc::TaskMetadata task_metadata;
+
+  __device__ __forceinline__ int smem_region_offset(int region_idx) const {
+    SmemPageRegionDesc const &region = smem_regions[region_idx];
+    return region.physical_page_start * TASK_SMEM_PAGE_SIZE +
+           region.byte_offset;
+  }
+
+  // First physical page backing a region (for the cross-task page lifecycle —
+  // SmemRing records its stage pages from this). A region spanning N pages
+  // occupies [physical_page_start, +N).
+  __device__ __forceinline__ int smem_region_page(int region_idx) const {
+    return smem_regions[region_idx].physical_page_start;
+  }
 };
 
 struct RuntimeConfig {
@@ -443,6 +505,17 @@ struct RuntimeConfig {
 #ifdef USE_NVSHMEM
   nvshmem_team_t *nvshmem_teams;
 #endif
+  // v2 runtime: static per-SM task plan
+  // Per-SM plan covers ONE iteration; kernel loops iters on device.
+  size_t *v2_per_sm_task_positions; // flat array; size = sum of per-SM counts
+  size_t *v2_per_sm_task_offsets;   // size = num_workers+1; [start_i, end_i)
+  // Device-side iter barrier:
+  //   iter_sync_counter: all SMs atomic-add 1 at end of their iter
+  //   iter_go_counter:   SM 0 atomic-adds 1 after running prepare_next_batch
+  unsigned long long *v2_iter_sync_counter; // device memory, init 0
+  unsigned long long *v2_iter_go_counter;   // device memory, init 0
+  int v2_max_iters; // cap on decode steps (= max_seq_length)
+  bool v2_enabled;  // true when launched by launch_persistent_kernel_v2
 };
 
 } // namespace runtime
