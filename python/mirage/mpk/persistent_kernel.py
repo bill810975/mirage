@@ -323,6 +323,19 @@ def get_compile_command(
     # baseline otherwise).
     if os.environ.get("MPK_DSV3_AR_NVLS_PERTILE") == "1":
         flags = flags + ["-DMPK_DSV3_AR_NVLS_PERTILE"]
+    # MPK_DSV3_FFN_WARPSPEC={1,2,3}: hand-rolled warp-specialization experiment
+    # inside the FFN-full megakernel (Runtime-V2 mechanism, self-scheduled).
+    # 1 = loader-staged router SMEM pages (V2 page semaphores);
+    # 2 = + W7 topk-detour / L2 warm-up streams (measured net-NEGATIVE locally,
+    #     kept as the ablation arm);
+    # 3 = + paged loader->consumer W2 pipeline for Phase 3 (measured +2.5us
+    #     locally vs self-load — mechanism demo, not a perf lever).
+    # Default-OFF => default build byte-identical. Codegen-gated env var: an
+    # mpirun launcher must forward it explicitly with -x MPK_DSV3_FFN_WARPSPEC
+    # (see feedback_mpirun_x_env_gap).
+    _ffn_ws = os.environ.get("MPK_DSV3_FFN_WARPSPEC")
+    if _ffn_ws and _ffn_ws != "0":
+        flags = flags + [f"-DMPK_DSV3_FFN_WARPSPEC={int(_ffn_ws)}"]
     # DSv3 decode FAST megakernels: the box-validated attention + FFN-full wins
     # (ATTN_FAST barrier-removal + Phase-0 RMSNorm deep-fusion + W0-tail-lighten +
     # GEMV scalar-ILP consumer; FFN_FAST packed-half2 GEMV + FFN_FAST_ROUTING
