@@ -103,7 +103,12 @@ inline constexpr int TK_OFF_TOP8V = TK_OFF_GACTW + align_up_16(8 * 4);
 inline constexpr int TK_OFF_GSEL = TK_OFF_TOP8V + 64 * 4;
 inline constexpr int TK_OFF_GACTE = TK_OFF_GSEL + align_up_16(8 * 4);
 inline constexpr int TK_OFF_TOP8I = TK_OFF_GACTE + align_up_16(8 * 4);
-inline constexpr int TK_WORK_BYTES = TK_OFF_TOP8I + 64 * 4;
+// SMEM-resident meta (the folded w13_topk publishes the routing here instead
+// of / in addition to the GMEM meta tensor).
+inline constexpr int TK_OFF_META = TK_OFF_TOP8I + 64 * 4;
+// nwarps=7 cross-role tag-flags (u64[4]: [0] ACT_READY, [1..3] HELPER_DONE).
+inline constexpr int TK_OFF_FLAGS = TK_OFF_META + align_up_16(META_INTS * 4);
+inline constexpr int TK_WORK_BYTES = TK_OFF_FLAGS + 4 * 8;
 
 inline ::mirage::runtime::TaskSmemInfo make_topk_smem_info() {
   ::mirage::runtime::TaskSmemInfo info{TK_WORK_BYTES, /*alignment=*/1024, {}};
@@ -140,6 +145,70 @@ inline ::mirage::runtime::TaskSmemInfo make_silu_quant_smem_info() {
   return ::mirage::runtime::TaskSmemInfo{/*size=*/0, /*alignment=*/1, {}};
 }
 
+// ============================================================================
+// Folded 3-op chain (router_quant_rms -> w13_topk -> w2_silu): SMEM layouts.
+// ============================================================================
+
+// ---- T1' router_quant_rms regions ------------------------------------------
+// [0] NORM: staged hidden -> in-place normed bf16[HIDDEN] (14336 B) followed
+//     by the 4-float block-reduce scratch + the nwarps=7 tag-flags.
+// [1] RING: nwarps * RQ_RING_BYTES_PER_WARP
+inline constexpr int RQR_OFF_RED = HIDDEN * 2; // bytes; float[4] warp partials
+inline constexpr int RQR_OFF_FLAGS = RQR_OFF_RED + align_up_16(4 * 4);
+inline constexpr int RQR_NORM_BYTES = RQR_OFF_FLAGS + 4 * 8;
+
+inline ::mirage::runtime::TaskSmemInfo
+    make_router_quant_rms_smem_info(int nwarps) {
+  int const ring_bytes = nwarps * RQ_RING_BYTES_PER_WARP;
+  ::mirage::runtime::TaskSmemInfo info{RQR_NORM_BYTES + ring_bytes,
+                                       /*alignment=*/1024,
+                                       {}};
+  info.regions.push_back({"rqr_norm", RQR_NORM_BYTES, 1024, /*page_count=*/1,
+                          /*can_pack=*/false, /*release_step=*/2,
+                          /*contiguous=*/true});
+  info.regions.push_back({"rqr_ring", ring_bytes, 1024, /*page_count=*/1,
+                          /*can_pack=*/true, /*release_step=*/2,
+                          /*contiguous=*/true});
+  return info;
+}
+
+// ---- T2' w13_topk regions ----------------------------------------------------
+// [0] ACT (same as w13)  [1] RING (nwarps pages)  [2] TK work (packed)
+inline constexpr int W13TK_REGION_ACT = 0;
+inline constexpr int W13TK_REGION_RING = 1;
+inline constexpr int W13TK_REGION_TK = 2;
+
+inline ::mirage::runtime::TaskSmemInfo make_w13_topk_smem_info(int nwarps) {
+  int const act_bytes = HIDDEN + KG1 * 4;
+  int const ring_bytes = nwarps * GEMV_RING_BYTES_PER_WARP;
+  ::mirage::runtime::TaskSmemInfo info{act_bytes + ring_bytes + TK_WORK_BYTES,
+                                       /*alignment=*/1024,
+                                       {}};
+  info.regions.push_back({"w13tk_act", act_bytes, 1024, /*page_count=*/1,
+                          /*can_pack=*/false, /*release_step=*/2,
+                          /*contiguous=*/true});
+  info.regions.push_back({"w13tk_ring", ring_bytes, 1024,
+                          /*page_count=*/nwarps, /*can_pack=*/false,
+                          /*release_step=*/2, /*contiguous=*/true});
+  info.regions.push_back({"w13tk_tk", TK_WORK_BYTES, 1024, /*page_count=*/1,
+                          /*can_pack=*/true, /*release_step=*/2,
+                          /*contiguous=*/true});
+  return info;
+}
+
+// ---- T3' w2_silu regions -----------------------------------------------------
+// [0] ACT (same layout as w2: i_fp8|i_scale|si_fp8|si_scale, but COMPUTED by
+//     the in-task silu instead of cp.async-staged)
+// [1] RING (nwarps pages). The first MAX_ACTIVE*W13_N*4 + SH_GU_N*4 bytes
+//     (34 KB <= 4*16 KB) double as the y13/sg staging area during the silu
+//     phase; the GEMV reuses the ring after the post-silu consumer barrier.
+// make_w2_silu_smem_info (== make_w2_smem_info) is defined after the w2
+// section below.
+inline constexpr int W2S_RING_Y13_OFF = 0;
+inline constexpr int W2S_RING_SG_OFF = MAX_ACTIVE * W13_N * 4; // 32768
+static_assert(W2S_RING_SG_OFF + SH_GU_N * 4 <= 4 * GEMV_RING_BYTES_PER_WARP,
+              "y13/sg staging must fit the 4 consumer ring slices");
+
 // ---- T5 w2_gemv regions ------------------------------------------------------
 // [0] ACT: i_fp8 u8[8*512] @0 | i_scale f32[8*4] @4096 | si_fp8 u8[256] @4224
 //          | si_scale f32[2] @4480   (4488 B)
@@ -150,7 +219,10 @@ inline constexpr int W2_ACT_ISCALE_OFF = MAX_ACTIVE * W2_K;             // 4096
 inline constexpr int W2_ACT_SIFP8_OFF =
     W2_ACT_ISCALE_OFF + MAX_ACTIVE * KG2 * 4;                           // 4224
 inline constexpr int W2_ACT_SISCALE_OFF = W2_ACT_SIFP8_OFF + SH_DN_K;   // 4480
-inline constexpr int W2_ACT_BYTES = W2_ACT_SISCALE_OFF + KG_SHDN * 4;   // 4488
+// nwarps=7 cross-role tag-flags (u64[4]); 16B-aligned tail.
+inline constexpr int W2_ACT_FLAGS_OFF =
+    align_up_16(W2_ACT_SISCALE_OFF + KG_SHDN * 4);                      // 4496
+inline constexpr int W2_ACT_BYTES = W2_ACT_FLAGS_OFF + 4 * 8;           // 4528
 
 inline ::mirage::runtime::TaskSmemInfo make_w2_smem_info(int nwarps) {
   int const ring_bytes = nwarps * GEMV_RING_BYTES_PER_WARP;
@@ -164,6 +236,10 @@ inline ::mirage::runtime::TaskSmemInfo make_w2_smem_info(int nwarps) {
                           /*page_count=*/nwarps, /*can_pack=*/false,
                           /*release_step=*/2, /*contiguous=*/true});
   return info;
+}
+
+inline ::mirage::runtime::TaskSmemInfo make_w2_silu_smem_info(int nwarps) {
+  return make_w2_smem_info(nwarps); // identical region shapes
 }
 
 } // namespace dsv3_ffn_v2

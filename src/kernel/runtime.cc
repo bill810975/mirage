@@ -587,7 +587,20 @@ void register_mugraph(
                 task_type == TASK_DSV3_FFN_TOPK_SIGMOID_V2 ||
                 task_type == TASK_DSV3_FFN_W13_GEMV_V2 ||
                 task_type == TASK_DSV3_FFN_SILU_QUANT_V2 ||
-                task_type == TASK_DSV3_FFN_W2_GEMV_V2) {
+                task_type == TASK_DSV3_FFN_W2_GEMV_V2 ||
+                task_type == TASK_DSV3_FFN_ROUTER_QUANT_RMS_V2 ||
+                task_type == TASK_DSV3_FFN_W13_TOPK_V2 ||
+                task_type == TASK_DSV3_FFN_W2_SILU_V2) {
+              task.task_metadata.task_offset = bid.x;
+            }
+            // DSv3 ATTN v2 chain: every op strides / indexes its item
+            // space by task_offset (= bid.x).
+            if (task_type == TASK_DSV3_ATTN_P0_QKVA_V2 ||
+                task_type == TASK_DSV3_ATTN_QB_ROPE_KV_V2 ||
+                task_type == TASK_DSV3_ATTN_MLA_PARTIAL_V2 ||
+                task_type == TASK_DSV3_ATTN_MLA_MERGE_V2 ||
+                task_type == TASK_DSV3_ATTN_WUV_V2 ||
+                task_type == TASK_DSV3_ATTN_OPROJ_V2) {
               task.task_metadata.task_offset = bid.x;
             }
             // Initialize input tensors to the task
@@ -2084,6 +2097,19 @@ TaskGraphResult print_task_graph(
   task_type_to_name[TASK_DSV3_FFN_SILU_QUANT_V2] =
       "TASK_DSV3_FFN_SILU_QUANT_V2";
   task_type_to_name[TASK_DSV3_FFN_W2_GEMV_V2] = "TASK_DSV3_FFN_W2_GEMV_V2";
+  task_type_to_name[TASK_DSV3_ATTN_P0_QKVA_V2] = "TASK_DSV3_ATTN_P0_QKVA_V2";
+  task_type_to_name[TASK_DSV3_ATTN_QB_ROPE_KV_V2] =
+      "TASK_DSV3_ATTN_QB_ROPE_KV_V2";
+  task_type_to_name[TASK_DSV3_ATTN_MLA_PARTIAL_V2] =
+      "TASK_DSV3_ATTN_MLA_PARTIAL_V2";
+  task_type_to_name[TASK_DSV3_ATTN_MLA_MERGE_V2] =
+      "TASK_DSV3_ATTN_MLA_MERGE_V2";
+  task_type_to_name[TASK_DSV3_ATTN_WUV_V2] = "TASK_DSV3_ATTN_WUV_V2";
+  task_type_to_name[TASK_DSV3_ATTN_OPROJ_V2] = "TASK_DSV3_ATTN_OPROJ_V2";
+  task_type_to_name[TASK_DSV3_FFN_ROUTER_QUANT_RMS_V2] =
+      "TASK_DSV3_FFN_ROUTER_QUANT_RMS_V2";
+  task_type_to_name[TASK_DSV3_FFN_W13_TOPK_V2] = "TASK_DSV3_FFN_W13_TOPK_V2";
+  task_type_to_name[TASK_DSV3_FFN_W2_SILU_V2] = "TASK_DSV3_FFN_W2_SILU_V2";
   task_type_to_name[TASK_SPLITK_LINEAR_SM100] = "TASK_SPLITK_LINEAR_SM100";
   task_type_to_name[TASK_ATTN_SM100] = "TASK_ATTN_SM100";
   task_type_to_name[TASK_ARGMAX_PARTIAL_SM100] = "TASK_ARGMAX_PARTIAL_SM100";

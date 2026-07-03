@@ -21,25 +21,26 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 PY = sys.executable
 
 
-def build_cases(what: str, repeats: int, nwarps: int, L: int, iters: int):
+def build_cases(what: str, repeats: int, nwarps: int, L: int, iters: int,
+                fold: bool = False):
     cases = []
     if what in ("correctness", "all"):
         cases.append({"name": "ffn_corr_typical", "mode": "ffn_correctness",
-                      "nwarps": nwarps, "timeout_s": 2400})
+                      "nwarps": nwarps, "fold": fold, "timeout_s": 2400})
         cases.append({"name": "ffn_corr_local8", "mode": "ffn_correctness",
                       "force_local8": True, "dump_inputs": False,
-                      "nwarps": nwarps, "timeout_s": 2400})
+                      "nwarps": nwarps, "fold": fold, "timeout_s": 2400})
     if what in ("perf", "all"):
         for r in range(repeats):
             cases.append({"name": f"ffn_perf_prof_r{r}", "mode": "ffn_perf",
                           "profiled": True, "L": L, "iters": iters,
-                          "nwarps": nwarps, "timeout_s": 3000})
+                          "nwarps": nwarps, "fold": fold, "timeout_s": 3000})
         cases.append({"name": "ffn_perf_nowall", "mode": "ffn_perf",
                       "profiled": False, "L": L, "iters": iters,
-                      "nwarps": nwarps, "timeout_s": 3000})
+                      "nwarps": nwarps, "fold": fold, "timeout_s": 3000})
         cases.append({"name": "ffn_perf_prof_local8", "mode": "ffn_perf",
                       "profiled": True, "L": L, "iters": iters,
-                      "force_local8": True, "nwarps": nwarps,
+                      "force_local8": True, "nwarps": nwarps, "fold": fold,
                       "timeout_s": 3000})
     return cases
 
@@ -85,6 +86,9 @@ def main():
     ap.add_argument("--nwarps", type=int, default=4, choices=[4, 7])
     ap.add_argument("--L", type=int, default=3)
     ap.add_argument("--iters", type=int, default=32)
+    ap.add_argument("--fold", action="store_true",
+                    help="folded 3-op chain (router_quant_rms/w13_topk/"
+                         "w2_silu) instead of the 6-op chain")
     ap.add_argument("--tag", default="ffn_r0")
     args = ap.parse_args()
 
@@ -93,7 +97,7 @@ def main():
     os.makedirs(tag_dir, exist_ok=True)
 
     cases = build_cases(args.what, args.repeats, args.nwarps, args.L,
-                        args.iters)
+                        args.iters, fold=args.fold)
     all_results = []
     for case in cases:  # serial (verdict-grade: quiet, one at a time)
         print(f"[ffn_suite] running {case['name']} on cuda:{device} ...",

@@ -662,6 +662,52 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
         customized->bgraph, params);
     task_config[op] =
         std::make_tuple(9, 1, TASK_DSV3_FFN_W2_GEMV_V2, variant_id);
+  } else if (name == "dsv3_attn_p0_qkva_v2") {
+    int variant_id = task_register->register_dsv3_attn_p0_qkva_v2_task(
+        customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(4, 1, TASK_DSV3_ATTN_P0_QKVA_V2, variant_id);
+  } else if (name == "dsv3_attn_qb_rope_kv_v2") {
+    int variant_id = task_register->register_dsv3_attn_qb_rope_kv_v2_task(
+        customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(7, 1, TASK_DSV3_ATTN_QB_ROPE_KV_V2, variant_id);
+  } else if (name == "dsv3_attn_mla_partial_v2") {
+    int variant_id = task_register->register_dsv3_attn_mla_partial_v2_task(
+        customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(4, 1, TASK_DSV3_ATTN_MLA_PARTIAL_V2, variant_id);
+  } else if (name == "dsv3_attn_mla_merge_v2") {
+    int variant_id = task_register->register_dsv3_attn_mla_merge_v2_task(
+        customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(4, 1, TASK_DSV3_ATTN_MLA_MERGE_V2, variant_id);
+  } else if (name == "dsv3_attn_wuv_v2") {
+    int variant_id = task_register->register_dsv3_attn_wuv_v2_task(
+        customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(4, 1, TASK_DSV3_ATTN_WUV_V2, variant_id);
+  } else if (name == "dsv3_attn_oproj_v2") {
+    int variant_id = task_register->register_dsv3_attn_oproj_v2_task(
+        customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(4, 1, TASK_DSV3_ATTN_OPROJ_V2, variant_id);
+  } else if (name == "dsv3_ffn_router_quant_rms_v2") {
+    int variant_id =
+        task_register->register_dsv3_ffn_router_quant_rms_v2_task(
+            customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(6, 1, TASK_DSV3_FFN_ROUTER_QUANT_RMS_V2, variant_id);
+  } else if (name == "dsv3_ffn_w13_topk_v2") {
+    int variant_id = task_register->register_dsv3_ffn_w13_topk_v2_task(
+        customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(10, 2, TASK_DSV3_FFN_W13_TOPK_V2, variant_id);
+  } else if (name == "dsv3_ffn_w2_silu_v2") {
+    int variant_id = task_register->register_dsv3_ffn_w2_silu_v2_task(
+        customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(11, 1, TASK_DSV3_FFN_W2_SILU_V2, variant_id);
   } else if (name == "splitk_linear_sm100") {
     int variant_id = task_register->register_splitk_linear_sm100_task(
         customized->bgraph, params, false /*with_residual*/);

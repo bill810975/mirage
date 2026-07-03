@@ -278,7 +278,24 @@ enum TaskType {
   TASK_DSV3_FFN_W13_GEMV_V2 = 334,
   TASK_DSV3_FFN_SILU_QUANT_V2 = 335,
   TASK_DSV3_FFN_W2_GEMV_V2 = 336,
-  TASK_SM100_TASK_END = 340, // SM100 end placeholder, not a real task
+  // Folded 3-op variant of the same chain (small-op serialization removed by
+  // replicating v1's redundant-per-CTA rmsnorm/topk/silu inside the MAC
+  // tasks): router_quant_rms -> w13_topk -> w2_silu.
+  TASK_DSV3_FFN_ROUTER_QUANT_RMS_V2 = 337,
+  TASK_DSV3_FFN_W13_TOPK_V2 = 338,
+  TASK_DSV3_FFN_W2_SILU_V2 = 339,
+  // DSv3 fused-ATTN block as a v2 task CHAIN (Step 3b of the V2 migration):
+  // p0_qkva -> qb_rope_kv -> mla_partial -> mla_merge -> wuv -> oproj.
+  // Deliberately OUTSIDE the TMA range 231..256 (create_tma_desc_by_task
+  // asserts on unknown types inside it). TASK_SM100_TASK_END shifted
+  // 340 -> 346 (placeholder only).
+  TASK_DSV3_ATTN_P0_QKVA_V2 = 340,
+  TASK_DSV3_ATTN_QB_ROPE_KV_V2 = 341,
+  TASK_DSV3_ATTN_MLA_PARTIAL_V2 = 342,
+  TASK_DSV3_ATTN_MLA_MERGE_V2 = 343,
+  TASK_DSV3_ATTN_WUV_V2 = 344,
+  TASK_DSV3_ATTN_OPROJ_V2 = 345,
+  TASK_SM100_TASK_END = 346, // SM100 end placeholder, not a real task
   TASK_SCHD_TASKS = 200,
   TASK_SCHD_EVENTS = 201,
   TASK_GET_EVENT = 202,

@@ -4030,6 +4030,231 @@ class PersistentKernel:
         self.kn_graph.register_task(tb_graph, "dsv3_ffn_w2_gemv_v2",
                                     [nwarps, rblk])
 
+    # ------------------------------------------------------------------
+    # FOLDED 3-op variant of the DSv3 FFN chain: the 1-task serial ops
+    # (rmsnorm / topk / silu) are recomputed redundantly inside the MAC
+    # tasks (v1's per-CTA trick):
+    #   dsv3_ffn_router_quant_rms_layer -> dsv3_ffn_w13_topk_layer ->
+    #   dsv3_ffn_w2_silu_layer
+    # Same hidden-write / alias conventions as the 6-op chain.
+    # ------------------------------------------------------------------
+    def dsv3_ffn_router_quant_rms_layer(
+        self,
+        input: DTensor,        # PRE-rmsnorm hidden bf16 (1,7168) [chain in]
+        rms_weight: DTensor,   # bf16 (7168,)
+        gate_weight: DTensor,  # router gate bf16 (256, 7168)
+        a_fp8: DTensor,        # u8 (7168,)     hidden write
+        a_scale: DTensor,      # f32 (56,)      hidden write
+        rmsnorm_out: DTensor,  # bf16 (1,7168)  hidden write (task 0 artifact)
+        inter: DTensor,        # f32 (256, 4)   [chain edge out]
+        num_tasks: int,
+        nwarps: int = 4,
+    ):
+        assert self.use_v2_runtime, "dsv3_ffn_* layers are v2-only"
+        assert nwarps in (4, 7)
+        tb_graph = TBGraph(CyTBGraph((num_tasks, 1, 1), (128, 1, 1), 1, 64))
+        for t in (input, rms_weight, gate_weight, a_fp8, a_scale,
+                  rmsnorm_out, inter):
+            tb_graph.new_input(t, (-1, -1, -1), -1, True)
+        self.kn_graph.customized(
+            [input, rms_weight, gate_weight, a_fp8, a_scale, rmsnorm_out,
+             inter], tb_graph)
+        self.kn_graph.register_task(tb_graph, "dsv3_ffn_router_quant_rms_v2",
+                                    [nwarps])
+
+    def dsv3_ffn_w13_topk_layer(
+        self,
+        inter: DTensor,       # f32 (256, 4)  [chain edge in]
+        bias: DTensor,        # f32 (256,) e_score_correction_bias
+        a_fp8: DTensor,       # u8 (7168,)    alias of router's hidden write
+        a_scale: DTensor,     # f32 (56,)     alias
+        w13: DTensor,         # u8 (128, 1024, 7168)
+        w13_scale: DTensor,   # f32 (128, 8, 56)
+        wgu: DTensor,         # u8 (512, 7168)
+        wgu_scale: DTensor,   # f32 (4, 56)
+        meta: DTensor,        # i32 (24,)     hidden write (task 0)
+        logits: DTensor,      # bf16 (256,)   hidden write (task 0 artifact)
+        y13: DTensor,         # f32 (8, 1024) [chain edge out]
+        sg: DTensor,          # f32 (512,)    [chain edge out]
+        num_tasks: int,
+        local_expert_start: int,
+        num_local_experts: int,
+        routed_scaling_factor: float = 2.5,
+        nwarps: int = 4,
+    ):
+        assert self.use_v2_runtime, "dsv3_ffn_* layers are v2-only"
+        assert nwarps in (4, 7)
+        import struct
+        rsf_bits = struct.unpack("<i", struct.pack("<f",
+                                                   routed_scaling_factor))[0]
+        tb_graph = TBGraph(CyTBGraph((num_tasks, 1, 1), (128, 1, 1), 1, 64))
+        for t in (inter, bias, a_fp8, a_scale, w13, w13_scale, wgu,
+                  wgu_scale, meta, logits, y13, sg):
+            tb_graph.new_input(t, (-1, -1, -1), -1, True)
+        self.kn_graph.customized(
+            [inter, bias, a_fp8, a_scale, w13, w13_scale, wgu, wgu_scale,
+             meta, logits, y13, sg], tb_graph)
+        self.kn_graph.register_task(
+            tb_graph, "dsv3_ffn_w13_topk_v2",
+            [nwarps, local_expert_start, num_local_experts, rsf_bits])
+
+    def dsv3_ffn_w2_silu_layer(
+        self,
+        y13: DTensor,         # f32 (8, 1024) [chain edge in]
+        sg: DTensor,          # f32 (512,)    [chain edge in]
+        meta: DTensor,        # i32 (24,)     alias (w13_topk's hidden write)
+        i_fp8: DTensor,       # u8 (8, 512)   hidden write (task 0 artifact)
+        i_scale: DTensor,     # f32 (8, 4)    hidden write (task 0)
+        si_fp8: DTensor,      # u8 (256,)     hidden write (task 0)
+        si_scale: DTensor,    # f32 (2,)      hidden write (task 0)
+        w2: DTensor,          # u8 (128, 7168, 512)
+        w2_scale: DTensor,    # f32 (128, 56, 4)
+        wdn: DTensor,         # u8 (7168, 256)
+        wdn_scale: DTensor,   # f32 (56, 2)
+        output: DTensor,      # bf16 (1, 7168) FFN block output
+        num_tasks: int,
+        nwarps: int = 4,
+        rblk: int = 16,
+    ):
+        assert self.use_v2_runtime, "dsv3_ffn_* layers are v2-only"
+        assert nwarps in (4, 7) and rblk in (8, 16)
+        tb_graph = TBGraph(CyTBGraph((num_tasks, 1, 1), (128, 1, 1), 1, 64))
+        for t in (y13, sg, meta, i_fp8, i_scale, si_fp8, si_scale, w2,
+                  w2_scale, wdn, wdn_scale, output):
+            tb_graph.new_input(t, (-1, -1, -1), -1, True)
+        self.kn_graph.customized(
+            [y13, sg, meta, i_fp8, i_scale, si_fp8, si_scale, w2, w2_scale,
+             wdn, wdn_scale, output], tb_graph)
+        self.kn_graph.register_task(tb_graph, "dsv3_ffn_w2_silu_v2",
+                                    [nwarps, rblk])
+
+    # ------------------------------------------------------------------
+    # DSv3 fused-ATTN block as a v2 task CHAIN (Step 3b of the V2 migration).
+    # v2-runtime only. The chain is:
+    #   dsv3_attn_p0_qkva_layer -> dsv3_attn_qb_rope_kv_layer ->
+    #   dsv3_attn_mla_partial_layer -> dsv3_attn_mla_merge_layer ->
+    #   dsv3_attn_wuv_layer -> dsv3_attn_oproj_layer
+    # Dep-graph contract (same as the FFN chain): each op's DECLARED output
+    # is read ONLY by the next op; kv_cache is a hidden write of qb_rope_kv
+    # and an ALIAS input of mla_partial; g_mla_m/l are hidden writes of
+    # mla_partial and aliases into mla_merge; residual is an ALIAS of the
+    # block input x (a declared edge would fork x between T1 and T6).
+    # Step-dependent ops take kv_offset: step = v2 iter_num + kv_offset.
+    # ------------------------------------------------------------------
+    def dsv3_attn_p0_qkva_layer(
+        self,
+        x,            # bf16 (1, 7168) RAW residual stream [chain edge in]
+        input_ln_w,   # bf16 (7168,)
+        qkv_a_w,      # fp8 (2176, 7168)
+        qkv_a_s,      # f32 (17, 56)
+        g_qkva,       # f32 (2176,)  [chain edge out]
+        num_tasks,
+    ):
+        assert self.use_v2_runtime, "dsv3_attn_* layers are v2-only"
+        tb_graph = TBGraph(CyTBGraph((num_tasks, 1, 1), (128, 1, 1), 1, 64))
+        for t in (x, input_ln_w, qkv_a_w, qkv_a_s, g_qkva):
+            tb_graph.new_input(t, (-1, -1, -1), -1, True)
+        self.kn_graph.customized(
+            [x, input_ln_w, qkv_a_w, qkv_a_s, g_qkva], tb_graph)
+        self.kn_graph.register_task(tb_graph, "dsv3_attn_p0_qkva_v2", [])
+
+    def dsv3_attn_qb_rope_kv_layer(
+        self,
+        g_qkva,       # f32 (2176,)  [chain edge in]
+        q_a_ln_w,     # bf16 (1536,)
+        kv_a_ln_w,    # bf16 (512,)
+        q_b_w,        # fp8 (9216, 1536) absorbed
+        q_b_s,        # f32 (72, 12)
+        cos_sin,      # bf16 (max_pos, 128) [cos(64)|sin(64)] per row
+        kv_cache,     # bf16 (rows, 576) hidden read/write (row [step])
+        g_qpe,        # f32 (9216,)  [chain edge out]
+        num_tasks,
+        kv_offset=0,
+    ):
+        assert self.use_v2_runtime, "dsv3_attn_* layers are v2-only"
+        tb_graph = TBGraph(CyTBGraph((num_tasks, 1, 1), (128, 1, 1), 1, 64))
+        for t in (g_qkva, q_a_ln_w, kv_a_ln_w, q_b_w, q_b_s, cos_sin,
+                  kv_cache, g_qpe):
+            tb_graph.new_input(t, (-1, -1, -1), -1, True)
+        self.kn_graph.customized(
+            [g_qkva, q_a_ln_w, kv_a_ln_w, q_b_w, q_b_s, cos_sin, kv_cache,
+             g_qpe], tb_graph)
+        self.kn_graph.register_task(tb_graph, "dsv3_attn_qb_rope_kv_v2",
+                                    [kv_offset])
+
+    def dsv3_attn_mla_partial_layer(
+        self,
+        g_qpe,        # f32 (9216,)  [chain edge in]
+        kv_cache,     # bf16 (rows, 576) ALIAS (fresh attach of the same
+                      #      torch tensor -> no edge; ordering via the chain)
+        g_mla_m,      # f32 (16, 8)  hidden write
+        g_mla_l,      # f32 (16, 8)  hidden write
+        g_mla_acc,    # f32 (16, 8, 512) [chain edge out]
+        kv_offset=0,
+    ):
+        assert self.use_v2_runtime, "dsv3_attn_* layers are v2-only"
+        tb_graph = TBGraph(CyTBGraph((128, 1, 1), (128, 1, 1), 1, 64))
+        for t in (g_qpe, kv_cache, g_mla_m, g_mla_l, g_mla_acc):
+            tb_graph.new_input(t, (-1, -1, -1), -1, True)
+        self.kn_graph.customized(
+            [g_qpe, kv_cache, g_mla_m, g_mla_l, g_mla_acc], tb_graph)
+        self.kn_graph.register_task(tb_graph, "dsv3_attn_mla_partial_v2",
+                                    [kv_offset])
+
+    def dsv3_attn_mla_merge_layer(
+        self,
+        g_mla_acc,    # f32 (16, 8, 512) [chain edge in]
+        g_mla_m,      # f32 (16, 8)  alias
+        g_mla_l,      # f32 (16, 8)  alias
+        g_attn,       # f32 (16, 512) hidden write (pre-quant merge, compare)
+        g_attn_deq,   # f32 (16, 512) [chain edge out]
+        kv_offset=0,
+    ):
+        assert self.use_v2_runtime, "dsv3_attn_* layers are v2-only"
+        tb_graph = TBGraph(CyTBGraph((16, 1, 1), (128, 1, 1), 1, 64))
+        for t in (g_mla_acc, g_mla_m, g_mla_l, g_attn, g_attn_deq):
+            tb_graph.new_input(t, (-1, -1, -1), -1, True)
+        self.kn_graph.customized(
+            [g_mla_acc, g_mla_m, g_mla_l, g_attn, g_attn_deq], tb_graph)
+        self.kn_graph.register_task(tb_graph, "dsv3_attn_mla_merge_v2",
+                                    [kv_offset])
+
+    def dsv3_attn_wuv_layer(
+        self,
+        g_attn_deq,   # f32 (16, 512) [chain edge in]
+        kvbv_w,       # fp8 (16, 128, 512)
+        kvbv_s,       # f32 (16, 1, 4)
+        ready_ones,   # i32 (16,) constant 1s (satisfies the verbatim
+                      #      wuv_bmm_grid acquire-spin; the REAL handoff is
+                      #      the chain event)
+        g_red,        # f32 (2048,)  [chain edge out]
+        num_tasks,
+    ):
+        assert self.use_v2_runtime, "dsv3_attn_* layers are v2-only"
+        tb_graph = TBGraph(CyTBGraph((num_tasks, 1, 1), (128, 1, 1), 1, 64))
+        for t in (g_attn_deq, kvbv_w, kvbv_s, ready_ones, g_red):
+            tb_graph.new_input(t, (-1, -1, -1), -1, True)
+        self.kn_graph.customized(
+            [g_attn_deq, kvbv_w, kvbv_s, ready_ones, g_red], tb_graph)
+        self.kn_graph.register_task(tb_graph, "dsv3_attn_wuv_v2", [])
+
+    def dsv3_attn_oproj_layer(
+        self,
+        g_red,        # f32 (2048,)  [chain edge in]
+        oproj_w,      # fp8 (7168, 2048)
+        oproj_s,      # f32 (56, 16)
+        residual,     # bf16 (1, 7168) ALIAS of the block input x
+        output,       # bf16 (1, 7168) block output [next block's x]
+        num_tasks,
+    ):
+        assert self.use_v2_runtime, "dsv3_attn_* layers are v2-only"
+        tb_graph = TBGraph(CyTBGraph((num_tasks, 1, 1), (128, 1, 1), 1, 64))
+        for t in (g_red, oproj_w, oproj_s, residual, output):
+            tb_graph.new_input(t, (-1, -1, -1), -1, True)
+        self.kn_graph.customized(
+            [g_red, oproj_w, oproj_s, residual, output], tb_graph)
+        self.kn_graph.register_task(tb_graph, "dsv3_attn_oproj_v2", [])
+
     def linear_layer_v2(
         self,
         input: DTensor,

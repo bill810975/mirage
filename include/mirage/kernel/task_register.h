@@ -178,6 +178,27 @@ public:
                                            std::vector<int> const &params);
   int register_dsv3_ffn_w2_gemv_v2_task(threadblock::Graph const &bgraph,
                                         std::vector<int> const &params);
+  // Folded 3-op variant (router_quant_rms -> w13_topk -> w2_silu).
+  int register_dsv3_ffn_router_quant_rms_v2_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
+  int register_dsv3_ffn_w13_topk_v2_task(threadblock::Graph const &bgraph,
+                                         std::vector<int> const &params);
+  int register_dsv3_ffn_w2_silu_v2_task(threadblock::Graph const &bgraph,
+                                        std::vector<int> const &params);
+  // DSv3 fused-ATTN block as a v2 task chain (Step 3b of the V2 migration).
+  // See tasks/blackwell_v2/dsv3_attn_v2.cuh for the chain layout.
+  int register_dsv3_attn_p0_qkva_v2_task(threadblock::Graph const &bgraph,
+                                         std::vector<int> const &params);
+  int register_dsv3_attn_qb_rope_kv_v2_task(threadblock::Graph const &bgraph,
+                                            std::vector<int> const &params);
+  int register_dsv3_attn_mla_partial_v2_task(threadblock::Graph const &bgraph,
+                                             std::vector<int> const &params);
+  int register_dsv3_attn_mla_merge_v2_task(threadblock::Graph const &bgraph,
+                                           std::vector<int> const &params);
+  int register_dsv3_attn_wuv_v2_task(threadblock::Graph const &bgraph,
+                                     std::vector<int> const &params);
+  int register_dsv3_attn_oproj_v2_task(threadblock::Graph const &bgraph,
+                                       std::vector<int> const &params);
   int register_paged_attention_sm100_task(threadblock::Graph const &bgraph,
                                           std::vector<int> const &params);
   int register_argmax_partial_sm100_task(threadblock::Graph const &bgraph,

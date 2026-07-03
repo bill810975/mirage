@@ -18,6 +18,7 @@
 
 #include "mirage/persistent_kernel/tasks/blackwell_v2/argmax_v2_spec.h"
 #include "mirage/persistent_kernel/tasks/blackwell_v2/dsv3_ffn_v2_spec.h"
+#include "mirage/persistent_kernel/tasks/blackwell_v2/dsv3_attn_v2_spec.h"
 #include "mirage/persistent_kernel/tasks/blackwell_v2/embedding_v2_spec.h"
 #include "mirage/persistent_kernel/tasks/blackwell_v2/linear_sm100_v2_spec.h"
 #include "mirage/persistent_kernel/tasks/blackwell_v2/linear_spec.h"
@@ -9060,6 +9061,366 @@ int TaskRegister::register_dsv3_ffn_w2_gemv_v2_task(
       variant,
       ::kernel::dsv3_ffn_v2::make_w2_smem_info(nwarps));
   return variant;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Folded 3-op DSv3-FFN chain: router_quant_rms -> w13_topk -> w2_silu.
+// Same registration shape as the 6-op chain; the small serial ops (rmsnorm /
+// topk / silu) are recomputed redundantly per task inside the MAC bodies
+// (v1's per-CTA trick), removing 3 dep boundaries + ~32us of 1-task serial
+// work per block.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// params: [nwarps]. grid.x = num_tasks.
+int TaskRegister::register_dsv3_ffn_router_quant_rms_v2_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  assert(params.size() == 1);
+  int const nwarps = params[0];
+  assert(nwarps == 4 || nwarps == 7);
+  int const num_tasks = (int)bgraph.grid_dim.x;
+  std::vector<tb::TBInputOp *> input_ops, output_ops;
+  ffn_v2_split_ops(bgraph, 6, 1, input_ops, output_ops);
+  bool const multi_role = nwarps > 4;
+
+  auto emit_body = [&](mirage::transpiler::CodeKeeper &c) {
+    c.e("kernel::dsv3_ffn_v2::router_quant_rms_task_impl(");
+    c.e("    task_desc,");
+    c.e("    static_cast<int>(task_desc->task_metadata.task_offset),");
+    c.e("    $, $,", num_tasks, nwarps);
+    if (multi_role) {
+      // Monotonic tag (salted bijection of the per-SM instruction sequence):
+      // the cross-role handshake primitive (no mbars, no init_semaphores).
+      c.e("    ((unsigned long long)instruction_index + 1ull) * "
+          "0x9E3779B97F4A7C15ull);");
+    } else {
+      c.e("    0ull);");
+    }
+  };
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  emit_body(code);
+  int variant = register_task_variant(TASK_DSV3_FFN_ROUTER_QUANT_RMS_V2,
+                                      code.to_string());
+
+  mirage::transpiler::CodeKeeper consumer_code;
+  consumer_code.inc_indent();
+  emit_dep_wait_consumer_prefix(consumer_code);
+  emit_body(consumer_code);
+
+  TaskRoleVariantCode role_code{/*init_semaphores=*/"",
+                                /*loader=*/"",
+                                /*launcher=*/"",
+                                /*consumer=*/consumer_code.to_string(),
+                                /*storer=*/""};
+  if (multi_role) {
+    // Helpers run NO dep-prefix: their first action is the ACT_READY tag
+    // acquire, which chains through the consumer's dep-wait transitively
+    // (the same release/acquire composition the framework's SEM_DEP_READY
+    // pattern relies on). Saves 3 warps of event-spin per task.
+    mirage::transpiler::CodeKeeper helper_code;
+    helper_code.inc_indent();
+    emit_body(helper_code);
+    role_code.loader = helper_code.to_string();
+    role_code.launcher = helper_code.to_string();
+    role_code.storer = helper_code.to_string();
+  }
+  register_v2_task_role_variant(
+      TASK_DSV3_FFN_ROUTER_QUANT_RMS_V2, variant, role_code);
+  register_variant_smem_info(
+      TASK_DSV3_FFN_ROUTER_QUANT_RMS_V2,
+      variant,
+      ::kernel::dsv3_ffn_v2::make_router_quant_rms_smem_info(nwarps));
+  return variant;
+}
+
+// params: [nwarps, local_expert_start, num_local_experts, rsf_bits].
+int TaskRegister::register_dsv3_ffn_w13_topk_v2_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  assert(params.size() == 4);
+  int const nwarps = params[0];
+  int const les = params[1];
+  int const nle = params[2];
+  int const rsf_bits = params[3];
+  assert(nwarps == 4 || nwarps == 7);
+  int const num_tasks = (int)bgraph.grid_dim.x;
+  std::vector<tb::TBInputOp *> input_ops, output_ops;
+  ffn_v2_split_ops(bgraph, 10, 2, input_ops, output_ops);
+  bool const multi_role = nwarps > 4;
+
+  auto emit_body = [&](mirage::transpiler::CodeKeeper &c) {
+    c.e("kernel::dsv3_ffn_v2::w13_topk_task_impl(");
+    c.e("    task_desc,");
+    c.e("    static_cast<int>(task_desc->task_metadata.task_offset),");
+    c.e("    $, $,", num_tasks, nwarps);
+    if (multi_role) {
+      c.e("    ((unsigned long long)instruction_index + 1ull) * "
+          "0x9E3779B97F4A7C15ull,");
+    } else {
+      c.e("    0ull,");
+    }
+    c.e("    $, $,", les, nle);
+    c.e("    __int_as_float($));", rsf_bits);
+  };
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  emit_body(code);
+  int variant =
+      register_task_variant(TASK_DSV3_FFN_W13_TOPK_V2, code.to_string());
+
+  mirage::transpiler::CodeKeeper consumer_code;
+  consumer_code.inc_indent();
+  emit_dep_wait_consumer_prefix(consumer_code);
+  emit_body(consumer_code);
+
+  TaskRoleVariantCode role_code{/*init_semaphores=*/"",
+                                /*loader=*/"",
+                                /*launcher=*/"",
+                                /*consumer=*/consumer_code.to_string(),
+                                /*storer=*/""};
+  if (multi_role) {
+    // Helpers run NO dep-prefix: their first action is the ACT_READY tag
+    // acquire, which chains through the consumer's dep-wait transitively
+    // (the same release/acquire composition the framework's SEM_DEP_READY
+    // pattern relies on). Saves 3 warps of event-spin per task.
+    mirage::transpiler::CodeKeeper helper_code;
+    helper_code.inc_indent();
+    emit_body(helper_code);
+    role_code.loader = helper_code.to_string();
+    role_code.launcher = helper_code.to_string();
+    role_code.storer = helper_code.to_string();
+  }
+  register_v2_task_role_variant(TASK_DSV3_FFN_W13_TOPK_V2, variant, role_code);
+  register_variant_smem_info(
+      TASK_DSV3_FFN_W13_TOPK_V2,
+      variant,
+      ::kernel::dsv3_ffn_v2::make_w13_topk_smem_info(nwarps));
+  return variant;
+}
+
+// params: [nwarps, rblk]. grid.x = num_tasks.
+int TaskRegister::register_dsv3_ffn_w2_silu_v2_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  assert(params.size() == 2);
+  int const nwarps = params[0];
+  int const rblk = params[1];
+  assert(nwarps == 4 || nwarps == 7);
+  assert(rblk == 16 || rblk == 8);
+  int const num_tasks = (int)bgraph.grid_dim.x;
+  std::vector<tb::TBInputOp *> input_ops, output_ops;
+  ffn_v2_split_ops(bgraph, 11, 1, input_ops, output_ops);
+  bool const multi_role = nwarps > 4;
+
+  auto emit_body = [&](mirage::transpiler::CodeKeeper &c) {
+    c.e("kernel::dsv3_ffn_v2::w2_silu_task_impl<$>(", rblk);
+    c.e("    task_desc,");
+    c.e("    static_cast<int>(task_desc->task_metadata.task_offset),");
+    c.e("    $, $,", num_tasks, nwarps);
+    if (multi_role) {
+      c.e("    ((unsigned long long)instruction_index + 1ull) * "
+          "0x9E3779B97F4A7C15ull);");
+    } else {
+      c.e("    0ull);");
+    }
+  };
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  emit_body(code);
+  int variant =
+      register_task_variant(TASK_DSV3_FFN_W2_SILU_V2, code.to_string());
+
+  mirage::transpiler::CodeKeeper consumer_code;
+  consumer_code.inc_indent();
+  emit_dep_wait_consumer_prefix(consumer_code);
+  emit_body(consumer_code);
+
+  TaskRoleVariantCode role_code{/*init_semaphores=*/"",
+                                /*loader=*/"",
+                                /*launcher=*/"",
+                                /*consumer=*/consumer_code.to_string(),
+                                /*storer=*/""};
+  if (multi_role) {
+    // Helpers run NO dep-prefix: their first action is the ACT_READY tag
+    // acquire, which chains through the consumer's dep-wait transitively
+    // (the same release/acquire composition the framework's SEM_DEP_READY
+    // pattern relies on). Saves 3 warps of event-spin per task.
+    mirage::transpiler::CodeKeeper helper_code;
+    helper_code.inc_indent();
+    emit_body(helper_code);
+    role_code.loader = helper_code.to_string();
+    role_code.launcher = helper_code.to_string();
+    role_code.storer = helper_code.to_string();
+  }
+  register_v2_task_role_variant(TASK_DSV3_FFN_W2_SILU_V2, variant, role_code);
+  register_variant_smem_info(
+      TASK_DSV3_FFN_W2_SILU_V2,
+      variant,
+      ::kernel::dsv3_ffn_v2::make_w2_silu_smem_info(nwarps));
+  return variant;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DSv3 fused-ATTN block as a v2 task chain (Step 3b of the V2 migration).
+// Task bodies live in tasks/blackwell_v2/dsv3_attn_v2.cuh (they call the v1
+// attn_block_megakernel helpers verbatim / exact-tree-emulated). All ops are
+// stage-1 (4 consumer warps); role variants are consumer-only. The
+// step-dependent ops (qb_rope_kv / mla_partial / mla_merge) bake an int
+// kv_offset param and read the v2 iteration counter `iter_num` (in scope in
+// every v2 role case): step = iter_num + kv_offset.
+// ─────────────────────────────────────────────────────────────────────────────
+
+namespace {
+
+// Shared emit scaffold for the attn v2 family: plain variant + consumer-only
+// role variant (dep-prefix + body) + smem info.
+template <typename EmitFn>
+inline int register_attn_v2_common(TaskRegister *reg,
+                                   mirage::runtime::TaskType tt,
+                                   EmitFn emit,
+                                   ::mirage::runtime::TaskSmemInfo smem_info) {
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  emit(code);
+  int variant = reg->register_task_variant(tt, code.to_string());
+
+  mirage::transpiler::CodeKeeper consumer_code;
+  consumer_code.inc_indent();
+  emit_dep_wait_consumer_prefix(consumer_code);
+  emit(consumer_code);
+  reg->register_v2_task_role_variant(
+      tt,
+      variant,
+      TaskRoleVariantCode{/*init_semaphores=*/"",
+                          /*loader=*/"",
+                          /*launcher=*/"",
+                          /*consumer=*/consumer_code.to_string(),
+                          /*storer=*/""});
+  reg->register_variant_smem_info(tt, variant, smem_info);
+  return variant;
+}
+
+} // anonymous namespace
+
+// params: none. grid.x = num_tasks.
+int TaskRegister::register_dsv3_attn_p0_qkva_v2_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  assert(params.size() == 0);
+  int const num_tasks = (int)bgraph.grid_dim.x;
+  std::vector<tb::TBInputOp *> input_ops, output_ops;
+  ffn_v2_split_ops(bgraph, 4, 1, input_ops, output_ops);
+  auto emit = [&](mirage::transpiler::CodeKeeper &c) {
+    c.e("kernel::dsv3_attn_v2::p0_qkva_task_impl(");
+    c.e("    task_desc,");
+    c.e("    static_cast<int>(task_desc->task_metadata.task_offset),");
+    c.e("    $);", num_tasks);
+  };
+  return register_attn_v2_common(this,
+                                 TASK_DSV3_ATTN_P0_QKVA_V2,
+                                 emit,
+                                 ::kernel::dsv3_attn_v2::make_p0_qkva_smem_info());
+}
+
+// params: [kv_offset]. grid.x = num_tasks.
+int TaskRegister::register_dsv3_attn_qb_rope_kv_v2_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  assert(params.size() == 1);
+  int const kv_offset = params[0];
+  int const num_tasks = (int)bgraph.grid_dim.x;
+  std::vector<tb::TBInputOp *> input_ops, output_ops;
+  ffn_v2_split_ops(bgraph, 7, 1, input_ops, output_ops);
+  auto emit = [&](mirage::transpiler::CodeKeeper &c) {
+    c.e("kernel::dsv3_attn_v2::qb_rope_kv_task_impl(");
+    c.e("    task_desc,");
+    c.e("    static_cast<int>(task_desc->task_metadata.task_offset),");
+    c.e("    $, $, iter_num);", num_tasks, kv_offset);
+  };
+  return register_attn_v2_common(
+      this,
+      TASK_DSV3_ATTN_QB_ROPE_KV_V2,
+      emit,
+      ::kernel::dsv3_attn_v2::make_qb_rope_kv_smem_info());
+}
+
+// params: [kv_offset]. grid.x = 128 (16 heads x 8 static splits).
+int TaskRegister::register_dsv3_attn_mla_partial_v2_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  assert(params.size() == 1);
+  int const kv_offset = params[0];
+  assert((int)bgraph.grid_dim.x == 128);
+  std::vector<tb::TBInputOp *> input_ops, output_ops;
+  ffn_v2_split_ops(bgraph, 4, 1, input_ops, output_ops);
+  auto emit = [&](mirage::transpiler::CodeKeeper &c) {
+    c.e("kernel::dsv3_attn_v2::mla_partial_task_impl(");
+    c.e("    task_desc,");
+    c.e("    static_cast<int>(task_desc->task_metadata.task_offset),");
+    c.e("    $, iter_num);", kv_offset);
+  };
+  return register_attn_v2_common(
+      this,
+      TASK_DSV3_ATTN_MLA_PARTIAL_V2,
+      emit,
+      ::kernel::dsv3_attn_v2::make_mla_partial_smem_info());
+}
+
+// params: [kv_offset]. grid.x = 16 (one task per local head).
+int TaskRegister::register_dsv3_attn_mla_merge_v2_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  assert(params.size() == 1);
+  int const kv_offset = params[0];
+  assert((int)bgraph.grid_dim.x == 16);
+  std::vector<tb::TBInputOp *> input_ops, output_ops;
+  ffn_v2_split_ops(bgraph, 4, 1, input_ops, output_ops);
+  auto emit = [&](mirage::transpiler::CodeKeeper &c) {
+    c.e("kernel::dsv3_attn_v2::mla_merge_task_impl(");
+    c.e("    task_desc,");
+    c.e("    static_cast<int>(task_desc->task_metadata.task_offset),");
+    c.e("    $, iter_num);", kv_offset);
+  };
+  return register_attn_v2_common(
+      this,
+      TASK_DSV3_ATTN_MLA_MERGE_V2,
+      emit,
+      ::kernel::dsv3_attn_v2::make_mla_merge_smem_info());
+}
+
+// params: none. grid.x = num_tasks.
+int TaskRegister::register_dsv3_attn_wuv_v2_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  assert(params.size() == 0);
+  int const num_tasks = (int)bgraph.grid_dim.x;
+  std::vector<tb::TBInputOp *> input_ops, output_ops;
+  ffn_v2_split_ops(bgraph, 4, 1, input_ops, output_ops);
+  auto emit = [&](mirage::transpiler::CodeKeeper &c) {
+    c.e("kernel::dsv3_attn_v2::wuv_task_impl(");
+    c.e("    task_desc,");
+    c.e("    static_cast<int>(task_desc->task_metadata.task_offset),");
+    c.e("    $);", num_tasks);
+  };
+  return register_attn_v2_common(this,
+                                 TASK_DSV3_ATTN_WUV_V2,
+                                 emit,
+                                 ::kernel::dsv3_attn_v2::make_wuv_smem_info());
+}
+
+// params: none. grid.x = num_tasks.
+int TaskRegister::register_dsv3_attn_oproj_v2_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  assert(params.size() == 0);
+  int const num_tasks = (int)bgraph.grid_dim.x;
+  std::vector<tb::TBInputOp *> input_ops, output_ops;
+  ffn_v2_split_ops(bgraph, 4, 1, input_ops, output_ops);
+  auto emit = [&](mirage::transpiler::CodeKeeper &c) {
+    c.e("kernel::dsv3_attn_v2::oproj_task_impl(");
+    c.e("    task_desc,");
+    c.e("    static_cast<int>(task_desc->task_metadata.task_offset),");
+    c.e("    $);", num_tasks);
+  };
+  return register_attn_v2_common(this,
+                                 TASK_DSV3_ATTN_OPROJ_V2,
+                                 emit,
+                                 ::kernel::dsv3_attn_v2::make_oproj_smem_info());
 }
 
 } // namespace runtime

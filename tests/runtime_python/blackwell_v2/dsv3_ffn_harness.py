@@ -152,6 +152,27 @@ def build_ffn_block(pk, prefix: str, weights: dict, bufs: dict,
     i_scale_al = at(bufs["i_scale"], "iscale_alias")
     si_scale_al = at(bufs["si_scale"], "siscale_alias")
 
+    if cfg.get("fold"):
+        # FOLDED 3-op chain: rmsnorm/topk/silu recomputed redundantly inside
+        # the MAC tasks (v1's per-CTA trick). Same artifacts written (task-0
+        # hidden writes) so the correctness comparisons below are unchanged.
+        pk.dsv3_ffn_router_quant_rms_layer(
+            input=hidden_dt, rms_weight=rms_w, gate_weight=router_w,
+            a_fp8=a_fp8, a_scale=a_scale, rmsnorm_out=rmsnorm_out,
+            inter=inter, num_tasks=cfg["nr"], nwarps=cfg["nwarps_rq"])
+        pk.dsv3_ffn_w13_topk_layer(
+            inter=inter, bias=bias, a_fp8=a_fp8_al, a_scale=a_scale_al,
+            w13=w13, w13_scale=w13_s, wgu=wgu, wgu_scale=wgu_s, meta=meta,
+            logits=logits, y13=y13, sg=sg, num_tasks=cfg["nt13"],
+            local_expert_start=cfg["les"], num_local_experts=cfg["nle"],
+            routed_scaling_factor=cfg["rsf"], nwarps=cfg["nwarps_w13"])
+        pk.dsv3_ffn_w2_silu_layer(
+            y13=y13, sg=sg, meta=meta_al_w2, i_fp8=i_fp8, i_scale=i_scale,
+            si_fp8=si_fp8, si_scale=si_scale, w2=w2, w2_scale=w2_s,
+            wdn=wdn, wdn_scale=wdn_s, output=out, num_tasks=cfg["nt2"],
+            nwarps=cfg["nwarps_w2"], rblk=cfg["rblk"])
+        return out
+
     # T0 rmsnorm (existing v2 task)
     pk.rmsnorm_layer(input=hidden_dt, weight=rms_w, output=rmsnorm_out,
                      grid_dim=(1, 1, 1), block_dim=(128, 1, 1))
@@ -184,20 +205,34 @@ def build_ffn_block(pk, prefix: str, weights: dict, bufs: dict,
 
 def default_cfg(spec: dict) -> dict:
     nwarps = spec.get("nwarps", 4)
+    # per-op warp counts (fold chain only): default to the global nwarps.
+    nw_rq = spec.get("nwarps_rq", nwarps)
+    nw_w13 = spec.get("nwarps_w13", nwarps)
+    nw_w2 = spec.get("nwarps_w2", nwarps)
     return {
         "nr": spec.get("nr", 136),
         "nt13": spec.get("nt13", 136),
-        "nt2": spec.get("nt2", 64 if nwarps == 7 else 112),
+        "nt2": spec.get("nt2", 128 if nw_w2 == 7 else 112),
         "nwarps": nwarps,
-        "rblk": spec.get("rblk", 8 if nwarps == 7 else 16),
+        "nwarps_rq": nw_rq,
+        "nwarps_w13": nw_w13,
+        "nwarps_w2": nw_w2,
+        "rblk": spec.get("rblk", 8 if nw_w2 == 7 else 16),
         "les": spec.get("les", 0),
         "nle": spec.get("nle", 128),
         "rsf": spec.get("rsf", 2.5),
+        "fold": spec.get("fold", False),
     }
 
 
 # per-block op instances (for v2_prof_decode.summarize)
 def block_instances(i: int, cfg: dict):
+    if cfg.get("fold"):
+        return [
+            (i, "ffn_router_quant_rms", cfg["nr"]),
+            (i, "ffn_w13_topk", cfg["nt13"]),
+            (i, "ffn_w2_silu", cfg["nt2"]),
+        ]
     return [
         (i, "rmsnorm_7168", 1),
         (i, "ffn_router_quant", cfg["nr"]),
@@ -456,6 +491,24 @@ def run_ffn_perf_case(spec: dict, out_dir: str) -> dict:
     pk.compile(output_dir=os.path.join(out_dir, "compile"))
     result["compile_s"] = time.time() - t0
 
+    # Reviewer-mandated skip/race gate: poison every intermediate + output
+    # buffer (floats -> NaN, fp8 bytes -> 0xFF = e4m3 NaN, meta ints ->
+    # INT32_MAX) BEFORE the run. Any first-iteration protocol race / skipped
+    # stage that consumes an unwritten buffer propagates NaN into out (or
+    # corrupts meta/magic); caught by the post-run NaN scan + magic check +
+    # the bit-compare of outs.pt against a clean run. Never-consumed slots
+    # (y13/i_fp8 rows >= active_count) legitimately retain poison.
+    if spec.get("poison_fill"):
+        for b in all_bufs:
+            for _name, t in b.items():
+                if t.dtype in (torch.float32, torch.bfloat16):
+                    t.fill_(float("nan"))
+                elif t.dtype == torch.uint8:
+                    t.fill_(0xFF)
+                elif t.dtype == torch.int32:
+                    t.fill_(0x7FFFFFFF)
+        torch.cuda.synchronize()
+
     torch.cuda.synchronize()
     ev0 = torch.cuda.Event(enable_timing=True)
     ev1 = torch.cuda.Event(enable_timing=True)
@@ -470,6 +523,27 @@ def run_ffn_perf_case(spec: dict, out_dir: str) -> dict:
     result["active_counts"] = [int(b["meta"][0].item()) for b in all_bufs]
     result["meta_magic_ok"] = [int(b["meta"][1].item()) == R.META_MAGIC
                                for b in all_bufs]
+
+    if spec.get("save_outs"):
+        torch.save({i: {"out": all_bufs[i]["out"].cpu(),
+                        "meta": all_bufs[i]["meta"].cpu()}
+                    for i in range(L)}, os.path.join(out_dir, "outs.pt"))
+        result["out_nan_counts"] = [
+            int(torch.isnan(b["out"].float()).sum()) for b in all_bufs]
+
+    # Optional: dump each block's ACTUAL chain input (x0 for block 0, block
+    # i-1's out for i>0; steady-state deterministic) so the v1 driver can be
+    # run on the SAME bytes (--load-dir): writes b{i}/hidden.bin only — the
+    # weight files come from the seed dumps (identical generation).
+    if spec.get("dump_block_inputs"):
+        dd = spec["dump_block_inputs"]
+        prev = x0
+        for i in range(L):
+            d = os.path.join(dd, f"b{i}")
+            os.makedirs(d, exist_ok=True)
+            prev.contiguous().view(torch.uint16).cpu().numpy().tofile(
+                os.path.join(d, "hidden.bin"))
+            prev = all_bufs[i]["out"]
 
     if profiled:
         import numpy as np
