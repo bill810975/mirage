@@ -581,6 +581,15 @@ void register_mugraph(
                 task_type == TASK_LINEAR_WITH_RESIDUAL_SM100_V3) {
               task.task_metadata.task_offset = bid.x;
             }
+            // DSv3 FFN v2 chain: every multi-task op strides its item space
+            // by task_offset (= bid.x).
+            if (task_type == TASK_DSV3_FFN_ROUTER_QUANT_V2 ||
+                task_type == TASK_DSV3_FFN_TOPK_SIGMOID_V2 ||
+                task_type == TASK_DSV3_FFN_W13_GEMV_V2 ||
+                task_type == TASK_DSV3_FFN_SILU_QUANT_V2 ||
+                task_type == TASK_DSV3_FFN_W2_GEMV_V2) {
+              task.task_metadata.task_offset = bid.x;
+            }
             // Initialize input tensors to the task
             for (auto const &input : input_ops) {
               task.inputs[task.num_inputs++] = get_tensor_desc(input);
@@ -2067,6 +2076,14 @@ TaskGraphResult print_task_graph(
       "TASK_ARGMAX_PARTIAL_SM100_V2";
   task_type_to_name[TASK_ARGMAX_REDUCE_SM100_V2] =
       "TASK_ARGMAX_REDUCE_SM100_V2";
+  task_type_to_name[TASK_DSV3_FFN_ROUTER_QUANT_V2] =
+      "TASK_DSV3_FFN_ROUTER_QUANT_V2";
+  task_type_to_name[TASK_DSV3_FFN_TOPK_SIGMOID_V2] =
+      "TASK_DSV3_FFN_TOPK_SIGMOID_V2";
+  task_type_to_name[TASK_DSV3_FFN_W13_GEMV_V2] = "TASK_DSV3_FFN_W13_GEMV_V2";
+  task_type_to_name[TASK_DSV3_FFN_SILU_QUANT_V2] =
+      "TASK_DSV3_FFN_SILU_QUANT_V2";
+  task_type_to_name[TASK_DSV3_FFN_W2_GEMV_V2] = "TASK_DSV3_FFN_W2_GEMV_V2";
   task_type_to_name[TASK_SPLITK_LINEAR_SM100] = "TASK_SPLITK_LINEAR_SM100";
   task_type_to_name[TASK_ATTN_SM100] = "TASK_ATTN_SM100";
   task_type_to_name[TASK_ARGMAX_PARTIAL_SM100] = "TASK_ARGMAX_PARTIAL_SM100";

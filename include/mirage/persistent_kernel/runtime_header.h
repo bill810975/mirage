@@ -268,7 +268,17 @@ enum TaskType {
   TASK_ATTN_SM100_V2 = 329,
   TASK_ARGMAX_PARTIAL_SM100_V2 = 330,
   TASK_ARGMAX_REDUCE_SM100_V2 = 331,
-  TASK_SM100_TASK_END = 335, // SM100 end placeholder, not a real task
+  // DSv3 fused-FFN block as a v2 task CHAIN (Step 3a of the V2 migration):
+  // router_quant -> topk_sigmoid -> w13_gemv -> silu_quant -> w2_gemv (plus
+  // the existing rmsnorm_v2 in front). Deliberately OUTSIDE the TMA range
+  // 231..256 (create_tma_desc_by_task asserts on unknown types inside it).
+  // TASK_SM100_TASK_END shifted 335 -> 340 (placeholder only).
+  TASK_DSV3_FFN_ROUTER_QUANT_V2 = 332,
+  TASK_DSV3_FFN_TOPK_SIGMOID_V2 = 333,
+  TASK_DSV3_FFN_W13_GEMV_V2 = 334,
+  TASK_DSV3_FFN_SILU_QUANT_V2 = 335,
+  TASK_DSV3_FFN_W2_GEMV_V2 = 336,
+  TASK_SM100_TASK_END = 340, // SM100 end placeholder, not a real task
   TASK_SCHD_TASKS = 200,
   TASK_SCHD_EVENTS = 201,
   TASK_GET_EVENT = 202,

@@ -166,6 +166,18 @@ public:
                                             std::vector<int> const &params);
   int register_argmax_reduce_sm100_v2_task(threadblock::Graph const &bgraph,
                                            std::vector<int> const &params);
+  // DSv3 fused-FFN block as a v2 task chain (Step 3a of the V2 migration).
+  // See tasks/blackwell_v2/dsv3_ffn_v2.cuh for the chain layout.
+  int register_dsv3_ffn_router_quant_v2_task(threadblock::Graph const &bgraph,
+                                             std::vector<int> const &params);
+  int register_dsv3_ffn_topk_sigmoid_v2_task(threadblock::Graph const &bgraph,
+                                             std::vector<int> const &params);
+  int register_dsv3_ffn_w13_gemv_v2_task(threadblock::Graph const &bgraph,
+                                         std::vector<int> const &params);
+  int register_dsv3_ffn_silu_quant_v2_task(threadblock::Graph const &bgraph,
+                                           std::vector<int> const &params);
+  int register_dsv3_ffn_w2_gemv_v2_task(threadblock::Graph const &bgraph,
+                                        std::vector<int> const &params);
   int register_paged_attention_sm100_task(threadblock::Graph const &bgraph,
                                           std::vector<int> const &params);
   int register_argmax_partial_sm100_task(threadblock::Graph const &bgraph,

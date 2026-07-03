@@ -637,6 +637,31 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
         customized->bgraph, params);
     task_config[op] =
         std::make_tuple(2, 1, TASK_ARGMAX_REDUCE_SM100_V2, variant_id);
+  } else if (name == "dsv3_ffn_router_quant_v2") {
+    int variant_id = task_register->register_dsv3_ffn_router_quant_v2_task(
+        customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(4, 1, TASK_DSV3_FFN_ROUTER_QUANT_V2, variant_id);
+  } else if (name == "dsv3_ffn_topk_sigmoid_v2") {
+    int variant_id = task_register->register_dsv3_ffn_topk_sigmoid_v2_task(
+        customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(3, 1, TASK_DSV3_FFN_TOPK_SIGMOID_V2, variant_id);
+  } else if (name == "dsv3_ffn_w13_gemv_v2") {
+    int variant_id = task_register->register_dsv3_ffn_w13_gemv_v2_task(
+        customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(7, 2, TASK_DSV3_FFN_W13_GEMV_V2, variant_id);
+  } else if (name == "dsv3_ffn_silu_quant_v2") {
+    int variant_id = task_register->register_dsv3_ffn_silu_quant_v2_task(
+        customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(5, 2, TASK_DSV3_FFN_SILU_QUANT_V2, variant_id);
+  } else if (name == "dsv3_ffn_w2_gemv_v2") {
+    int variant_id = task_register->register_dsv3_ffn_w2_gemv_v2_task(
+        customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(9, 1, TASK_DSV3_FFN_W2_GEMV_V2, variant_id);
   } else if (name == "splitk_linear_sm100") {
     int variant_id = task_register->register_splitk_linear_sm100_task(
         customized->bgraph, params, false /*with_residual*/);

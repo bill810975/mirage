@@ -17,6 +17,7 @@
 #include "mirage/transpiler/utils.h"
 
 #include "mirage/persistent_kernel/tasks/blackwell_v2/argmax_v2_spec.h"
+#include "mirage/persistent_kernel/tasks/blackwell_v2/dsv3_ffn_v2_spec.h"
 #include "mirage/persistent_kernel/tasks/blackwell_v2/embedding_v2_spec.h"
 #include "mirage/persistent_kernel/tasks/blackwell_v2/linear_sm100_v2_spec.h"
 #include "mirage/persistent_kernel/tasks/blackwell_v2/linear_spec.h"
@@ -8754,6 +8755,310 @@ int TaskRegister::register_argmax_reduce_sm100_v2_task(
   TaskSmemInfo smem_info = ::kernel::argmax_v2::make_smem_info(
       /*t_size_bytes=*/2); // bf16
   register_variant_smem_info(TASK_ARGMAX_REDUCE_SM100_V2, variant, smem_info);
+  return variant;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DSv3 fused-FFN block as a v2 task chain (Step 3a of the V2 migration).
+// Task bodies live in tasks/blackwell_v2/dsv3_ffn_v2.cuh (they call the v1
+// ffn_full_megakernel helpers verbatim). Each MAC op supports two variants
+// selected by params: nwarps == 4 (stage 1, consumer-only — the v2-idiomatic
+// shape) or nwarps == 7 (stage 2 ablation: the same MAC body is ALSO emitted
+// into the loader/launcher/storer role cases so warp-slots 4/5/6 become
+// extra stride lanes; cross-role page-release safety via two op-private
+// dynamic semaphores, see the .cuh header comment).
+// ─────────────────────────────────────────────────────────────────────────────
+
+namespace {
+
+// init_semaphores body shared by the stage-2 (nwarps==7) MAC tasks:
+//   sem[SEM_OP_BASE+0] HELPERS_DONE (3 arrivals: loader/launcher/storer)
+//   sem[SEM_OP_BASE+1] ACT_READY    (1 arrival: consumer staging done)
+inline void
+    emit_ffn_v2_multirole_init_semaphores(mirage::transpiler::CodeKeeper &c) {
+  c.e("{");
+  c.e("  int const _slot = ring_slot(instruction_index);");
+  c.e("  uint64_t (*_sem)[MAX_DYNAMIC_SEMAPHORES] = "
+      "runtime_smem->dynamic_semaphores;");
+  c.e("  mbar_init(&_sem[_slot][SEM_OP_BASE + 0], 3);");
+  c.e("  mbar_init(&_sem[_slot][SEM_OP_BASE + 1], 1);");
+  c.e("  asm volatile(\"fence.mbarrier_init.release.cluster;\");");
+  c.e("}");
+}
+
+// Split a customized op's TB_INPUT_OP list into inputs/outputs by count.
+inline void ffn_v2_split_ops(tb::Graph const &bgraph,
+                             int num_inputs,
+                             int num_outputs,
+                             std::vector<tb::TBInputOp *> &input_ops,
+                             std::vector<tb::TBInputOp *> &output_ops) {
+  assert(bgraph.operators.size() == (size_t)(num_inputs + num_outputs));
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops.size() < (size_t)num_inputs) {
+      input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+}
+
+} // anonymous namespace
+
+// params: [nwarps]. grid.x = num_tasks.
+int TaskRegister::register_dsv3_ffn_router_quant_v2_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  assert(params.size() == 1);
+  int const nwarps = params[0];
+  assert(nwarps == 4 || nwarps == 7);
+  int const num_tasks = (int)bgraph.grid_dim.x;
+  std::vector<tb::TBInputOp *> input_ops, output_ops;
+  ffn_v2_split_ops(bgraph, 4, 1, input_ops, output_ops);
+  bool const multi_role = nwarps > 4;
+
+  auto emit_body = [&](mirage::transpiler::CodeKeeper &c) {
+    c.e("kernel::dsv3_ffn_v2::router_quant_task_impl(");
+    c.e("    task_desc,");
+    c.e("    static_cast<int>(task_desc->task_metadata.task_offset),");
+    c.e("    $, $,", num_tasks, nwarps);
+    if (multi_role) {
+      c.e("    op_sem_base_addr(runtime_smem, instruction_index));");
+    } else {
+      c.e("    -1);");
+    }
+  };
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  emit_body(code);
+  int variant =
+      register_task_variant(TASK_DSV3_FFN_ROUTER_QUANT_V2, code.to_string());
+
+  mirage::transpiler::CodeKeeper consumer_code;
+  consumer_code.inc_indent();
+  emit_dep_wait_consumer_prefix(consumer_code);
+  emit_body(consumer_code);
+
+  TaskRoleVariantCode role_code{/*init_semaphores=*/"",
+                                /*loader=*/"",
+                                /*launcher=*/"",
+                                /*consumer=*/consumer_code.to_string(),
+                                /*storer=*/""};
+  if (multi_role) {
+    mirage::transpiler::CodeKeeper init_code, helper_code;
+    init_code.inc_indent();
+    emit_ffn_v2_multirole_init_semaphores(init_code);
+    helper_code.inc_indent();
+    emit_dep_wait_consumer_prefix(helper_code);
+    emit_body(helper_code);
+    role_code.init_semaphores = init_code.to_string();
+    role_code.loader = helper_code.to_string();
+    role_code.launcher = helper_code.to_string();
+    role_code.storer = helper_code.to_string();
+  }
+  register_v2_task_role_variant(
+      TASK_DSV3_FFN_ROUTER_QUANT_V2, variant, role_code);
+  register_variant_smem_info(
+      TASK_DSV3_FFN_ROUTER_QUANT_V2,
+      variant,
+      ::kernel::dsv3_ffn_v2::make_router_quant_smem_info(nwarps));
+  return variant;
+}
+
+// params: [local_expert_start, num_local_experts, rsf_bits(fp32 bit pattern)]
+int TaskRegister::register_dsv3_ffn_topk_sigmoid_v2_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  assert(params.size() == 3);
+  int const les = params[0];
+  int const nle = params[1];
+  int const rsf_bits = params[2];
+  std::vector<tb::TBInputOp *> input_ops, output_ops;
+  ffn_v2_split_ops(bgraph, 3, 1, input_ops, output_ops);
+
+  auto emit_body = [&](mirage::transpiler::CodeKeeper &c) {
+    c.e("kernel::dsv3_ffn_v2::topk_sigmoid_task_impl(");
+    c.e("    task_desc,");
+    c.e("    $, $,", les, nle);
+    c.e("    __int_as_float($));", rsf_bits);
+  };
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  emit_body(code);
+  int variant =
+      register_task_variant(TASK_DSV3_FFN_TOPK_SIGMOID_V2, code.to_string());
+
+  mirage::transpiler::CodeKeeper consumer_code;
+  consumer_code.inc_indent();
+  emit_dep_wait_consumer_prefix(consumer_code);
+  emit_body(consumer_code);
+  register_v2_task_role_variant(
+      TASK_DSV3_FFN_TOPK_SIGMOID_V2,
+      variant,
+      TaskRoleVariantCode{/*init_semaphores=*/"",
+                          /*loader=*/"",
+                          /*launcher=*/"",
+                          /*consumer=*/consumer_code.to_string(),
+                          /*storer=*/""});
+  register_variant_smem_info(TASK_DSV3_FFN_TOPK_SIGMOID_V2,
+                             variant,
+                             ::kernel::dsv3_ffn_v2::make_topk_smem_info());
+  return variant;
+}
+
+// params: [nwarps]. grid.x = num_tasks.
+int TaskRegister::register_dsv3_ffn_w13_gemv_v2_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  assert(params.size() == 1);
+  int const nwarps = params[0];
+  assert(nwarps == 4 || nwarps == 7);
+  int const num_tasks = (int)bgraph.grid_dim.x;
+  std::vector<tb::TBInputOp *> input_ops, output_ops;
+  ffn_v2_split_ops(bgraph, 7, 2, input_ops, output_ops);
+  bool const multi_role = nwarps > 4;
+
+  auto emit_body = [&](mirage::transpiler::CodeKeeper &c) {
+    c.e("kernel::dsv3_ffn_v2::w13_gemv_task_impl(");
+    c.e("    task_desc,");
+    c.e("    static_cast<int>(task_desc->task_metadata.task_offset),");
+    c.e("    $, $,", num_tasks, nwarps);
+    if (multi_role) {
+      c.e("    op_sem_base_addr(runtime_smem, instruction_index));");
+    } else {
+      c.e("    -1);");
+    }
+  };
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  emit_body(code);
+  int variant =
+      register_task_variant(TASK_DSV3_FFN_W13_GEMV_V2, code.to_string());
+
+  mirage::transpiler::CodeKeeper consumer_code;
+  consumer_code.inc_indent();
+  emit_dep_wait_consumer_prefix(consumer_code);
+  emit_body(consumer_code);
+
+  TaskRoleVariantCode role_code{/*init_semaphores=*/"",
+                                /*loader=*/"",
+                                /*launcher=*/"",
+                                /*consumer=*/consumer_code.to_string(),
+                                /*storer=*/""};
+  if (multi_role) {
+    mirage::transpiler::CodeKeeper init_code, helper_code;
+    init_code.inc_indent();
+    emit_ffn_v2_multirole_init_semaphores(init_code);
+    helper_code.inc_indent();
+    emit_dep_wait_consumer_prefix(helper_code);
+    emit_body(helper_code);
+    role_code.init_semaphores = init_code.to_string();
+    role_code.loader = helper_code.to_string();
+    role_code.launcher = helper_code.to_string();
+    role_code.storer = helper_code.to_string();
+  }
+  register_v2_task_role_variant(TASK_DSV3_FFN_W13_GEMV_V2, variant, role_code);
+  register_variant_smem_info(
+      TASK_DSV3_FFN_W13_GEMV_V2,
+      variant,
+      ::kernel::dsv3_ffn_v2::make_w13_smem_info(nwarps));
+  return variant;
+}
+
+// params: none.
+int TaskRegister::register_dsv3_ffn_silu_quant_v2_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  assert(params.size() == 0);
+  std::vector<tb::TBInputOp *> input_ops, output_ops;
+  ffn_v2_split_ops(bgraph, 5, 2, input_ops, output_ops);
+
+  auto emit_body = [&](mirage::transpiler::CodeKeeper &c) {
+    c.e("kernel::dsv3_ffn_v2::silu_quant_task_impl(task_desc);");
+  };
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  emit_body(code);
+  int variant =
+      register_task_variant(TASK_DSV3_FFN_SILU_QUANT_V2, code.to_string());
+
+  mirage::transpiler::CodeKeeper consumer_code;
+  consumer_code.inc_indent();
+  emit_dep_wait_consumer_prefix(consumer_code);
+  emit_body(consumer_code);
+  register_v2_task_role_variant(
+      TASK_DSV3_FFN_SILU_QUANT_V2,
+      variant,
+      TaskRoleVariantCode{/*init_semaphores=*/"",
+                          /*loader=*/"",
+                          /*launcher=*/"",
+                          /*consumer=*/consumer_code.to_string(),
+                          /*storer=*/""});
+  register_variant_smem_info(
+      TASK_DSV3_FFN_SILU_QUANT_V2,
+      variant,
+      ::kernel::dsv3_ffn_v2::make_silu_quant_smem_info());
+  return variant;
+}
+
+// params: [nwarps, rblk]. grid.x = num_tasks.
+int TaskRegister::register_dsv3_ffn_w2_gemv_v2_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  assert(params.size() == 2);
+  int const nwarps = params[0];
+  int const rblk = params[1];
+  assert(nwarps == 4 || nwarps == 7);
+  assert(rblk == 16 || rblk == 8);
+  int const num_tasks = (int)bgraph.grid_dim.x;
+  std::vector<tb::TBInputOp *> input_ops, output_ops;
+  ffn_v2_split_ops(bgraph, 9, 1, input_ops, output_ops);
+  bool const multi_role = nwarps > 4;
+
+  auto emit_body = [&](mirage::transpiler::CodeKeeper &c) {
+    c.e("kernel::dsv3_ffn_v2::w2_gemv_task_impl<$>(", rblk);
+    c.e("    task_desc,");
+    c.e("    static_cast<int>(task_desc->task_metadata.task_offset),");
+    c.e("    $, $,", num_tasks, nwarps);
+    if (multi_role) {
+      c.e("    op_sem_base_addr(runtime_smem, instruction_index));");
+    } else {
+      c.e("    -1);");
+    }
+  };
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  emit_body(code);
+  int variant =
+      register_task_variant(TASK_DSV3_FFN_W2_GEMV_V2, code.to_string());
+
+  mirage::transpiler::CodeKeeper consumer_code;
+  consumer_code.inc_indent();
+  emit_dep_wait_consumer_prefix(consumer_code);
+  emit_body(consumer_code);
+
+  TaskRoleVariantCode role_code{/*init_semaphores=*/"",
+                                /*loader=*/"",
+                                /*launcher=*/"",
+                                /*consumer=*/consumer_code.to_string(),
+                                /*storer=*/""};
+  if (multi_role) {
+    mirage::transpiler::CodeKeeper init_code, helper_code;
+    init_code.inc_indent();
+    emit_ffn_v2_multirole_init_semaphores(init_code);
+    helper_code.inc_indent();
+    emit_dep_wait_consumer_prefix(helper_code);
+    emit_body(helper_code);
+    role_code.init_semaphores = init_code.to_string();
+    role_code.loader = helper_code.to_string();
+    role_code.launcher = helper_code.to_string();
+    role_code.storer = helper_code.to_string();
+  }
+  register_v2_task_role_variant(TASK_DSV3_FFN_W2_GEMV_V2, variant, role_code);
+  register_variant_smem_info(
+      TASK_DSV3_FFN_W2_GEMV_V2,
+      variant,
+      ::kernel::dsv3_ffn_v2::make_w2_smem_info(nwarps));
   return variant;
 }
 

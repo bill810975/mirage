@@ -13,6 +13,7 @@
 // namespace to avoid collision with the v1 (kernel::) versions.
 #include "argmax_sm100.cuh"    // kernel::v2
 #include "attention_sm100.cuh" // kernel::v2
+#include "dsv3_ffn_v2.cuh"     // kernel::dsv3_ffn_v2
 #include "embedding_v2.cuh"    // kernel::v2
 #include "linear_sm100_v2.cuh" // kernel::linear_v2
 #include "linear_sm100_v3.cuh" // kernel::linear_v3
