@@ -51,34 +51,49 @@ static constexpr int V2_PROF_EPILOGUE_WAIT = 213;      // launcher: tmem slot
 static constexpr int V2_PROF_CONSUMER_DONE_WAIT = 214; // launcher tail
 static constexpr unsigned long long V2_PROF_WAIT_THRESHOLD_NS = 2000;
 // Total profiler-buffer entries — MUST match demo.py's profiler_tensor size.
-// Sized for 8 tracks x 128 SMs x 25 windowed iters; the busiest track
-// (consumer-phase: dep + tmem + mainloop slices) can write ~12-17k entries,
-// so per-track capacity = (ENTRIES - tail) / (128*8) ≈ 15k. The emitter
-// counts (never silently drops) overflow in the MISC region.
+// Sized for 8 tracks x up to V2_PROF_SM_SLOTS SMs x 25 windowed iters; the
+// busiest track (consumer-phase: dep + tmem + mainloop slices) can write
+// ~12-17k entries, so per-track capacity = (ENTRIES - tail) / (nblocks*8)
+// ≈ 13-15k. The emitter counts (never silently drops) overflow in MISC.
 static constexpr size_t V2_PROF_BUF_ENTRIES = 120000ull * 128;
+// Per-SM slot count for every per-SM tail array below. MUST be >= the
+// launch's worker count: B200 production runs 136 workers, and the original
+// 128-slot arrays made blocks 128-135 alias the spin accumulators through
+// their emitter cursors (junk cursor values -> capacity-guard drops) and
+// write their page-suffix counts PAST the buffer end. 256 covers any
+// current/near-future part.
+static constexpr int V2_PROF_SM_SLOTS = 256;
 // Tail of the profiler buffer reserved for accumulators (all in NANOSECONDS
 // via %globaltimer — same timebase as the trace events, no clock-rate
 // conversion). CONVENTION with demo.py's profiler_tensor; debug-only.
-// Layout, growing back from the end:
-//   [SPIN_BASE + bucket*256 + sm]        dep-wait ns,   per task-type bucket
-//   [SPIN_BASE + bucket*256 + 128 + sm]  dep-wait count
-//   [SUFFIX_BASE + sm]                   page-suffix ns, per SM (aggregate)
-//   [SUFFIX_BASE + 128 + sm]             page-suffix count
+// Layout, growing back from the end (SLOTS = V2_PROF_SM_SLOTS):
+//   [SPIN_BASE + bucket*2*SLOTS + sm]         dep-wait ns, per task-type bucket
+//   [SPIN_BASE + bucket*2*SLOTS + SLOTS + sm] dep-wait count
+//   [SUFFIX_BASE + sm]                        page-suffix ns, per SM
+//   [SUFFIX_BASE + SLOTS + sm]                page-suffix count
 // Type buckets: 0=linear(v3+res) 1=attn 2=rmsnorm 3=silu
 //               4=argmax(partial/reduce) 5=embed 6=other
 // (Bucketed by TASK_*_V2 enum NAME below — ids were renumbered in the v2
 // merge, so never hardcode the numeric values here.)
 static constexpr int V2_PROF_NUM_BUCKETS = 7;
+static constexpr size_t V2_PROF_SUFFIX_BASE =
+    V2_PROF_BUF_ENTRIES - 2ull * V2_PROF_SM_SLOTS;
 static constexpr size_t V2_PROF_SPIN_BASE =
-    V2_PROF_BUF_ENTRIES - 256ull * V2_PROF_NUM_BUCKETS - 256;
-static constexpr size_t V2_PROF_SUFFIX_BASE = V2_PROF_BUF_ENTRIES - 256;
-// Per-track write cursors for the closure-free emitter (1024 slots covers
-// 128 SMs x 8 groups), then a misc region: [MISC_BASE + sm] counts events
+    V2_PROF_SUFFIX_BASE - 2ull * V2_PROF_SM_SLOTS * V2_PROF_NUM_BUCKETS;
+// Per-track write cursors for the closure-free emitter (8 groups x
+// V2_PROF_SM_SLOTS), then a misc region: [MISC_BASE + sm] counts events
 // DROPPED by the capacity guard (must be 0 in a healthy run — the checker
 // reports it). Everything from MISC_BASE on is reserved tail — the exporter
 // skips it (V2_PROF_TAIL_ENTRIES in profiler_persistent.py must match).
-static constexpr size_t V2_PROF_CURSOR_BASE = V2_PROF_SPIN_BASE - 1024;
-static constexpr size_t V2_PROF_MISC_BASE = V2_PROF_CURSOR_BASE - 256;
+static constexpr size_t V2_PROF_CURSOR_BASE =
+    V2_PROF_SPIN_BASE - 8ull * V2_PROF_SM_SLOTS;
+static constexpr size_t V2_PROF_MISC_BASE =
+    V2_PROF_CURSOR_BASE - V2_PROF_SM_SLOTS;
+// The tag's block_group field is 11 bits (2048 tracks); the per-SM cursor
+// region must stay addressable through it.
+static_assert(V2_PROF_SM_SLOTS * 8 <= 2048,
+              "V2_PROF_SM_SLOTS x 8 role/phase tracks must fit the 11-bit "
+              "block_group tag field");
 // Event-trigger log: a single global ring recording every
 // trigger_task_event() fired inside the profiling window, packed as
 // [63:32]=globaltimer_lo  [31:8]=event_index  [7:0]=sm. One atomic cursor.
@@ -622,9 +637,10 @@ __device__ __noinline__ void consumer_dep_prefix(RuntimeConfig const &config,
       unsigned long long *_spin =
           static_cast<unsigned long long *>(config.profiler_buffer);
       size_t const _b =
-          V2_PROF_SPIN_BASE + 256ull * v2_prof_bucket(task_desc->task_type);
+          V2_PROF_SPIN_BASE +
+          2ull * V2_PROF_SM_SLOTS * v2_prof_bucket(task_desc->task_type);
       _spin[_b + blockIdx.x] += v2_prof_now_ns() - _t0;
-      _spin[_b + 128 + blockIdx.x] += 1;
+      _spin[_b + V2_PROF_SM_SLOTS + blockIdx.x] += 1;
     }
 #endif
     mbar_arrive(&rt->dynamic_semaphores[slot][SEM_DEP_READY]);
@@ -1180,6 +1196,20 @@ __global__ __launch_bounds__(MPK_LAUNCH_THREADS,
 inline void launch_worker_v2(RuntimeConfig const &config,
                              int num_workers,
                              cudaStream_t stream) {
+#ifdef MPK_ENABLE_PROFILING
+  // Per-SM profiler tail arrays (cursors/spin/suffix/misc) are sized for
+  // V2_PROF_SM_SLOTS workers; a larger grid would silently corrupt them
+  // (this is exactly what happened at 136 workers with the old 128-slot
+  // arrays). Fail loudly instead.
+  if (num_workers > V2_PROF_SM_SLOTS) {
+    printf("[v2] FATAL: num_workers=%d exceeds V2_PROF_SM_SLOTS=%d — "
+           "profiler tail arrays would be corrupted. Increase "
+           "V2_PROF_SM_SLOTS in runtime_v2.cuh.\n",
+           num_workers,
+           V2_PROF_SM_SLOTS);
+    abort();
+  }
+#endif
   int smem = MAX_DYNAMIC_SHARED_MEMORY_SIZE;
   cudaFuncSetAttribute(
       worker_v2_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);

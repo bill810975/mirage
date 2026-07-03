@@ -3913,6 +3913,14 @@ class PersistentKernel:
         assert input.num_dims == 2
         assert weight.num_dims == 2
         assert output.num_dims == 2
+        assert input.dim(0) == output.dim(0), "batch mismatch input vs output"
+        assert input.dim(1) == weight.dim(1), "K mismatch input vs weight"
+        assert output.dim(1) == weight.dim(0), "N mismatch output vs weight"
+        assert output.dim(0) <= 16, (
+            "linear_sm100_v2 processes one 16-row activation tile "
+            f"(BLOCK_N=16); rows beyond 16 are silently not computed. Got "
+            f"batch={output.dim(0)}."
+        )
         N = weight.dim(0)
         assert N % 128 == 0, f"linear_layer_v2 requires N divisible by 128, got {N}"
         num_tiles = N // 128
@@ -3943,6 +3951,14 @@ class PersistentKernel:
         assert input.num_dims == 2
         assert weight.num_dims == 2
         assert output.num_dims == 2
+        assert input.dim(0) == output.dim(0), "batch mismatch input vs output"
+        assert input.dim(1) == weight.dim(1), "K mismatch input vs weight"
+        assert output.dim(1) == weight.dim(0), "N mismatch output vs weight"
+        assert output.dim(0) <= 16, (
+            "linear_sm100_v3 processes one 16-row activation tile "
+            f"(BLOCK_N=16, consumer M_REAL<=16); rows beyond 16 are silently "
+            f"not computed. Got batch={output.dim(0)}."
+        )
         N = weight.dim(0)
         assert N % 128 == 0, f"linear_layer_v3 requires N divisible by 128, got {N}"
         num_tiles = N // 128
@@ -3974,6 +3990,16 @@ class PersistentKernel:
         assert weight.num_dims == 2
         assert residual.num_dims == 2
         assert output.num_dims == 2
+        assert input.dim(0) == output.dim(0), "batch mismatch input vs output"
+        assert input.dim(1) == weight.dim(1), "K mismatch input vs weight"
+        assert output.dim(1) == weight.dim(0), "N mismatch output vs weight"
+        assert residual.dim(0) == output.dim(0) and residual.dim(1) == output.dim(1), \
+            "residual shape must match output"
+        assert output.dim(0) <= 16, (
+            "linear_with_residual_sm100_v3 processes one 16-row activation "
+            f"tile (BLOCK_N=16); rows beyond 16 are silently not computed. "
+            f"Got batch={output.dim(0)}."
+        )
         N = weight.dim(0)
         assert N % 128 == 0, f"linear_with_residual_layer_v3 requires N divisible by 128, got {N}"
         num_tiles = N // 128
@@ -4001,6 +4027,16 @@ class PersistentKernel:
         assert weight.num_dims == 2
         assert residual.num_dims == 2
         assert output.num_dims == 2
+        assert input.dim(0) == output.dim(0), "batch mismatch input vs output"
+        assert input.dim(1) == weight.dim(1), "K mismatch input vs weight"
+        assert output.dim(1) == weight.dim(0), "N mismatch output vs weight"
+        assert residual.dim(0) == output.dim(0) and residual.dim(1) == output.dim(1), \
+            "residual shape must match output"
+        assert output.dim(0) <= 16, (
+            "linear_with_residual_sm100_v2 processes one 16-row activation "
+            f"tile (BLOCK_N=16); rows beyond 16 are silently not computed. "
+            f"Got batch={output.dim(0)}."
+        )
         N = weight.dim(0)
         assert N % 128 == 0, f"linear_with_residual_layer_v2 requires N divisible by 128, got {N}"
         grid_dim = (N // 128, 1, 1)
@@ -5106,7 +5142,13 @@ class PersistentKernel:
         self.launch_func = getattr(mod, "launch_func")
         self.init_request_func = getattr(mod, "init_request_func")
         self.finalize_func = getattr(mod, "finalize_func")
-        
+        if self.use_v2_runtime:
+            # Mirror compile(): the v2 runtime launches through
+            # launch_v2_func and needs init_v2_func to build the static
+            # per-SM task plan after init_func has loaded the task graph.
+            self.init_v2_func = getattr(mod, "init_v2_func")
+            self.launch_v2_func = getattr(mod, "launch_v2_func")
+
         # Prepare meta tensors
         meta_tensors = list()
         meta_tensors.append(self.meta_tensors["step"])

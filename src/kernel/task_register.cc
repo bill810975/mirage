@@ -2009,6 +2009,9 @@ int TaskRegister::register_linear_sm100_v2_task(
   int const m_real = (m_real_override > 0) ? m_real_override : batch_size;
   assert(m_real <= batch_size &&
          "m_real override must not exceed output tensor's dim[0] (OOB write).");
+  assert(m_real <= 16 &&
+         "linear_sm100_v2 consumes a single 16-row activation tile "
+         "(BLOCK_N=16); rows beyond 16 would silently not be computed.");
 
   std::string const true_or_false = rank_with_residual ? "true" : "false";
   std::string const residual_arg =
@@ -2203,6 +2206,10 @@ int TaskRegister::register_linear_sm100_v3_task(
   int const m_real = (m_real_override > 0) ? m_real_override : batch_size;
   assert(m_real <= batch_size &&
          "m_real override must not exceed output tensor's dim[0].");
+  assert(m_real <= 16 &&
+         "linear_sm100_v3 consumes a single 16-row activation tile "
+         "(BLOCK_N=16, consumer template M_REAL<=16); rows beyond 16 would "
+         "silently not be computed.");
 
   std::string const true_or_false = with_residual ? "true" : "false";
   std::string const residual_arg =

@@ -49,10 +49,23 @@ constexpr int MAX_DYNAMIC_SHARED_MEMORY_SIZE =
 #endif
 #else
 #if MPK_TARGET_CC >= 90
+#ifdef USE_RUNTIME_V2
+// Runtime V2 builds: the v2 static task-smem page plan (v2_smem_planner.py
+// CAPACITY_BYTES = 225K - 6K = 224256, 14 x 16KB pages) was designed against
+// the original 225KB budget; the linear v2/v3 plan occupies dynamic bytes
+// [0, 221200) which overflows the 222KB dsv3 budget below (Invalid __shared__
+// write at the linear_scratch region, first byte past 221184; sanitizer addr
+// 0x37400 = 5120B static RuntimeSMEM + 221184). Restore the 225KB geometry
+// for v2: 224256 dynamic + 5120 static = 229376 <= the 232448-byte B200
+// opt-in cap. v1/dsv3 builds are unaffected.
+constexpr int MAX_DYNAMIC_SHARED_MEMORY_SIZE =
+    225 * 1024 - WORKER_RESERVED_STATIC_SHARED_MEMORY_SIZE;
+#else
 // B200: 222KB dynamic smem (under the 228KB hardware total after the worker
 // reserved static; sized to fit the FP8 group GEMM NS=6/BN=128 ~216KB).
 constexpr int MAX_DYNAMIC_SHARED_MEMORY_SIZE =
     222 * 1024 - WORKER_RESERVED_STATIC_SHARED_MEMORY_SIZE;
+#endif
 #elif MPK_TARGET_CC >= 86
 constexpr int MAX_DYNAMIC_SHARED_MEMORY_SIZE =
     99 * 1024 - WORKER_RESERVED_STATIC_SHARED_MEMORY_SIZE;

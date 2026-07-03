@@ -115,7 +115,7 @@ char const *kConsumerPageSuffix =
     "*>(runtime_config.profiler_buffer);\n"
     "    _sfx[V2_PROF_SUFFIX_BASE + blockIdx.x] += v2_prof_now_ns() - "
     "_sfx_t0;\n"
-    "    _sfx[V2_PROF_SUFFIX_BASE + 128 + blockIdx.x] += 1;\n"
+    "    _sfx[V2_PROF_SUFFIX_BASE + V2_PROF_SM_SLOTS + blockIdx.x] += 1;\n"
     "  }\n"
     "#endif\n"
     "}\n";

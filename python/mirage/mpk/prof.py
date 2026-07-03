@@ -17,8 +17,12 @@ import sys
 import numpy as np
 from collections import defaultdict
 
-# must match runtime_v2.cuh: misc(256) + cursors(1024) + spin(7*256) + suffix(256)
-V2_PROF_TAIL = (1048576 + 1) + 256 + 1024 + 7 * 256 + 256
+# must match runtime_v2.cuh (V2_PROF_SM_SLOTS=256 since the 136-worker fix):
+# trig(1048576+1) + misc(SLOTS) + cursors(8*SLOTS) + spin(7*2*SLOTS)
+# + suffix(2*SLOTS)
+V2_PROF_SM_SLOTS = 256
+V2_PROF_TAIL = ((1048576 + 1) + V2_PROF_SM_SLOTS + 8 * V2_PROF_SM_SLOTS
+                + 7 * 2 * V2_PROF_SM_SLOTS + 2 * V2_PROF_SM_SLOTS)
 V2_PROF_NUM_BUCKETS = 7
 WINDOW_ITERS = 25
 
@@ -79,22 +83,26 @@ class Dump:
                 self.windows[(tr // self.ngroups, tr % self.ngroups)].append(
                     (s, ts, ev0))
 
-    # accumulator regions ---------------------------------------------------
+    # accumulator regions (offsets mirror runtime_v2.cuh V2_PROF_*_BASE) ----
     def spin_bucket(self, b):
-        base = len(self.buf) - 7 * 256 - 256 + 256 * b
-        ns = self.buf[base:base + 128].astype(float)
-        n = self.buf[base + 128:base + 256].astype(float)
+        S = V2_PROF_SM_SLOTS
+        base = len(self.buf) - 2 * S - 7 * 2 * S + 2 * S * b
+        ns = self.buf[base:base + S].astype(float)
+        n = self.buf[base + S:base + 2 * S].astype(float)
         return ns, n
 
     def suffix(self):
-        base = len(self.buf) - 256
-        return (self.buf[base:base + 128].astype(float),
-                self.buf[base + 128:base + 256].astype(float))
+        S = V2_PROF_SM_SLOTS
+        base = len(self.buf) - 2 * S
+        return (self.buf[base:base + S].astype(float),
+                self.buf[base + S:base + 2 * S].astype(float))
 
     def dropped(self):
-        """Events dropped by the emitter's capacity guard, per SM."""
-        base = len(self.buf) - V2_PROF_TAIL
-        return self.buf[base:base + 128].astype(float)
+        """Events dropped by the emitter's capacity guard, per SM
+        (the MISC region: below the cursors, above the trigger ring)."""
+        S = V2_PROF_SM_SLOTS
+        base = len(self.buf) - 2 * S - 7 * 2 * S - 8 * S - S
+        return self.buf[base:base + S].astype(float)
 
 
 def cmd_check(d: Dump) -> int:

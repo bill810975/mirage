@@ -232,7 +232,8 @@ def _decode_events(profiler_buffer: torch.Tensor):
         # not events — decoding them produces garbage slices at t~0 that
         # stretch the whole timeline. Skip the tail (must match
         # V2_PROF_TAIL_ENTRIES on the device side).
-        V2_PROF_TAIL_ENTRIES = (1048576 + 1) + 256 + 1024 + 256 * 7 + 256  # trig+misc+cursors+spin+suffix
+        # trig+misc+cursors+spin+suffix, V2_PROF_SM_SLOTS=256 (136-worker fix)
+        V2_PROF_TAIL_ENTRIES = (1048576 + 1) + 256 + 2048 + 512 * 7 + 512
         nz = nz[nz < len(buf_np) - V2_PROF_TAIL_ENTRIES]
     for i in nz:
         entry = int(buf_np[i])
