@@ -670,8 +670,10 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
   } else if (name == "dsv3_attn_qb_rope_kv_v2") {
     int variant_id = task_register->register_dsv3_attn_qb_rope_kv_v2_task(
         customized->bgraph, params);
-    task_config[op] =
-        std::make_tuple(7, 1, TASK_DSV3_ATTN_QB_ROPE_KV_V2, variant_id);
+    // params[2] (has_head_flags) adds the g_head_done input (round-4 fold).
+    int const qb_num_inputs = (params.size() > 2 && params[2] != 0) ? 8 : 7;
+    task_config[op] = std::make_tuple(
+        qb_num_inputs, 1, TASK_DSV3_ATTN_QB_ROPE_KV_V2, variant_id);
   } else if (name == "dsv3_attn_mla_partial_v2") {
     int variant_id = task_register->register_dsv3_attn_mla_partial_v2_task(
         customized->bgraph, params);
@@ -682,6 +684,11 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
         customized->bgraph, params);
     task_config[op] =
         std::make_tuple(4, 1, TASK_DSV3_ATTN_MLA_MERGE_V2, variant_id);
+  } else if (name == "dsv3_attn_mla_fused_v2") {
+    int variant_id = task_register->register_dsv3_attn_mla_fused_v2_task(
+        customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(7, 1, TASK_DSV3_ATTN_MLA_FUSED_V2, variant_id);
   } else if (name == "dsv3_attn_wuv_v2") {
     int variant_id = task_register->register_dsv3_attn_wuv_v2_task(
         customized->bgraph, params);

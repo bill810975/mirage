@@ -598,6 +598,7 @@ void register_mugraph(
             if (task_type == TASK_DSV3_ATTN_P0_QKVA_V2 ||
                 task_type == TASK_DSV3_ATTN_QB_ROPE_KV_V2 ||
                 task_type == TASK_DSV3_ATTN_MLA_PARTIAL_V2 ||
+                task_type == TASK_DSV3_ATTN_MLA_FUSED_V2 ||
                 task_type == TASK_DSV3_ATTN_MLA_MERGE_V2 ||
                 task_type == TASK_DSV3_ATTN_WUV_V2 ||
                 task_type == TASK_DSV3_ATTN_OPROJ_V2) {
@@ -2104,6 +2105,8 @@ TaskGraphResult print_task_graph(
       "TASK_DSV3_ATTN_MLA_PARTIAL_V2";
   task_type_to_name[TASK_DSV3_ATTN_MLA_MERGE_V2] =
       "TASK_DSV3_ATTN_MLA_MERGE_V2";
+  task_type_to_name[TASK_DSV3_ATTN_MLA_FUSED_V2] =
+      "TASK_DSV3_ATTN_MLA_FUSED_V2";
   task_type_to_name[TASK_DSV3_ATTN_WUV_V2] = "TASK_DSV3_ATTN_WUV_V2";
   task_type_to_name[TASK_DSV3_ATTN_OPROJ_V2] = "TASK_DSV3_ATTN_OPROJ_V2";
   task_type_to_name[TASK_DSV3_FFN_ROUTER_QUANT_RMS_V2] =

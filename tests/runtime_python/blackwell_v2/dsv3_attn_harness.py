@@ -142,6 +142,7 @@ def alloc_block_buffers() -> dict:
         "out": z((1, R.HIDDEN), torch.bfloat16),
         "kv_cache": z((KV_ROWS, R.QKHEAD), torch.bfloat16),
         "ready_ones": torch.ones((R.HLOCAL,), device=DEV, dtype=torch.int32),
+        "g_head_done": z((R.HLOCAL,), torch.int32),
     }
 
 
@@ -187,39 +188,82 @@ def build_attn_block(pk, prefix: str, weights: dict, bufs: dict,
     resid_alias = at(x_torch, "resid_alias")
 
     kvo = cfg["kv_offset"]
+    fold = cfg["fold_merge"]
+    # T2 gets the real attach; the fused op gets an ALIAS (a second declared
+    # edge T2->T3' would double the pair's event bookkeeping — same rule as
+    # kv_cache/residual).
+    head_done_t2 = at(bufs["g_head_done"], "ghd") if fold else None
+    head_done_alias = at(bufs["g_head_done"], "ghd_alias") if fold else None
     pk.dsv3_attn_p0_qkva_layer(
         x=x_dt, input_ln_w=in_ln, qkv_a_w=qkv_a_w, qkv_a_s=qkv_a_s,
-        g_qkva=g_qkva, num_tasks=cfg["n1"])
+        g_qkva=g_qkva, num_tasks=cfg["n1"], nwarps=cfg["nw_p0"])
     pk.dsv3_attn_qb_rope_kv_layer(
         g_qkva=g_qkva, q_a_ln_w=qa_ln, kv_a_ln_w=kva_ln, q_b_w=q_b_w,
         q_b_s=q_b_s, cos_sin=cos_sin_dt, kv_cache=kv_cache, g_qpe=g_qpe,
-        num_tasks=cfg["n2"], kv_offset=kvo)
-    pk.dsv3_attn_mla_partial_layer(
-        g_qpe=g_qpe, kv_cache=kv_alias, g_mla_m=g_mla_m, g_mla_l=g_mla_l,
-        g_mla_acc=g_mla_acc, kv_offset=kvo)
-    pk.dsv3_attn_mla_merge_layer(
-        g_mla_acc=g_mla_acc, g_mla_m=m_alias, g_mla_l=l_alias,
-        g_attn=g_attn, g_attn_deq=g_attn_deq, kv_offset=kvo)
+        num_tasks=cfg["n2"], kv_offset=kvo, nwarps=cfg["nw_qb"],
+        g_head_done=head_done_t2)
+    if fold:
+        # Round-4 fold: ONE op = partial + last-arriver merge (T4 removed;
+        # the T3'->T5 edge is g_attn_deq; acc/m/l/attn are hidden writes).
+        pk.dsv3_attn_mla_fused_layer(
+            g_qpe=g_qpe, kv_cache=kv_alias, g_mla_m=g_mla_m,
+            g_mla_l=g_mla_l, g_mla_acc=g_mla_acc,
+            g_head_done=head_done_alias,
+            g_attn=g_attn, g_attn_deq=g_attn_deq, kv_offset=kvo,
+            nwarps=cfg["nw_mla"])
+    else:
+        pk.dsv3_attn_mla_partial_layer(
+            g_qpe=g_qpe, kv_cache=kv_alias, g_mla_m=g_mla_m, g_mla_l=g_mla_l,
+            g_mla_acc=g_mla_acc, kv_offset=kvo, nwarps=cfg["nw_mla"])
+        pk.dsv3_attn_mla_merge_layer(
+            g_mla_acc=g_mla_acc, g_mla_m=m_alias, g_mla_l=l_alias,
+            g_attn=g_attn, g_attn_deq=g_attn_deq, kv_offset=kvo)
     pk.dsv3_attn_wuv_layer(
         g_attn_deq=g_attn_deq, kvbv_w=kvbv_w, kvbv_s=kvbv_s,
-        ready_ones=ready_ones, g_red=g_red, num_tasks=cfg["n5"])
+        ready_ones=ready_ones, g_red=g_red, num_tasks=cfg["n5"],
+        nwarps=cfg["nw_wuv"])
     pk.dsv3_attn_oproj_layer(
         g_red=g_red, oproj_w=oproj_w, oproj_s=oproj_s,
-        residual=resid_alias, output=out, num_tasks=cfg["n6"])
+        residual=resid_alias, output=out, num_tasks=cfg["n6"],
+        nwarps=cfg["nw_oproj"])
     return out, bufs["out"]
 
 
 def default_cfg(spec: dict) -> dict:
+    nwarps = spec.get("nwarps", 4)  # global default; per-op keys override
+    # oproj's per-warp cp.async ring (OP_GEMV_RBT*32*16*STAGES = 32KB/warp)
+    # exceeds the ~205KB smem budget at 7 warps — cap the DEFAULT at 4 so
+    # `--nwarps 7` without an explicit oproj override can't build an
+    # oversized allocation; an explicit spec["nw_oproj"] still wins.
+    nw_oproj = spec.get("nw_oproj", min(nwarps, 4))
+    # oproj row-blocks = 896: at nwarps=7 n6=128 makes 128*7=896 exactly one
+    # block per warp (halves the GEMV wall); at 4 warps 112*4*2=896 (2 each).
+    n6_default = 128 if nw_oproj == 7 else 112
     return {
         "n1": spec.get("n1", 136),
         "n2": spec.get("n2", 136),
         "n5": spec.get("n5", 128),
-        "n6": spec.get("n6", 112),
+        "n6": spec.get("n6", n6_default),
         "kv_offset": spec.get("kv_offset", 0),
+        "nwarps": nwarps,
+        "nw_p0": spec.get("nw_p0", nwarps),
+        "nw_qb": spec.get("nw_qb", nwarps),
+        "nw_mla": spec.get("nw_mla", nwarps),
+        "nw_wuv": spec.get("nw_wuv", nwarps),
+        "nw_oproj": nw_oproj,
+        "fold_merge": bool(spec.get("fold_merge", False)),
     }
 
 
 def block_instances(i: int, cfg: dict):
+    if cfg["fold_merge"]:
+        return [
+            (i, "attn_p0_qkva", cfg["n1"]),
+            (i, "attn_qb_rope_kv", cfg["n2"]),
+            (i, "attn_mla_fused", 128),
+            (i, "attn_wuv", cfg["n5"]),
+            (i, "attn_oproj", cfg["n6"]),
+        ]
     return [
         (i, "attn_p0_qkva", cfg["n1"]),
         (i, "attn_qb_rope_kv", cfg["n2"]),

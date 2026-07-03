@@ -295,7 +295,9 @@ enum TaskType {
   TASK_DSV3_ATTN_MLA_MERGE_V2 = 343,
   TASK_DSV3_ATTN_WUV_V2 = 344,
   TASK_DSV3_ATTN_OPROJ_V2 = 345,
-  TASK_SM100_TASK_END = 346, // SM100 end placeholder, not a real task
+  // partial+merge fold (v1 lever-4 atomic last-arriver; step-3c round 4).
+  TASK_DSV3_ATTN_MLA_FUSED_V2 = 346,
+  TASK_SM100_TASK_END = 347, // SM100 end placeholder, not a real task
   TASK_SCHD_TASKS = 200,
   TASK_SCHD_EVENTS = 201,
   TASK_GET_EVENT = 202,

@@ -22,28 +22,54 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 PY = sys.executable
 
 
+def parse_nw_overrides(s):
+    """--nw-overrides "p0=4,qb=4,mla=7,wuv=7,oproj=4" -> spec keys."""
+    out = {}
+    if not s:
+        return out
+    for kv in s.split(","):
+        k, v = kv.split("=")
+        out[f"nw_{k.strip()}"] = int(v)
+    return out
+
+
 def build_cases(args):
     cases = []
     kvos = [int(k) for k in args.kv_offsets.split(",")]
+    nwarps = args.nwarps
+    nw_over = parse_nw_overrides(args.nw_overrides)
+    if args.fold:
+        nw_over["fold_merge"] = True
     if args.what in ("correctness", "all"):
         # kv_offset 0 (KV=1, nsp=1) / 511 (KV=512, nsp=8) / 2047 (KV=2048)
-        for kvo in [0, 511, 2047]:
+        corr_kvos = ([int(k) for k in args.corr_kv_offsets.split(",")]
+                     if args.corr_kv_offsets else [0, 511, 2047])
+        for kvo in corr_kvos:
             cases.append({"name": f"attn_corr_kvo{kvo}",
                           "mode": "attn_correctness", "kv_offset": kvo,
+                          "nwarps": nwarps, **nw_over,
                           "dump_inputs": True, "timeout_s": 2400})
         cases.append({"name": "attn_multistep_s4", "mode": "attn_multistep",
-                      "kv_offset": 0, "iters": 4, "timeout_s": 2400})
+                      "kv_offset": 0, "iters": 4, "nwarps": nwarps,
+                      **nw_over, "timeout_s": 2400})
+        if args.what == "all" or args.multistep_inplace:
+            cases.append({"name": "attn_multistep_msx2",
+                          "mode": "attn_multistep", "kv_offset": 0,
+                          "iters": 4, "inplace_x": True, "nwarps": nwarps,
+                          **nw_over, "timeout_s": 2400})
     if args.what in ("perf", "all"):
         for kvo in kvos:
             for r in range(args.repeats):
                 cases.append({"name": f"attn_perf_kvo{kvo}_r{r}",
                               "mode": "attn_perf", "profiled": True,
                               "L": args.L, "iters": args.iters,
-                              "kv_offset": kvo, "timeout_s": 3000})
+                              "kv_offset": kvo, "nwarps": nwarps,
+                              **nw_over, "timeout_s": 3000})
             cases.append({"name": f"attn_perf_kvo{kvo}_nowall",
                           "mode": "attn_perf", "profiled": False,
                           "L": args.L, "iters": args.iters,
-                          "kv_offset": kvo, "timeout_s": 3000})
+                          "kv_offset": kvo, "nwarps": nwarps,
+                          **nw_over, "timeout_s": 3000})
     return cases
 
 
@@ -88,6 +114,16 @@ def main():
     ap.add_argument("--L", type=int, default=3)
     ap.add_argument("--iters", type=int, default=32)
     ap.add_argument("--kv-offsets", default="0,512,2048,4064")
+    ap.add_argument("--corr-kv-offsets", default="",
+                    help="override the correctness-arm kv_offsets")
+    ap.add_argument("--nwarps", type=int, default=4, choices=[4, 7],
+                    help="MAC warps per task (4 = stage-1, 7 = tag-flag "
+                         "stage-2)")
+    ap.add_argument("--nw-overrides", default="",
+                    help='per-op nwarps, e.g. "p0=4,qb=4,mla=7,wuv=7,oproj=4"')
+    ap.add_argument("--fold", action="store_true",
+                    help="use the fused partial+merge chain (round 4)")
+    ap.add_argument("--multistep-inplace", action="store_true")
     ap.add_argument("--tag", default="attn_r0")
     args = ap.parse_args()
 

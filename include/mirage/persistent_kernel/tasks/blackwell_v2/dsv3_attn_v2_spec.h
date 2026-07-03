@@ -42,46 +42,73 @@ inline constexpr int GRP = 128;      // K_GRP
 inline constexpr int SPLITS = 8;     // MLA_SPLITS
 
 // ---- per-warp cp.async ring geometry (bytes) -------------------------------
-// == the verbatim GEMV templates' STAGES*RBT*32*16 requirement:
-//   qkv_a: gemv_grid_cpa_t<2,6>            -> 2*32*16*6 =  6144 B/warp
-//   q_b:   gemv_grid_cpa_qb_rope_smem_t<8,4> -> 8*32*16*4 = 16384 B/warp
-//   oproj: gemv_grid_cpa_oproj_smem_t<8,4>   -> 8*32*16*4 = 16384 B/warp
-inline constexpr int P0_RING_BYTES_PER_WARP = 6144;
-inline constexpr int GEMV_RING_BYTES_PER_WARP = 16384;
+// == the verbatim GEMV templates' STAGES*RBT*32*16 requirement. Round-3
+// tuning: deeper rings at 4 MAC warps (in-flight bytes per warp is the
+// concurrency lever; warp-count is not — round-1 verdict). STAGES here must
+// match the template args in dsv3_attn_v2.cuh (static_asserts there).
+// NOTE: at these depths the nwarps=7 ring (7*32KB + work > 14 pages) no
+// longer fits for qb/oproj — unused since round 1 reverted them to 4 warps.
+inline constexpr int P0_GEMV_RBT = 4;      // 544 blocks = 1/warp exactly:
+inline constexpr int P0_GEMV_STAGES = 8;   //   -38% GEMV vs <2,6> (round 3)
+inline constexpr int QB_GEMV_RBT = 8;      // 1152 blocks (16 straggled: NULL)
+inline constexpr int QB_GEMV_STAGES = 4;   //   original <8,4> retained
+inline constexpr int OP_GEMV_RBT = 16;     // 448 blocks = 448 warps = 1/warp
+inline constexpr int OP_GEMV_STAGES = 4;   //   K=2048 => 4 super-steps
+inline constexpr int P0_RING_BYTES_PER_WARP =
+    P0_GEMV_RBT * 32 * 16 * P0_GEMV_STAGES;
+inline constexpr int QB_RING_BYTES_PER_WARP =
+    QB_GEMV_RBT * 32 * 16 * QB_GEMV_STAGES;
+inline constexpr int OP_RING_BYTES_PER_WARP =
+    OP_GEMV_RBT * 32 * 16 * OP_GEMV_STAGES;
 inline constexpr int NWARPS_V2 = 4; // stage-1 consumer-only
 
+// Stage-2 (nwarps=7) cross-role tag-flag block appended to each WORK region:
+// u64[4]: [0] consumer->helper GO (monotonic phase tags), [1..3] per-helper
+// DONE. A 16-B scalar slot (rms_rcp / q_rcp handoff) precedes it.
+inline constexpr int ATTN_FLAG_BYTES = 4 * 8;
+
 // ---- T1 p0_qkva regions -----------------------------------------------------
-// [0] WORK: s_act f32[HIDDEN] (28672 B) | red8 f32[8]+pad (32 B) = 28704 B
-// [1] RING: 4 * 6144 = 24576 B
+// [0] WORK: s_act f32[HIDDEN] (28672 B) | red8 f32[8]+pad (32 B) |
+//           scalar f32+pad (16 B) | flags u64[4] (32 B) = 28752 B
+// [1] RING: nwarps * 6144 B. The first HIDDEN*2 = 14336 B double as the
+//           bf16 x staging buffer during the prologue (dead before the GEMV
+//           touches the ring).
 inline constexpr int P0_REGION_WORK = 0;
 inline constexpr int P0_REGION_RING = 1;
 inline constexpr int P0_RED_OFF = HIDDEN * 4; // bytes into WORK
+inline constexpr int P0_SCALAR_OFF = P0_RED_OFF + 32;
+inline constexpr int P0_FLAGS_OFF = P0_SCALAR_OFF + 16;
 
-inline ::mirage::runtime::TaskSmemInfo make_p0_qkva_smem_info() {
-  int const work_bytes = HIDDEN * 4 + 32;
-  int const ring_bytes = NWARPS_V2 * P0_RING_BYTES_PER_WARP;
+inline ::mirage::runtime::TaskSmemInfo make_p0_qkva_smem_info(int nwarps) {
+  int const work_bytes = P0_FLAGS_OFF + ATTN_FLAG_BYTES;
+  int const ring_bytes = nwarps * P0_RING_BYTES_PER_WARP;
+  int const ring_pages = (ring_bytes + 16383) / 16384;
   ::mirage::runtime::TaskSmemInfo info{work_bytes + ring_bytes,
                                        /*alignment=*/1024,
                                        {}};
   info.regions.push_back({"attn_p0_work", work_bytes, 1024, /*page_count=*/2,
                           /*can_pack=*/false, /*release_step=*/2,
                           /*contiguous=*/true});
-  info.regions.push_back({"attn_p0_ring", ring_bytes, 1024, /*page_count=*/2,
-                          /*can_pack=*/false, /*release_step=*/2,
-                          /*contiguous=*/true});
+  info.regions.push_back({"attn_p0_ring", ring_bytes, 1024,
+                          /*page_count=*/ring_pages, /*can_pack=*/false,
+                          /*release_step=*/2, /*contiguous=*/true});
   return info;
 }
 
 // ---- T2 qb_rope_kv regions --------------------------------------------------
-// [0] WORK: s_qbdeq f32[QLORA] (6144 B) | red8 f32[8]+pad (32 B) = 6176 B
-// [1] RING: 4 * 16384 = 65536 B
+// [0] WORK: s_qbdeq f32[QLORA] (6144 B) | red8 f32[8]+pad (32 B) |
+//           scalar (16 B) | flags u64[4] (32 B) = 6224 B
+// [1] RING: nwarps * 16384 B
 inline constexpr int QB_REGION_WORK = 0;
 inline constexpr int QB_REGION_RING = 1;
 inline constexpr int QB_RED_OFF = QLORA * 4; // bytes into WORK
+inline constexpr int QB_SCALAR_OFF = QB_RED_OFF + 32;
+inline constexpr int QB_FLAGS_OFF = QB_SCALAR_OFF + 16;
 
-inline ::mirage::runtime::TaskSmemInfo make_qb_rope_kv_smem_info() {
-  int const work_bytes = QLORA * 4 + 32;
-  int const ring_bytes = NWARPS_V2 * GEMV_RING_BYTES_PER_WARP;
+inline ::mirage::runtime::TaskSmemInfo make_qb_rope_kv_smem_info(int nwarps) {
+  int const work_bytes = QB_FLAGS_OFF + ATTN_FLAG_BYTES;
+  int const ring_bytes = nwarps * QB_RING_BYTES_PER_WARP;
+  int const ring_pages = (ring_bytes + 16383) / 16384;
   ::mirage::runtime::TaskSmemInfo info{work_bytes + ring_bytes,
                                        /*alignment=*/1024,
                                        {}};
@@ -89,18 +116,21 @@ inline ::mirage::runtime::TaskSmemInfo make_qb_rope_kv_smem_info() {
                           /*can_pack=*/false, /*release_step=*/2,
                           /*contiguous=*/true});
   info.regions.push_back({"attn_qb_ring", ring_bytes, 1024,
-                          /*page_count=*/NWARPS_V2, /*can_pack=*/false,
+                          /*page_count=*/ring_pages, /*can_pack=*/false,
                           /*release_step=*/2, /*contiguous=*/true});
   return info;
 }
 
-// ---- T3 mla_partial regions -------------------------------------------------
-// [0] WORK: s_score f32[512] (2048 B) | red8 f32[8]+pad (32 B) = 2080 B
+// ---- T3 mla_partial regions (shared by the round-4 FUSED partial+merge) ----
+// [0] WORK: s_score f32[512] (2048 B) | red8 f32[8]+pad (32 B) |
+//           flags u64[4] (32 B) | s_last i32+pad (16 B) = 2128 B
 inline constexpr int MP_REGION_WORK = 0;
 inline constexpr int MP_RED_OFF = KVLORA * 4; // bytes into WORK
+inline constexpr int MP_FLAGS_OFF = MP_RED_OFF + 32;
+inline constexpr int MP_LAST_OFF = MP_FLAGS_OFF + ATTN_FLAG_BYTES;
 
 inline ::mirage::runtime::TaskSmemInfo make_mla_partial_smem_info() {
-  int const work_bytes = KVLORA * 4 + 32;
+  int const work_bytes = MP_LAST_OFF + 16;
   ::mirage::runtime::TaskSmemInfo info{work_bytes, /*alignment=*/1024, {}};
   info.regions.push_back({"attn_mp_work", work_bytes, 1024, /*page_count=*/1,
                           /*can_pack=*/true, /*release_step=*/2,
@@ -127,14 +157,16 @@ inline ::mirage::runtime::TaskSmemInfo make_wuv_smem_info() {
 }
 
 // ---- T6 oproj regions -------------------------------------------------------
-// [0] WORK: s_odeq f32[OIN] (8192 B)
-// [1] RING: 4 * 16384 = 65536 B
+// [0] WORK: s_odeq f32[OIN] (8192 B) | flags u64[4] (32 B) = 8224 B
+// [1] RING: nwarps * 16384 B
 inline constexpr int OP_REGION_WORK = 0;
 inline constexpr int OP_REGION_RING = 1;
+inline constexpr int OP_FLAGS_OFF = OIN * 4; // bytes into WORK
 
-inline ::mirage::runtime::TaskSmemInfo make_oproj_smem_info() {
-  int const work_bytes = OIN * 4;
-  int const ring_bytes = NWARPS_V2 * GEMV_RING_BYTES_PER_WARP;
+inline ::mirage::runtime::TaskSmemInfo make_oproj_smem_info(int nwarps) {
+  int const work_bytes = OP_FLAGS_OFF + ATTN_FLAG_BYTES;
+  int const ring_bytes = nwarps * OP_RING_BYTES_PER_WARP;
+  int const ring_pages = (ring_bytes + 16383) / 16384;
   ::mirage::runtime::TaskSmemInfo info{work_bytes + ring_bytes,
                                        /*alignment=*/1024,
                                        {}};
@@ -142,7 +174,7 @@ inline ::mirage::runtime::TaskSmemInfo make_oproj_smem_info() {
                           /*can_pack=*/false, /*release_step=*/2,
                           /*contiguous=*/true});
   info.regions.push_back({"attn_op_ring", ring_bytes, 1024,
-                          /*page_count=*/NWARPS_V2, /*can_pack=*/false,
+                          /*page_count=*/ring_pages, /*can_pack=*/false,
                           /*release_step=*/2, /*contiguous=*/true});
   return info;
 }

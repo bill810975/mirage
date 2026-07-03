@@ -9264,22 +9264,29 @@ int TaskRegister::register_dsv3_ffn_w2_silu_v2_task(
 // ─────────────────────────────────────────────────────────────────────────────
 // DSv3 fused-ATTN block as a v2 task chain (Step 3b of the V2 migration).
 // Task bodies live in tasks/blackwell_v2/dsv3_attn_v2.cuh (they call the v1
-// attn_block_megakernel helpers verbatim / exact-tree-emulated). All ops are
-// stage-1 (4 consumer warps); role variants are consumer-only. The
-// step-dependent ops (qb_rope_kv / mla_partial / mla_merge) bake an int
-// kv_offset param and read the v2 iteration counter `iter_num` (in scope in
-// every v2 role case): step = iter_num + kv_offset.
+// attn_block_megakernel helpers verbatim / exact-tree-emulated). Each MAC op
+// supports nwarps == 4 (stage-1, consumer-only role variant — the original
+// port) or nwarps == 7 (stage-2: the same MAC body is ALSO emitted into the
+// loader/launcher/storer role cases; cross-role safety via the monotonic
+// tag-flag protocol, sync_base = instruction_index + 1). The step-dependent
+// ops (qb_rope_kv / mla_partial / mla_merge) bake an int kv_offset param and
+// read the v2 iteration counter `iter_num`: step = iter_num + kv_offset.
 // ─────────────────────────────────────────────────────────────────────────────
 
 namespace {
 
-// Shared emit scaffold for the attn v2 family: plain variant + consumer-only
-// role variant (dep-prefix + body) + smem info.
+// Shared emit scaffold for the attn v2 family: plain variant + role variant +
+// smem info. helper_mode: 0 = consumer-only (stage-1); 1 = helpers run the
+// body FLAG-GATED (no dep-prefix — first action is a tag acquire released by
+// a consumer post-prefix, the FFN-folded pattern); 2 = helpers run the
+// dep-prefix + body (for tasks with no flags at all, e.g. wuv, where the
+// helpers' input/page ordering must come from SEM_DEP_READY itself).
 template <typename EmitFn>
 inline int register_attn_v2_common(TaskRegister *reg,
                                    mirage::runtime::TaskType tt,
                                    EmitFn emit,
-                                   ::mirage::runtime::TaskSmemInfo smem_info) {
+                                   ::mirage::runtime::TaskSmemInfo smem_info,
+                                   int helper_mode) {
   mirage::transpiler::CodeKeeper code;
   code.inc_indent();
   emit(code);
@@ -9289,79 +9296,144 @@ inline int register_attn_v2_common(TaskRegister *reg,
   consumer_code.inc_indent();
   emit_dep_wait_consumer_prefix(consumer_code);
   emit(consumer_code);
-  reg->register_v2_task_role_variant(
-      tt,
-      variant,
-      TaskRoleVariantCode{/*init_semaphores=*/"",
-                          /*loader=*/"",
-                          /*launcher=*/"",
-                          /*consumer=*/consumer_code.to_string(),
-                          /*storer=*/""});
+
+  TaskRoleVariantCode role_code{/*init_semaphores=*/"",
+                                /*loader=*/"",
+                                /*launcher=*/"",
+                                /*consumer=*/consumer_code.to_string(),
+                                /*storer=*/""};
+  if (helper_mode != 0) {
+    mirage::transpiler::CodeKeeper helper_code;
+    helper_code.inc_indent();
+    if (helper_mode == 2) {
+      emit_dep_wait_consumer_prefix(helper_code);
+    }
+    emit(helper_code);
+    role_code.loader = helper_code.to_string();
+    role_code.launcher = helper_code.to_string();
+    role_code.storer = helper_code.to_string();
+  }
+  reg->register_v2_task_role_variant(tt, variant, role_code);
   reg->register_variant_smem_info(tt, variant, smem_info);
   return variant;
 }
 
+// The stage-2 tag base: a per-SM monotonic instruction sequence number
+// (salted+packed into phase tags on the device side). 0 => stage-1.
+inline char const *attn_v2_sync_base_expr(bool multi_role) {
+  return multi_role ? "(unsigned long long)instruction_index + 1ull" : "0ull";
+}
+
 } // anonymous namespace
 
-// params: none. grid.x = num_tasks.
+// params: [nwarps]. grid.x = num_tasks.
 int TaskRegister::register_dsv3_attn_p0_qkva_v2_task(
     threadblock::Graph const &bgraph, std::vector<int> const &params) {
-  assert(params.size() == 0);
+  assert(params.size() == 1);
+  int const nwarps = params[0];
+  assert(nwarps == 4 || nwarps == 7);
   int const num_tasks = (int)bgraph.grid_dim.x;
   std::vector<tb::TBInputOp *> input_ops, output_ops;
   ffn_v2_split_ops(bgraph, 4, 1, input_ops, output_ops);
+  bool const multi_role = nwarps > 4;
   auto emit = [&](mirage::transpiler::CodeKeeper &c) {
     c.e("kernel::dsv3_attn_v2::p0_qkva_task_impl(");
     c.e("    task_desc,");
     c.e("    static_cast<int>(task_desc->task_metadata.task_offset),");
-    c.e("    $);", num_tasks);
+    c.e("    $, $, $);", num_tasks, nwarps, attn_v2_sync_base_expr(multi_role));
   };
-  return register_attn_v2_common(this,
-                                 TASK_DSV3_ATTN_P0_QKVA_V2,
-                                 emit,
-                                 ::kernel::dsv3_attn_v2::make_p0_qkva_smem_info());
+  return register_attn_v2_common(
+      this,
+      TASK_DSV3_ATTN_P0_QKVA_V2,
+      emit,
+      ::kernel::dsv3_attn_v2::make_p0_qkva_smem_info(nwarps),
+      multi_role ? 1 : 0);
 }
 
-// params: [kv_offset]. grid.x = num_tasks.
+// params: [nwarps, kv_offset, has_head_flags]. grid.x = num_tasks.
+// has_head_flags != 0 => an 8th input g_head_done i32[16] is bound and task 0
+// zeroes it each iteration (the round-4 fused partial+merge chain).
 int TaskRegister::register_dsv3_attn_qb_rope_kv_v2_task(
     threadblock::Graph const &bgraph, std::vector<int> const &params) {
-  assert(params.size() == 1);
-  int const kv_offset = params[0];
+  assert(params.size() == 3);
+  int const nwarps = params[0];
+  int const kv_offset = params[1];
+  bool const has_head_flags = params[2] != 0;
+  assert(nwarps == 4 || nwarps == 7);
   int const num_tasks = (int)bgraph.grid_dim.x;
   std::vector<tb::TBInputOp *> input_ops, output_ops;
-  ffn_v2_split_ops(bgraph, 7, 1, input_ops, output_ops);
+  ffn_v2_split_ops(bgraph, has_head_flags ? 8 : 7, 1, input_ops, output_ops);
+  bool const multi_role = nwarps > 4;
   auto emit = [&](mirage::transpiler::CodeKeeper &c) {
     c.e("kernel::dsv3_attn_v2::qb_rope_kv_task_impl(");
     c.e("    task_desc,");
     c.e("    static_cast<int>(task_desc->task_metadata.task_offset),");
-    c.e("    $, $, iter_num);", num_tasks, kv_offset);
+    c.e("    $, $, $,", num_tasks, nwarps, attn_v2_sync_base_expr(multi_role));
+    c.e("    $, iter_num, $);", kv_offset, has_head_flags ? "true" : "false");
   };
   return register_attn_v2_common(
       this,
       TASK_DSV3_ATTN_QB_ROPE_KV_V2,
       emit,
-      ::kernel::dsv3_attn_v2::make_qb_rope_kv_smem_info());
+      ::kernel::dsv3_attn_v2::make_qb_rope_kv_smem_info(nwarps),
+      multi_role ? 1 : 0);
 }
 
-// params: [kv_offset]. grid.x = 128 (16 heads x 8 static splits).
-int TaskRegister::register_dsv3_attn_mla_partial_v2_task(
+// params: [nwarps, kv_offset]. grid.x = 128. The round-4 FUSED partial+merge
+// (T4 removed from the chain; output edge = g_attn_deq).
+int TaskRegister::register_dsv3_attn_mla_fused_v2_task(
     threadblock::Graph const &bgraph, std::vector<int> const &params) {
-  assert(params.size() == 1);
-  int const kv_offset = params[0];
+  assert(params.size() == 2);
+  int const nwarps = params[0];
+  int const kv_offset = params[1];
+  assert(nwarps == 4 || nwarps == 7);
   assert((int)bgraph.grid_dim.x == 128);
   std::vector<tb::TBInputOp *> input_ops, output_ops;
-  ffn_v2_split_ops(bgraph, 4, 1, input_ops, output_ops);
+  ffn_v2_split_ops(bgraph, 7, 1, input_ops, output_ops);
+  bool const multi_role = nwarps > 4;
   auto emit = [&](mirage::transpiler::CodeKeeper &c) {
-    c.e("kernel::dsv3_attn_v2::mla_partial_task_impl(");
+    c.e("kernel::dsv3_attn_v2::mla_fused_task_impl(");
     c.e("    task_desc,");
     c.e("    static_cast<int>(task_desc->task_metadata.task_offset),");
+    c.e("    $, $,", nwarps, attn_v2_sync_base_expr(multi_role));
     c.e("    $, iter_num);", kv_offset);
   };
   return register_attn_v2_common(
       this,
+      TASK_DSV3_ATTN_MLA_FUSED_V2,
+      emit,
+      ::kernel::dsv3_attn_v2::make_mla_partial_smem_info(),
+      multi_role ? 2 : 0);
+}
+
+// params: [nwarps, kv_offset]. grid.x = 128 (16 heads x 8 static splits).
+int TaskRegister::register_dsv3_attn_mla_partial_v2_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  assert(params.size() == 2);
+  int const nwarps = params[0];
+  int const kv_offset = params[1];
+  assert(nwarps == 4 || nwarps == 7);
+  assert((int)bgraph.grid_dim.x == 128);
+  std::vector<tb::TBInputOp *> input_ops, output_ops;
+  ffn_v2_split_ops(bgraph, 4, 1, input_ops, output_ops);
+  bool const multi_role = nwarps > 4;
+  auto emit = [&](mirage::transpiler::CodeKeeper &c) {
+    c.e("kernel::dsv3_attn_v2::mla_partial_task_impl(");
+    c.e("    task_desc,");
+    c.e("    static_cast<int>(task_desc->task_metadata.task_offset),");
+    c.e("    $, $,", nwarps, attn_v2_sync_base_expr(multi_role));
+    c.e("    $, iter_num);", kv_offset);
+  };
+  // helper_mode 2: helpers do the score phase right after the dep-prefix
+  // (their inputs g_qpe/kv_cache and the s_score page are ordered by
+  // SEM_DEP_READY; the first consumer-produced data they need is the
+  // post-exp s_score, gated by the GO_V flag).
+  return register_attn_v2_common(
+      this,
       TASK_DSV3_ATTN_MLA_PARTIAL_V2,
       emit,
-      ::kernel::dsv3_attn_v2::make_mla_partial_smem_info());
+      ::kernel::dsv3_attn_v2::make_mla_partial_smem_info(),
+      multi_role ? 2 : 0);
 }
 
 // params: [kv_offset]. grid.x = 16 (one task per local head).
@@ -9382,45 +9454,57 @@ int TaskRegister::register_dsv3_attn_mla_merge_v2_task(
       this,
       TASK_DSV3_ATTN_MLA_MERGE_V2,
       emit,
-      ::kernel::dsv3_attn_v2::make_mla_merge_smem_info());
+      ::kernel::dsv3_attn_v2::make_mla_merge_smem_info(),
+      /*helper_mode=*/0);
 }
 
-// params: none. grid.x = num_tasks.
+// params: [nwarps]. grid.x = num_tasks.
 int TaskRegister::register_dsv3_attn_wuv_v2_task(
     threadblock::Graph const &bgraph, std::vector<int> const &params) {
-  assert(params.size() == 0);
+  assert(params.size() == 1);
+  int const nwarps = params[0];
+  assert(nwarps == 4 || nwarps == 7);
   int const num_tasks = (int)bgraph.grid_dim.x;
   std::vector<tb::TBInputOp *> input_ops, output_ops;
   ffn_v2_split_ops(bgraph, 4, 1, input_ops, output_ops);
+  bool const multi_role = nwarps > 4;
   auto emit = [&](mirage::transpiler::CodeKeeper &c) {
     c.e("kernel::dsv3_attn_v2::wuv_task_impl(");
     c.e("    task_desc,");
     c.e("    static_cast<int>(task_desc->task_metadata.task_offset),");
-    c.e("    $);", num_tasks);
+    c.e("    $, $);", num_tasks, nwarps);
   };
+  // helper_mode 2: wuv has no flags — helpers take their input/page ordering
+  // from the dep-prefix (SEM_DEP_READY wait) itself.
   return register_attn_v2_common(this,
                                  TASK_DSV3_ATTN_WUV_V2,
                                  emit,
-                                 ::kernel::dsv3_attn_v2::make_wuv_smem_info());
+                                 ::kernel::dsv3_attn_v2::make_wuv_smem_info(),
+                                 multi_role ? 2 : 0);
 }
 
-// params: none. grid.x = num_tasks.
+// params: [nwarps]. grid.x = num_tasks.
 int TaskRegister::register_dsv3_attn_oproj_v2_task(
     threadblock::Graph const &bgraph, std::vector<int> const &params) {
-  assert(params.size() == 0);
+  assert(params.size() == 1);
+  int const nwarps = params[0];
+  assert(nwarps == 4 || nwarps == 7);
   int const num_tasks = (int)bgraph.grid_dim.x;
   std::vector<tb::TBInputOp *> input_ops, output_ops;
   ffn_v2_split_ops(bgraph, 4, 1, input_ops, output_ops);
+  bool const multi_role = nwarps > 4;
   auto emit = [&](mirage::transpiler::CodeKeeper &c) {
     c.e("kernel::dsv3_attn_v2::oproj_task_impl(");
     c.e("    task_desc,");
     c.e("    static_cast<int>(task_desc->task_metadata.task_offset),");
-    c.e("    $);", num_tasks);
+    c.e("    $, $, $);", num_tasks, nwarps, attn_v2_sync_base_expr(multi_role));
   };
-  return register_attn_v2_common(this,
-                                 TASK_DSV3_ATTN_OPROJ_V2,
-                                 emit,
-                                 ::kernel::dsv3_attn_v2::make_oproj_smem_info());
+  return register_attn_v2_common(
+      this,
+      TASK_DSV3_ATTN_OPROJ_V2,
+      emit,
+      ::kernel::dsv3_attn_v2::make_oproj_smem_info(nwarps),
+      multi_role ? 1 : 0);
 }
 
 } // namespace runtime

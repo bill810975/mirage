@@ -108,6 +108,125 @@ __device__ __forceinline__ void attn_task_epilogue() {
   attn_consumer_sync();
 }
 
+// ---------------------------------------------------------------------------
+// Stage-2 (nwarps=7) cross-role handshake: monotonic TAG-FLAGS in task SMEM
+// (u64[4]: [0] consumer->helper GO, [1..3] per-helper-warp DONE). Same proven
+// protocol as dsv3_ffn_v2 (st.release.cta / ld.acquire.cta, lane-0 poll +
+// nanosleep; no mbar init/parity). sync_base == 0 => stage-1 (4 consumer
+// warps): every handshake compiles out and the consumer path degrades to the
+// plain 128-thread named barrier.
+//
+// Phase tags: tag(phase) = ((sync_base << 4) | phase) * GOLDEN with
+// sync_base = instruction_index + 1 (codegen). The packed value is bijective
+// over (instruction, phase<16) and the odd multiplier salts it so stale
+// SMEM bytes from a previous task can never satisfy a 64-bit exact-match
+// wait (design-review edit: salt AFTER packing, no additive-offset overlap
+// argument needed).
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ uint64_t attnv2_tag(unsigned long long sync_base,
+                                               int phase) {
+  // sync_base == 0 => stage-1: EVERY phase tag must be 0 so all handshakes
+  // compile out (a nonzero phase tag would make consumers poll flags no
+  // helper ever writes). For sync_base >= 1 the packed value is >= 16, and
+  // an odd multiplier never maps a nonzero value to 0 mod 2^64.
+  return sync_base == 0
+             ? 0ull
+             : ((sync_base << 4) | (unsigned long long)phase) *
+                   0x9E3779B97F4A7C15ull;
+}
+__device__ __forceinline__ void attnv2_flag_store_release(uint64_t *f,
+                                                          uint64_t v) {
+  asm volatile("st.release.cta.shared::cta.u64 [%0], %1;" ::"r"(
+                   static_cast<int>(__cvta_generic_to_shared(f))),
+               "l"(v)
+               : "memory");
+}
+__device__ __forceinline__ uint64_t attnv2_flag_load_acquire(uint64_t *f) {
+  uint64_t v;
+  asm volatile("ld.acquire.cta.shared::cta.u64 %0, [%1];"
+               : "=l"(v)
+               : "r"(static_cast<int>(__cvta_generic_to_shared(f)))
+               : "memory");
+  return v;
+}
+__device__ __forceinline__ void attnv2_flag_poll(uint64_t *f, uint64_t tag) {
+  while (attnv2_flag_load_acquire(f) != tag) {
+    __nanosleep(64);
+  }
+}
+// Whole-warp wait: lane 0 polls, __syncwarp hands the acquire ordering to
+// lanes 1..31 (an all-lane tight acquire spin from 3 helper warps would
+// saturate the LSU pipes).
+__device__ __forceinline__ void attnv2_flag_wait(uint64_t *f, uint64_t tag) {
+  if ((threadIdx.x & 31) == 0) {
+    attnv2_flag_poll(f, tag);
+  }
+  __syncwarp();
+}
+
+// Consumer -> helper release (GO flag). Consumer-side only; call from
+// thread 0 after the data being published (e.g. the rms_rcp scalar slot).
+__device__ __forceinline__ void
+    attnv2_go(uint64_t *flags, uint64_t tag) {
+  if (tag != 0 && threadIdx.x == 0) {
+    attnv2_flag_store_release(&flags[0], tag);
+  }
+}
+
+// Full cross-role barrier: every MAC warp's prior SMEM/GMEM work is visible
+// to every MAC warp after it. Consumers: bar4 (their own work folded), then
+// thread 0 acquires the 3 helper DONE flags and releases GO, then bar4
+// (hands the acquired helper writes to warps 1-3). Helpers: lane 0 releases
+// DONE then acquires GO. Stage-1 (tag==0): a single consumer bar4.
+__device__ __forceinline__ void
+    attnv2_xrole_barrier(uint64_t *flags, uint64_t tag, bool is_consumer) {
+  if (is_consumer) {
+    attn_consumer_sync();
+    if (tag != 0) {
+      if (threadIdx.x == 0) {
+        attnv2_flag_poll(&flags[1], tag);
+        attnv2_flag_poll(&flags[2], tag);
+        attnv2_flag_poll(&flags[3], tag);
+        attnv2_flag_store_release(&flags[0], tag);
+      }
+      attn_consumer_sync();
+    }
+  } else {
+    int const ws = threadIdx.x >> 5; // 4/5/6
+    if ((threadIdx.x & 31) == 0) {
+      attnv2_flag_store_release(&flags[1 + (ws - 4)], tag);
+    }
+    attnv2_flag_wait(&flags[0], tag);
+  }
+}
+
+// Multi-role task epilogue (FFN mac_task_epilogue pattern): every MAC warp
+// drains its own cp.async ring; helpers release their DONE flag and return;
+// consumer warp 0 lane 0 acquires all helper DONE flags BEFORE returning so
+// the codegen page-release suffix (warp-0 lanes) cannot free SMEM pages a
+// helper still uses. Must run on EVERY path (incl. no-op paths).
+__device__ __forceinline__ void
+    attnv2_mac_epilogue(uint64_t *flags, uint64_t tag, bool is_consumer) {
+  v1a::k_cpa_wait<0>();
+  __syncwarp();
+  if (is_consumer) {
+    attn_consumer_sync();
+    if (tag != 0 && threadIdx.x < 32) {
+      if (threadIdx.x == 0) {
+        attnv2_flag_poll(&flags[1], tag);
+        attnv2_flag_poll(&flags[2], tag);
+        attnv2_flag_poll(&flags[3], tag);
+      }
+      __syncwarp();
+    }
+  } else {
+    int const ws = threadIdx.x >> 5;
+    if ((threadIdx.x & 31) == 0) {
+      attnv2_flag_store_release(&flags[1 + (ws - 4)], tag);
+    }
+  }
+}
+
 // ============================================================================
 // EXACT-TREE 128-thread emulation of v1's rms_rcp_block
 // (attn_block_megakernel_sm100.cuh: per-thread partial with stride
@@ -153,6 +272,14 @@ __device__ __forceinline__ float
 // T1 — p0_qkva. v1 Phase-0 (rmsnorm_quant_hidden_block_smem: fused RMSNorm +
 // per-128-group UE8M0 quant of the normed value, redundant per CTA) + v1 S2
 // (qkv_a GEMV, grid-strided).
+//
+// Stage-2 tuning (round 1): (a) x is STAGED into the (pre-GEMV-dead) ring
+// region via cp.async uint4 — both v1 and the original port read x from GMEM
+// with strided scalar-bf16 loads, the documented 128-thread latency trap;
+// staging changes no value (same bytes, same tree order, same h2 pairs).
+// (b) With nwarps == 7 the quant loop and the GEMV are strided over all 7
+// MAC warps; helpers wait a tag-flag carrying rms_rcp (the reduction TREES
+// stay consumer-only — exact 128-emu code untouched).
 //   inputs : [0] x bf16[1,HIDDEN] (RAW residual stream — the chain edge in)
 //            [1] input_ln_w bf16[HIDDEN]
 //            [2] qkv_a_w fp8[QKVAN,HIDDEN]  [3] qkv_a_s f32[17,56]
@@ -161,7 +288,9 @@ __device__ __forceinline__ float
 __device__ __noinline__ void
     p0_qkva_task_impl(mirage::runtime::TaskDesc const *task_desc,
                       int task_offset,
-                      int num_tasks) {
+                      int num_tasks,
+                      int nwarps,
+                      unsigned long long sync_base) {
   __nv_bfloat16 const *x =
       static_cast<__nv_bfloat16 const *>(task_desc->input_ptrs[0]);
   __nv_bfloat16 const *input_ln_w =
@@ -176,56 +305,87 @@ __device__ __noinline__ void
       smem + task_desc->smem_region_offset(P0_REGION_WORK));
   float *red8 = reinterpret_cast<float *>(
       reinterpret_cast<char *>(s_act) + P0_RED_OFF);
+  float *s_scalar = reinterpret_cast<float *>(
+      reinterpret_cast<char *>(s_act) + P0_SCALAR_OFF);
+  uint64_t *s_flags = reinterpret_cast<uint64_t *>(
+      reinterpret_cast<char *>(s_act) + P0_FLAGS_OFF);
   uint4 *s_ring = reinterpret_cast<uint4 *>(
       smem + task_desc->smem_region_offset(P0_REGION_RING));
+  // bf16 x staging view over the ring (dead before the GEMV touches it).
+  __nv_bfloat16 *s_x = reinterpret_cast<__nv_bfloat16 *>(s_ring);
 
   int tid = threadIdx.x, lane = tid & 31, warpl = tid >> 5;
+  bool const is_consumer = tid < 128;
+  float rms_rcp;
 
-  // ---- Phase-0 RMSNorm reduction: EXACT-TREE port of
-  // rmsnorm_quant_hidden_block_smem's xor-tree variant (per-thread partial
-  // stride 256, per-warp shfl_XOR, warp-0 xor tree over red8[0..8),
-  // broadcast via red8[0], rsqrtf). A/B emulation as described above.
-  float psA = 0.f, psB = 0.f;
-  for (int i = tid; i < K_HIDDEN; i += NTHREAD) {
-    float v = __bfloat162float(x[i]);
-    psA += v * v;
-  }
-  for (int i = tid + 128; i < K_HIDDEN; i += NTHREAD) {
-    float v = __bfloat162float(x[i]);
-    psB += v * v;
-  }
+  if (is_consumer) {
+    // ---- stage x -> s_x (uint4 cp.async; 896 vectors / 128 threads).
+    {
+      uint32_t const sb = static_cast<uint32_t>(__cvta_generic_to_shared(s_x));
+      uint4 const *g4 = reinterpret_cast<uint4 const *>(x);
+      constexpr int NU4 = K_HIDDEN * 2 / 16; // 896
+      for (int u = tid; u < NU4; u += 128) {
+        v1a::k_cpa16(sb + (uint32_t)u * 16, &g4[u]);
+      }
+      v1a::k_cpa_commit();
+      v1a::k_cpa_wait<0>();
+      attn_consumer_sync();
+    }
+    // ---- Phase-0 RMSNorm reduction: EXACT-TREE port of
+    // rmsnorm_quant_hidden_block_smem's xor-tree variant (per-thread partial
+    // stride 256, per-warp shfl_XOR, warp-0 xor tree over red8[0..8),
+    // broadcast via red8[0], rsqrtf). A/B emulation, reading the staged
+    // bytes in the identical i = tid (+128), += 256 order.
+    float psA = 0.f, psB = 0.f;
+    for (int i = tid; i < K_HIDDEN; i += NTHREAD) {
+      float v = __bfloat162float(s_x[i]);
+      psA += v * v;
+    }
+    for (int i = tid + 128; i < K_HIDDEN; i += NTHREAD) {
+      float v = __bfloat162float(s_x[i]);
+      psB += v * v;
+    }
 #pragma unroll
-  for (int o = 16; o > 0; o >>= 1) {
-    psA += __shfl_xor_sync(0xffffffffu, psA, o);
-    psB += __shfl_xor_sync(0xffffffffu, psB, o);
-  }
-  if (lane == 0) {
-    red8[warpl] = psA;
-    red8[warpl + 4] = psB;
-  }
-  attn_consumer_sync();
-  // v1: warp-0 xor tree over the NWARP partials (lanes 0-7 hold red8[0..8);
-  // xor with o=4,2,1 stays inside the 8-aligned lane group), broadcast
-  // through red8[0].
-  float ss = (tid < NWARP) ? red8[tid] : 0.f;
+    for (int o = 16; o > 0; o >>= 1) {
+      psA += __shfl_xor_sync(0xffffffffu, psA, o);
+      psB += __shfl_xor_sync(0xffffffffu, psB, o);
+    }
+    if (lane == 0) {
+      red8[warpl] = psA;
+      red8[warpl + 4] = psB;
+    }
+    attn_consumer_sync();
+    // v1: warp-0 xor tree over the NWARP partials (lanes 0-7 hold
+    // red8[0..8); xor with o=4,2,1 stays inside the 8-aligned lane group),
+    // broadcast through red8[0].
+    float ss = (tid < NWARP) ? red8[tid] : 0.f;
 #pragma unroll
-  for (int o = NWARP / 2; o > 0; o >>= 1) {
-    ss += __shfl_xor_sync(0xffffffffu, ss, o);
+    for (int o = NWARP / 2; o > 0; o >>= 1) {
+      ss += __shfl_xor_sync(0xffffffffu, ss, o);
+    }
+    if (tid == 0) {
+      red8[0] = ss;
+    }
+    attn_consumer_sync();
+    ss = red8[0];
+    attn_consumer_sync(); // re-converge before red8 is reused later
+    rms_rcp = rsqrtf(ss / (float)K_HIDDEN + K_EPS);
+    if (sync_base != 0 && tid == 0) {
+      s_scalar[0] = rms_rcp;
+    }
+    attnv2_go(s_flags, attnv2_tag(sync_base, 0)); // publish rms_rcp + s_x
+  } else {
+    attnv2_flag_wait(&s_flags[0], attnv2_tag(sync_base, 0));
+    rms_rcp = s_scalar[0];
   }
-  if (tid == 0) {
-    red8[0] = ss;
-  }
-  attn_consumer_sync();
-  ss = red8[0];
-  attn_consumer_sync(); // re-converge before red8 is reused later
-  float rms_rcp = rsqrtf(ss / (float)K_HIDDEN + K_EPS);
 
   // ---- UE8M0 per-128-group quant of the NORMED value into s_act (v1 body
-  // verbatim; outer warp stride 8 -> 4; group math is warp-local).
+  // verbatim; outer warp stride 8 -> nwarps; group math is warp-local, so
+  // any group->warp redistribution is value-identical).
   {
     int ng = K_HIDDEN / K_GRP;
-    for (int gx = warpl; gx < ng; gx += 4) {
-      __nv_bfloat16 const *h = x + gx * K_GRP;
+    for (int gx = warpl; gx < ng; gx += nwarps) {
+      __nv_bfloat16 const *h = s_x + gx * K_GRP;
       __nv_bfloat16 const *w = input_ln_w + gx * K_GRP;
       float v[4];
       float mx = 1e-10f;
@@ -259,22 +419,25 @@ __device__ __noinline__ void
       }
     }
   }
-  attn_consumer_sync(); // publishes s_act (v1's trailing __syncthreads)
+  // publishes s_act to every MAC warp (v1's trailing __syncthreads); also
+  // retires all s_x reads before the GEMV reuses the ring.
+  attnv2_xrole_barrier(s_flags, attnv2_tag(sync_base, 1), is_consumer);
 
   // ---- qkv_a GEMV (VERBATIM v1 template; activation from task-local SMEM,
-  // exactly as v1 lever 1 passes s_act).
+  // exactly as v1 lever 1 passes s_act). Row-block accumulation depends only
+  // on (n, K) — the gwarp re-stride is value-exact.
   uint4 *my_ring = s_ring + (size_t)warpl * (P0_RING_BYTES_PER_WARP / 16);
-  v1a::gemv_grid_cpa_t<2, 6>(s_act,
+  v1a::gemv_grid_cpa_t<P0_GEMV_RBT, P0_GEMV_STAGES>(s_act,
                              qkv_a_w,
                              qkv_a_s,
                              g_qkva,
                              K_QKVAN,
                              K_HIDDEN,
-                             task_offset * 4 + warpl,
-                             num_tasks * 4,
+                             task_offset * nwarps + warpl,
+                             num_tasks * nwarps,
                              lane,
                              my_ring);
-  attn_task_epilogue();
+  attnv2_mac_epilogue(s_flags, attnv2_tag(sync_base, 2), is_consumer);
 }
 
 // ============================================================================
@@ -294,8 +457,18 @@ __device__ __noinline__ void
     qb_rope_kv_task_impl(mirage::runtime::TaskDesc const *task_desc,
                          int task_offset,
                          int num_tasks,
+                         int nwarps,
+                         unsigned long long sync_base,
                          int kv_offset,
-                         int iter_num) {
+                         int iter_num,
+                         bool has_head_flags) {
+  // Round-4 fold support: when the chain uses the FUSED partial+merge, T2
+  // carries an 8th input g_head_done i32[16] and task 0 zeroes it every
+  // iteration (ordered before the fused op's atomics by the T2->T3' event;
+  // ordered after the PREVIOUS iteration's fused op by the event chain
+  // through T5/T6/T1 — robust to profiled all-S iterations and re-runs).
+  int *g_head_done =
+      has_head_flags ? static_cast<int *>(task_desc->input_ptrs[7]) : nullptr;
   float const *g_qkva = static_cast<float const *>(task_desc->input_ptrs[0]);
   __nv_bfloat16 const *q_a_ln_w =
       static_cast<__nv_bfloat16 const *>(task_desc->input_ptrs[1]);
@@ -315,47 +488,68 @@ __device__ __noinline__ void
       smem + task_desc->smem_region_offset(QB_REGION_WORK));
   float *red8 = reinterpret_cast<float *>(
       reinterpret_cast<char *>(s_qbdeq) + QB_RED_OFF);
+  float *s_scalar = reinterpret_cast<float *>(
+      reinterpret_cast<char *>(s_qbdeq) + QB_SCALAR_OFF);
+  uint64_t *s_flags = reinterpret_cast<uint64_t *>(
+      reinterpret_cast<char *>(s_qbdeq) + QB_FLAGS_OFF);
   uint4 *s_ring = reinterpret_cast<uint4 *>(
       smem + task_desc->smem_region_offset(QB_REGION_RING));
 
   int tid = threadIdx.x, lane = tid & 31, warpl = tid >> 5;
+  bool const is_consumer = tid < 128;
   int const step = iter_num + kv_offset;
   int const pos = step;
+  float q_rcp;
 
-  // q_rcp: EXACT-TREE emulation of v1's rms_rcp_block over g_qkva[0:QLORA)
-  // (global reads, exactly as v1 reads its scratch).
-  float q_rcp = rms_rcp_block_128emu(g_qkva, K_QLORA, red8);
+  if (is_consumer) {
+    // q_rcp: EXACT-TREE emulation of v1's rms_rcp_block over g_qkva[0:QLORA)
+    // (global reads, exactly as v1 reads its scratch). Consumer-only.
+    q_rcp = rms_rcp_block_128emu(g_qkva, K_QLORA, red8);
+    if (sync_base != 0 && tid == 0) {
+      s_scalar[0] = q_rcp;
+    }
+    // Release the helpers BEFORE the task-0 kv-branch: helper requant only
+    // needs q_rcp + g_qkva (transitively event-ordered through this flag),
+    // so task 0's helpers requant while its consumers do the kv business.
+    attnv2_go(s_flags, attnv2_tag(sync_base, 0));
 
-  // Task 0 only: kv_rcp (exact tree) + kv_a-ln (v1's grid-strided 512-elem
-  // elementwise loop RESTRIPED into this task — value-exact) + rope(k_pe)
-  // (v1's literal worker-0/tid<32 pair loop). task_offset is task-uniform,
-  // so the barriers inside rms_rcp_block_128emu are non-divergent.
-  if (task_offset == 0) {
-    float kv_rcp = rms_rcp_block_128emu(g_qkva + K_QLORA, K_KVLORA, red8);
-    for (int i = tid; i < K_KVLORA; i += 128) {
-      float v = v1a::k_bf16(g_qkva[K_QLORA + i] * kv_rcp *
-                            __bfloat162float(kv_a_ln_w[i]));
-      kv_cache[(size_t)step * K_QKHEAD + i] = __float2bfloat16(v);
+    // Task 0 only: kv_rcp (exact tree) + kv_a-ln (v1's grid-strided 512-elem
+    // elementwise loop RESTRIPED into this task — value-exact) + rope(k_pe)
+    // (v1's literal worker-0/tid<32 pair loop). task_offset is task-uniform,
+    // so the barriers inside rms_rcp_block_128emu are non-divergent.
+    if (task_offset == 0) {
+      if (g_head_done != nullptr && tid < K_HLOCAL) {
+        g_head_done[tid] = 0; // reset the fold's per-head arrival counters
+      }
+      float kv_rcp = rms_rcp_block_128emu(g_qkva + K_QLORA, K_KVLORA, red8);
+      for (int i = tid; i < K_KVLORA; i += 128) {
+        float v = v1a::k_bf16(g_qkva[K_QLORA + i] * kv_rcp *
+                              __bfloat162float(kv_a_ln_w[i]));
+        kv_cache[(size_t)step * K_QKHEAD + i] = __float2bfloat16(v);
+      }
+      if (tid < K_QKROPE / 2) {
+        int pr = tid;
+        int d0 = pr * 2, d1 = d0 + 1;
+        float c = __bfloat162float(cos_sin[pos * K_COSSIN_STRIDE + d0]);
+        float s = __bfloat162float(
+            cos_sin[pos * K_COSSIN_STRIDE + K_COSSIN_SINOFF + d0]);
+        float k0 = g_qkva[2048 + d0], k1 = g_qkva[2048 + d1];
+        kv_cache[(size_t)step * K_QKHEAD + 512 + d0] =
+            __float2bfloat16(v1a::k_bf16(k0 * c - k1 * s));
+        kv_cache[(size_t)step * K_QKHEAD + 512 + d1] =
+            __float2bfloat16(v1a::k_bf16(k1 * c + k0 * s));
+      }
     }
-    if (tid < K_QKROPE / 2) {
-      int pr = tid;
-      int d0 = pr * 2, d1 = d0 + 1;
-      float c = __bfloat162float(cos_sin[pos * K_COSSIN_STRIDE + d0]);
-      float s = __bfloat162float(
-          cos_sin[pos * K_COSSIN_STRIDE + K_COSSIN_SINOFF + d0]);
-      float k0 = g_qkva[2048 + d0], k1 = g_qkva[2048 + d1];
-      kv_cache[(size_t)step * K_QKHEAD + 512 + d0] =
-          __float2bfloat16(v1a::k_bf16(k0 * c - k1 * s));
-      kv_cache[(size_t)step * K_QKHEAD + 512 + d1] =
-          __float2bfloat16(v1a::k_bf16(k1 * c + k0 * s));
-    }
+  } else {
+    attnv2_flag_wait(&s_flags[0], attnv2_tag(sync_base, 0));
+    q_rcp = s_scalar[0];
   }
 
   // q_a-ln + UE8M0 requant into task-local SMEM s_qbdeq (v1 lever-2 body
-  // verbatim; outer warp stride 8 -> 4).
+  // verbatim; outer warp stride 8 -> nwarps; group math warp-local).
   {
     int ngq = K_QLORA / K_GRP; // 12
-    for (int g = warpl; g < ngq; g += 4) {
+    for (int g = warpl; g < ngq; g += nwarps) {
       float const *src = g_qkva + g * K_GRP;
       __nv_bfloat16 const *w = q_a_ln_w + g * K_GRP;
       float nv[4];
@@ -383,11 +577,12 @@ __device__ __noinline__ void
       }
     }
   }
-  attn_consumer_sync(); // publishes s_qbdeq (v1's __syncthreads at S3->S4)
+  // publishes s_qbdeq to every MAC warp (v1's __syncthreads at S3->S4).
+  attnv2_xrole_barrier(s_flags, attnv2_tag(sync_base, 1), is_consumer);
 
   // q_b GEMV + fused YaRN rope (VERBATIM v1 template, SMEM activation).
-  uint4 *my_ring = s_ring + (size_t)warpl * (GEMV_RING_BYTES_PER_WARP / 16);
-  v1a::gemv_grid_cpa_qb_rope_smem_t<8, 4>(s_qbdeq,
+  uint4 *my_ring = s_ring + (size_t)warpl * (QB_RING_BYTES_PER_WARP / 16);
+  v1a::gemv_grid_cpa_qb_rope_smem_t<QB_GEMV_RBT, QB_GEMV_STAGES>(s_qbdeq,
                                           q_b_w,
                                           q_b_s,
                                           g_qpe,
@@ -395,11 +590,11 @@ __device__ __noinline__ void
                                           K_QLORA,
                                           cos_sin,
                                           pos,
-                                          task_offset * 4 + warpl,
-                                          num_tasks * 4,
+                                          task_offset * nwarps + warpl,
+                                          num_tasks * nwarps,
                                           lane,
                                           my_ring);
-  attn_task_epilogue();
+  attnv2_mac_epilogue(s_flags, attnv2_tag(sync_base, 2), is_consumer);
 }
 
 // ============================================================================
@@ -414,9 +609,282 @@ __device__ __noinline__ void
 //   outputs: [0] g_mla_acc f32[16*8*512] (the T3->T4 chain edge)
 //   params : kv_offset
 // ============================================================================
+// Shared core of the partial computation (score + trees + V), used by BOTH
+// the standalone partial op and the round-4 FUSED partial+merge. Returns
+// after the V accumulation; the caller supplies the epilogue (plain
+// mac-epilogue for the standalone op; the lever-4 fold for the fused op).
+__device__ __forceinline__ void
+    mla_partial_core(float const *__restrict__ g_qpe,
+                     __nv_bfloat16 const *__restrict__ kv_cache,
+                     float *__restrict__ g_mla_m,
+                     float *__restrict__ g_mla_l,
+                     float *__restrict__ g_mla_acc,
+                     float *__restrict__ s_score,
+                     float *__restrict__ red8,
+                     uint64_t *__restrict__ s_flags,
+                     int nwarps,
+                     unsigned long long sync_base,
+                     int h,
+                     int sp,
+                     int nsp,
+                     int r0,
+                     int nr,
+                     bool active) {
+  int const tid = threadIdx.x;
+  bool const is_consumer = tid < 128;
+  int const nthreads_mac = nwarps * 32;
+  double mscale = 0.1 * log(40.0) + 1.0;
+  float sm = (float)((1.0 / sqrt(192.0)) * mscale * mscale);
+  float const *q = &g_qpe[h * K_QKHEAD];
+
+  // ---- TPR selection VERBATIM (NTHREAD is v1's 256, NOT the MAC thread
+  // count — value-affecting via the score grouping).
+  int TPR = NTHREAD / (nr > 0 ? nr : 1);
+  if (TPR < 1) {
+    TPR = 1;
+  }
+  if (TPR > 8) {
+    TPR = 8;
+  }
+  if (TPR >= 8) {
+    TPR = 8;
+  } else if (TPR >= 4) {
+    TPR = 4;
+  } else if (TPR >= 2) {
+    TPR = 2;
+  } else {
+    TPR = 1;
+  }
+
+  // ---- SCORE (all MAC warps): flat group-stripe + 2-row ILP. A row's score
+  // depends only on (rr, TPR): the c-loop sub-partition and the
+  // shfl_down(width=TPR) tree are identical for any aligned TPR group in any
+  // warp, so the assignment of rows to groups is value-neutral; the 2-row
+  // interleave keeps each row's c-order (and its own fp chain) unchanged.
+  if (active) {
+    int const laneInWarp = tid & 31;
+    unsigned const grpmask =
+        ((TPR >= 32) ? 0xffffffffu
+                     : (((1u << TPR) - 1u) << ((laneInWarp / TPR) * TPR)));
+    int const sub = tid % TPR; // == laneInWarp % TPR (TPR divides 32)
+    int const gid = tid / TPR; // groups contiguous across the MAC warps
+    int const ngroups = nthreads_mac / TPR;
+    for (int rr0 = gid; rr0 < nr; rr0 += 2 * ngroups) {
+      int const rr1 = rr0 + ngroups;
+      bool const has1 = rr1 < nr; // group-uniform (rr0, ngroups uniform)
+      uint4 const *kvr0 = reinterpret_cast<uint4 const *>(
+          &kv_cache[(size_t)(r0 + rr0) * K_QKHEAD]);
+      uint4 const *kvr1 =
+          has1 ? reinterpret_cast<uint4 const *>(
+                     &kv_cache[(size_t)(r0 + rr1) * K_QKHEAD])
+               : kvr0;
+      float dot0 = 0.f, dot1 = 0.f;
+      for (int c = sub; c < K_QKHEAD / 8; c += TPR) {
+        float const *qc = &q[c * 8];
+        uint4 const kw0 = kvr0[c];
+        __nv_bfloat162 const *k20 =
+            reinterpret_cast<__nv_bfloat162 const *>(&kw0);
+#pragma unroll
+        for (int p = 0; p < 4; p++) {
+          float2 kf = __bfloat1622float2(k20[p]);
+          dot0 += qc[2 * p] * kf.x + qc[2 * p + 1] * kf.y;
+        }
+        if (has1) {
+          uint4 const kw1 = kvr1[c];
+          __nv_bfloat162 const *k21 =
+              reinterpret_cast<__nv_bfloat162 const *>(&kw1);
+#pragma unroll
+          for (int p = 0; p < 4; p++) {
+            float2 kf = __bfloat1622float2(k21[p]);
+            dot1 += qc[2 * p] * kf.x + qc[2 * p + 1] * kf.y;
+          }
+        }
+      }
+#pragma unroll
+      for (int o = TPR >> 1; o > 0; o >>= 1) {
+        dot0 += __shfl_down_sync(grpmask, dot0, o, TPR);
+      }
+      if (has1) {
+#pragma unroll
+        for (int o = TPR >> 1; o > 0; o >>= 1) {
+          dot1 += __shfl_down_sync(grpmask, dot1, o, TPR);
+        }
+      }
+      if (sub == 0) {
+        s_score[rr0] = dot0 * sm;
+        if (has1) {
+          s_score[rr1] = dot1 * sm;
+        }
+      }
+    }
+  }
+
+  if (is_consumer) {
+    attn_consumer_sync(); // v1's post-score __syncthreads (consumer share)
+    // fold the helpers' s_score writes in (score-done handshake).
+    {
+      uint64_t const stag = attnv2_tag(sync_base, 0);
+      if (stag != 0) {
+        if (tid == 0) {
+          attnv2_flag_poll(&s_flags[1], stag);
+          attnv2_flag_poll(&s_flags[2], stag);
+          attnv2_flag_poll(&s_flags[3], stag);
+        }
+        attn_consumer_sync();
+      }
+    }
+    float gmax = -1e30f, gsum = 0.f;
+    if (active) {
+      // ---- lmax (A/B emulation of v1's xor tree — UNCHANGED, consumers).
+      float lmA = -1e30f, lmB = -1e30f;
+      for (int rr = tid; rr < nr; rr += NTHREAD) {
+        lmA = fmaxf(lmA, s_score[rr]);
+      }
+      for (int rr = tid + 128; rr < nr; rr += NTHREAD) {
+        lmB = fmaxf(lmB, s_score[rr]);
+      }
+#pragma unroll
+      for (int o = 16; o > 0; o >>= 1) {
+        lmA = fmaxf(lmA, __shfl_xor_sync(0xffffffffu, lmA, o));
+        lmB = fmaxf(lmB, __shfl_xor_sync(0xffffffffu, lmB, o));
+      }
+      if ((tid & 31) == 0) {
+        red8[tid >> 5] = lmA;
+        red8[(tid >> 5) + 4] = lmB;
+      }
+      attn_consumer_sync();
+#pragma unroll
+      for (int i = 0; i < NWARP; i++) {
+        gmax = fmaxf(gmax, red8[i]);
+      }
+      attn_consumer_sync();
+      // exp (elementwise restripe — value-exact; consumers only).
+      for (int rr = tid; rr < nr; rr += 128) {
+        s_score[rr] = __expf(s_score[rr] - gmax);
+      }
+      attn_consumer_sync(); // post-exp: s_score final for all V readers
+    }
+    // release the helpers into V (post-exp bytes published). UNCONDITIONAL
+    // (no-op tasks must still release parked helpers).
+    attnv2_go(s_flags, attnv2_tag(sync_base, 1));
+    if (active) {
+      // ---- lsum (A/B emulation — UNCHANGED; overlaps the helpers' V).
+      float lsA = 0.f, lsB = 0.f;
+      for (int rr = tid; rr < nr; rr += NTHREAD) {
+        lsA += s_score[rr];
+      }
+      for (int rr = tid + 128; rr < nr; rr += NTHREAD) {
+        lsB += s_score[rr];
+      }
+#pragma unroll
+      for (int o = 16; o > 0; o >>= 1) {
+        lsA += __shfl_xor_sync(0xffffffffu, lsA, o);
+        lsB += __shfl_xor_sync(0xffffffffu, lsB, o);
+      }
+      if ((tid & 31) == 0) {
+        red8[tid >> 5] = lsA;
+        red8[(tid >> 5) + 4] = lsB;
+      }
+      attn_consumer_sync();
+#pragma unroll
+      for (int i = 0; i < NWARP; i++) {
+        gsum += red8[i];
+      }
+      int const base = h * MLA_SPLITS + sp;
+      if (tid == 0) {
+        g_mla_m[base] = (nr > 0) ? gmax : -1e30f;
+        g_mla_l[base] = gsum;
+      }
+    }
+  } else {
+    // helpers: score done -> park until the post-exp GO.
+    int const ws = tid >> 5; // 4/5/6
+    if ((tid & 31) == 0) {
+      attnv2_flag_store_release(&s_flags[1 + (ws - 4)],
+                                attnv2_tag(sync_base, 0));
+    }
+    attnv2_flag_wait(&s_flags[0], attnv2_tag(sync_base, 1));
+  }
+
+  // ---- V accumulation (all MAC warps): each thread owns the d-columns
+  // {tid, tid+nT, ...}; up to 4 independent fp32 chains in ONE ascending-rr
+  // loop (per-column accumulation order identical to the reference outer-d
+  // loop => bit-exact; the interleave only adds ILP).
+  if (active) {
+    int const base = h * MLA_SPLITS + sp;
+    float *accv = &g_mla_acc[(size_t)base * K_KVLORA];
+    int const d0 = tid;
+    int const d1 = tid + nthreads_mac;
+    int const d2 = tid + 2 * nthreads_mac;
+    int const d3 = tid + 3 * nthreads_mac;
+    bool const e1 = d1 < K_KVLORA;
+    bool const e2 = d2 < K_KVLORA;
+    bool const e3 = d3 < K_KVLORA;
+    float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+    for (int rr = 0; rr < nr; rr++) {
+      float const sc = s_score[rr];
+      __nv_bfloat16 const *row = &kv_cache[(size_t)(r0 + rr) * K_QKHEAD];
+      a0 += sc * __bfloat162float(row[d0]);
+      if (e1) {
+        a1 += sc * __bfloat162float(row[d1]);
+      }
+      if (e2) {
+        a2 += sc * __bfloat162float(row[d2]);
+      }
+      if (e3) {
+        a3 += sc * __bfloat162float(row[d3]);
+      }
+    }
+    accv[d0] = a0;
+    if (e1) {
+      accv[d1] = a1;
+    }
+    if (e2) {
+      accv[d2] = a2;
+    }
+    if (e3) {
+      accv[d3] = a3;
+    }
+  }
+}
+
+// Geometry shared by the partial/fused wrappers (v1 split math VERBATIM).
+struct MlaGeom {
+  int nsp;
+  int h;
+  int sp;
+  int r0;
+  int nr;
+  bool active;
+};
+__device__ __forceinline__ MlaGeom mla_geom(int task_offset, int KV) {
+  MlaGeom g;
+  int nsp = (KV + 63) / 64;
+  if (nsp < 1) {
+    nsp = 1;
+  }
+  if (nsp > MLA_SPLITS) {
+    nsp = MLA_SPLITS;
+  }
+  int const tile = (KV + nsp - 1) / nsp;
+  g.nsp = nsp;
+  g.h = task_offset >> 3;
+  g.sp = task_offset & 7;
+  g.active = g.sp < nsp;
+  g.r0 = g.sp * tile;
+  int r1 = g.r0 + tile;
+  if (r1 > KV) {
+    r1 = KV;
+  }
+  g.nr = g.active ? (r1 - g.r0) : 0;
+  return g;
+}
+
 __device__ __noinline__ void
     mla_partial_task_impl(mirage::runtime::TaskDesc const *task_desc,
                           int task_offset,
+                          int nwarps,
+                          unsigned long long sync_base,
                           int kv_offset,
                           int iter_num) {
   float const *g_qpe = static_cast<float const *>(task_desc->input_ptrs[0]);
@@ -431,161 +899,174 @@ __device__ __noinline__ void
       smem + task_desc->smem_region_offset(MP_REGION_WORK));
   float *red8 = reinterpret_cast<float *>(
       reinterpret_cast<char *>(s_score) + MP_RED_OFF);
+  uint64_t *s_flags = reinterpret_cast<uint64_t *>(
+      reinterpret_cast<char *>(s_score) + MP_FLAGS_OFF);
 
-  int tid = threadIdx.x;
-  int const step = iter_num + kv_offset;
-  int const KV = step + 1;
-  // v1 split math VERBATIM.
-  int nsp = (KV + 63) / 64;
-  if (nsp < 1) {
-    nsp = 1;
-  }
-  if (nsp > MLA_SPLITS) {
-    nsp = MLA_SPLITS;
-  }
-  int const tile = (KV + nsp - 1) / nsp;
-  int const h = task_offset >> 3;
-  int const sp = task_offset & 7;
+  MlaGeom const g = mla_geom(task_offset, iter_num + kv_offset + 1);
+  mla_partial_core(g_qpe, kv_cache, g_mla_m, g_mla_l, g_mla_acc, s_score,
+                   red8, s_flags, nwarps, sync_base, g.h, g.sp, g.nsp, g.r0,
+                   g.nr, g.active);
+  // UNCONDITIONAL multi-role epilogue (also on the sp>=nsp no-op path).
+  attnv2_mac_epilogue(s_flags, attnv2_tag(sync_base, 2),
+                      threadIdx.x < 128);
+}
 
-  if (sp < nsp) {
-    int r0 = sp * tile, r1 = r0 + tile;
-    if (r1 > KV) {
-      r1 = KV;
-    }
-    double mscale = 0.1 * log(40.0) + 1.0;
-    float sm = (float)((1.0 / sqrt(192.0)) * mscale * mscale);
-    float const *q = &g_qpe[h * K_QKHEAD];
-    int const nr = r1 - r0;
-    // ---- TPR selection VERBATIM (NTHREAD is v1's 256, NOT the v2 thread
-    // count — required for the exact grouping).
-    int TPR = NTHREAD / (nr > 0 ? nr : 1);
-    if (TPR < 1) {
-      TPR = 1;
-    }
-    if (TPR > 8) {
-      TPR = 8;
-    }
-    if (TPR >= 8) {
-      TPR = 8;
-    } else if (TPR >= 4) {
-      TPR = 4;
-    } else if (TPR >= 2) {
-      TPR = 2;
-    } else {
-      TPR = 1;
-    }
+// ============================================================================
+// T3' — mla_fused (round 4): the T4 merge FOLDED into the partial op via
+// v1's lever-4 atomic last-arriver (attn_block_megakernel_sm100.cuh:2329-
+// 2385). After the V accumulation, every task atomically bumps its head's
+// counter; the LAST split-task of head h (old == nsp-1) runs head h's merge
+// + 448-quant on its 128 consumer threads (the T4 body verbatim, s_attn
+// reusing the s_score region). Cross-task/-SM ordering (v1's pattern +
+// the design-review fence edit): each HELPER warp __threadfence()s BEFORE
+// its DONE flag (device-publishes its g_mla_acc columns); consumer thread0
+// acquires the 3 DONE flags + bar4 (folds all consumer stores), then
+// __threadfence() (A-cumulative device release) -> atomicAdd; the last
+// arriver __threadfence()s again (device acquire) and bar4-broadcasts, so
+// the merge reads every split's acc. g_head_done[h] is zeroed by T2 task 0
+// each iteration (event-ordered both ways through the chain). No task ever
+// WAITS on the counter (pure detect-last) — v1's HAZARD-#2 progress
+// condition holds under any task->SM packing.
+//   inputs : [0] g_qpe (chain edge in)  [1] kv_cache (ALIAS)
+//            [2] g_mla_m (hidden)  [3] g_mla_l (hidden)
+//            [4] g_mla_acc (hidden)  [5] g_head_done i32[16] (hidden RMW)
+//            [6] g_attn (hidden write — pre-quant merge, A/B artifact)
+//   outputs: [0] g_attn_deq f32[16*512]  (the T3'->T5 chain edge)
+//   params : [nwarps, kv_offset]
+// ============================================================================
+__device__ __noinline__ void
+    mla_fused_task_impl(mirage::runtime::TaskDesc const *task_desc,
+                        int task_offset,
+                        int nwarps,
+                        unsigned long long sync_base,
+                        int kv_offset,
+                        int iter_num) {
+  float const *g_qpe = static_cast<float const *>(task_desc->input_ptrs[0]);
+  __nv_bfloat16 const *kv_cache =
+      static_cast<__nv_bfloat16 const *>(task_desc->input_ptrs[1]);
+  float *g_mla_m = static_cast<float *>(task_desc->input_ptrs[2]);
+  float *g_mla_l = static_cast<float *>(task_desc->input_ptrs[3]);
+  float *g_mla_acc = static_cast<float *>(task_desc->input_ptrs[4]);
+  int *g_head_done = static_cast<int *>(task_desc->input_ptrs[5]);
+  float *g_attn = static_cast<float *>(task_desc->input_ptrs[6]);
+  float *g_attn_deq = static_cast<float *>(task_desc->output_ptrs[0]);
+
+  extern __shared__ char smem[];
+  float *s_score = reinterpret_cast<float *>(
+      smem + task_desc->smem_region_offset(MP_REGION_WORK));
+  float *red8 = reinterpret_cast<float *>(
+      reinterpret_cast<char *>(s_score) + MP_RED_OFF);
+  uint64_t *s_flags = reinterpret_cast<uint64_t *>(
+      reinterpret_cast<char *>(s_score) + MP_FLAGS_OFF);
+  int *s_last = reinterpret_cast<int *>(
+      reinterpret_cast<char *>(s_score) + MP_LAST_OFF);
+
+  int const tid = threadIdx.x;
+  int const lane = tid & 31, warpl = tid >> 5;
+  bool const is_consumer = tid < 128;
+  MlaGeom const g = mla_geom(task_offset, iter_num + kv_offset + 1);
+
+  mla_partial_core(g_qpe, kv_cache, g_mla_m, g_mla_l, g_mla_acc, s_score,
+                   red8, s_flags, nwarps, sync_base, g.h, g.sp, g.nsp, g.r0,
+                   g.nr, g.active);
+
+  if (is_consumer) {
+    attn_consumer_sync(); // consumers' V stores folded (v1's __syncthreads)
     {
-      int laneInWarp = tid & 31;
-      unsigned grpmask =
-          ((TPR >= 32) ? 0xffffffffu
-                       : (((1u << TPR) - 1u) << ((laneInWarp / TPR) * TPR)));
-      int rows_per_step = NTHREAD / TPR;
-      // Role A (v1 tid = tid) then role B (v1 tid = tid+128), sequentially.
-      // TPR | 128 => subB == subA and the grpmask is identical; only the row
-      // base shifts by 128/TPR. Each masked shuffle converges because all
-      // lanes of a group share the same row sequence within a role pass.
+      uint64_t const dtag = attnv2_tag(sync_base, 2);
+      if (dtag != 0) {
+        if (tid == 0) {
+          attnv2_flag_poll(&s_flags[1], dtag); // fenced helper V folded in
+          attnv2_flag_poll(&s_flags[2], dtag);
+          attnv2_flag_poll(&s_flags[3], dtag);
+        }
+        attn_consumer_sync();
+      }
+    }
+    if (g.active) {
+      if (tid == 0) {
+        __threadfence(); // device release (v1 lever-4 producer side)
+        int const old = atomicAdd(&g_head_done[g.h], 1);
+        int const last = (old == g.nsp - 1) ? 1 : 0;
+        if (last) {
+          __threadfence(); // device acquire (see all splits' acc)
+        }
+        s_last[0] = last;
+      }
+      attn_consumer_sync(); // broadcast s_last + hand the acquire over
+      if (s_last[0]) {
+        // ---- T4 merge body VERBATIM on the 128 consumer threads ----
+        float const *mrow = &g_mla_m[g.h * MLA_SPLITS];
+        float const *lrow = &g_mla_l[g.h * MLA_SPLITS];
+        float gmax = -1e30f;
 #pragma unroll
-      for (int role = 0; role < 2; role++) {
-        int const v1tid = tid + role * 128;
-        int const sub = v1tid % TPR;
-        int const row = v1tid / TPR;
-        for (int rr = row; rr < nr; rr += rows_per_step) {
-          int r = r0 + rr;
-          uint4 const *kvr =
-              reinterpret_cast<uint4 const *>(&kv_cache[(size_t)r * K_QKHEAD]);
-          float dot = 0.f;
-          for (int c = sub; c < K_QKHEAD / 8; c += TPR) {
-            uint4 kw = kvr[c];
-            __nv_bfloat162 const *k2 =
-                reinterpret_cast<__nv_bfloat162 const *>(&kw);
-            float const *qc = &q[c * 8];
+        for (int s = 0; s < MLA_SPLITS; s++) {
+          if (s < g.nsp) {
+            gmax = fmaxf(gmax, mrow[s]);
+          }
+        }
+        float denom = 0.f;
 #pragma unroll
-            for (int p = 0; p < 4; p++) {
-              float2 kf = __bfloat1622float2(k2[p]);
-              dot += qc[2 * p] * kf.x + qc[2 * p + 1] * kf.y;
+        for (int s = 0; s < MLA_SPLITS; s++) {
+          if (s < g.nsp) {
+            denom += lrow[s] * __expf(mrow[s] - gmax);
+          }
+        }
+        float inv = (denom > 0.f) ? 1.0f / denom : 0.f;
+        float *s_attn = s_score; // REUSE (V-accum complete; bar4s above)
+        for (int d = tid; d < K_KVLORA; d += 128) {
+          float acc = 0.f;
+#pragma unroll
+          for (int s = 0; s < MLA_SPLITS; s++) {
+            if (s < g.nsp) {
+              float w = __expf(mrow[s] - gmax);
+              acc +=
+                  g_mla_acc[((size_t)(g.h * MLA_SPLITS + s)) * K_KVLORA + d] *
+                  w;
             }
           }
-#pragma unroll
-          for (int o = TPR >> 1; o > 0; o >>= 1) {
-            dot += __shfl_down_sync(grpmask, dot, o, TPR);
+          float v = v1a::k_bf16(acc * inv);
+          s_attn[d] = v;
+          g_attn[g.h * K_KVLORA + d] = v;
+        }
+        attn_consumer_sync(); // v1's __syncthreads before the quant phase
+        int const KGv = K_KVLORA / K_GRP; // 4
+        if (warpl < KGv) {
+          float const *ar = &s_attn[warpl * K_GRP];
+          float *dq = &g_attn_deq[g.h * K_KVLORA + warpl * K_GRP];
+          float mx = 1e-10f;
+          for (int j = lane; j < K_GRP; j += 32) {
+            float a = fabsf(ar[j]);
+            mx = fmaxf(mx, a);
           }
-          if (sub == 0) {
-            s_score[rr] = dot * sm;
+#pragma unroll
+          for (int o = 16; o > 0; o >>= 1) {
+            float ot = __shfl_xor_sync(0xffffffffu, mx, o);
+            mx = fmaxf(mx, ot);
+          }
+          float ys = fmaxf(mx / K_FP8MAX, 1e-10f); // RAW 448 — NOT UE8M0
+          for (int j = lane; j < K_GRP; j += 32) {
+            float vq = fminf(fmaxf(ar[j] / ys, -K_FP8MAX), K_FP8MAX);
+            dq[j] = (float)__nv_fp8_e4m3(vq) * ys;
           }
         }
       }
     }
-    attn_consumer_sync(); // v1's post-score __syncthreads
-    // ---- lmax (A/B emulation of v1's xor tree + red8 + redundant max).
-    float lmA = -1e30f, lmB = -1e30f;
-    for (int rr = tid; rr < nr; rr += NTHREAD) {
-      lmA = fmaxf(lmA, s_score[rr]);
+    attn_consumer_sync(); // final page-release hold (helpers already done)
+  } else {
+    // helpers: device-publish this warp's V columns BEFORE the DONE flag
+    // (review edit: lane-0's cta-release alone would not device-publish the
+    // other lanes' global stores for the cross-SM merge reader).
+    if (g.active) {
+      __threadfence();
     }
-    for (int rr = tid + 128; rr < nr; rr += NTHREAD) {
-      lmB = fmaxf(lmB, s_score[rr]);
-    }
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1) {
-      lmA = fmaxf(lmA, __shfl_xor_sync(0xffffffffu, lmA, o));
-      lmB = fmaxf(lmB, __shfl_xor_sync(0xffffffffu, lmB, o));
-    }
+    __syncwarp();
+    int const ws = tid >> 5; // 4/5/6
     if ((tid & 31) == 0) {
-      red8[tid >> 5] = lmA;
-      red8[(tid >> 5) + 4] = lmB;
-    }
-    attn_consumer_sync();
-    float gmax = -1e30f;
-#pragma unroll
-    for (int i = 0; i < NWARP; i++) {
-      gmax = fmaxf(gmax, red8[i]);
-    }
-    attn_consumer_sync();
-    // exp (elementwise restripe — value-exact).
-    for (int rr = tid; rr < nr; rr += 128) {
-      s_score[rr] = __expf(s_score[rr] - gmax);
-    }
-    attn_consumer_sync();
-    // ---- lsum (A/B emulation; v1 xor tree + red8 + redundant sequential Σ).
-    float lsA = 0.f, lsB = 0.f;
-    for (int rr = tid; rr < nr; rr += NTHREAD) {
-      lsA += s_score[rr];
-    }
-    for (int rr = tid + 128; rr < nr; rr += NTHREAD) {
-      lsB += s_score[rr];
-    }
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1) {
-      lsA += __shfl_xor_sync(0xffffffffu, lsA, o);
-      lsB += __shfl_xor_sync(0xffffffffu, lsB, o);
-    }
-    if ((tid & 31) == 0) {
-      red8[tid >> 5] = lsA;
-      red8[(tid >> 5) + 4] = lsB;
-    }
-    attn_consumer_sync();
-    float gsum = 0.f;
-#pragma unroll
-    for (int i = 0; i < NWARP; i++) {
-      gsum += red8[i];
-    }
-    int const base = h * MLA_SPLITS + sp;
-    if (tid == 0) {
-      g_mla_m[base] = (nr > 0) ? gmax : -1e30f;
-      g_mla_l[base] = gsum;
-    }
-    // V accumulation (per-d independent, inner rr loop sequential — the
-    // restripe is value-exact).
-    float *accv = &g_mla_acc[(size_t)base * K_KVLORA];
-    for (int d = tid; d < K_KVLORA; d += 128) {
-      float acc = 0.f;
-      for (int rr = 0; rr < nr; rr++) {
-        acc += s_score[rr] *
-               __bfloat162float(kv_cache[(size_t)(r0 + rr) * K_QKHEAD + d]);
-      }
-      accv[d] = acc;
+      attnv2_flag_store_release(&s_flags[1 + (ws - 4)],
+                                attnv2_tag(sync_base, 2));
     }
   }
-  attn_task_epilogue(); // UNCONDITIONAL (also on the sp>=nsp no-op path)
 }
 
 // ============================================================================
@@ -695,7 +1176,8 @@ __device__ __noinline__ void
 __device__ __noinline__ void
     wuv_task_impl(mirage::runtime::TaskDesc const *task_desc,
                   int task_offset,
-                  int num_tasks) {
+                  int num_tasks,
+                  int nwarps) {
   float const *g_attn_deq =
       static_cast<float const *>(task_desc->input_ptrs[0]);
   __nv_fp8_e4m3 const *kvbv_w =
@@ -709,12 +1191,15 @@ __device__ __noinline__ void
                     kvbv_w,
                     kvbv_s,
                     g_red,
-                    task_offset * 4 + warpl,
-                    num_tasks * 4,
+                    task_offset * nwarps + warpl,
+                    num_tasks * nwarps,
                     lane,
                     ready_ones);
-  // No SMEM regions -> plain return (page suffix no-ops); GMEM stores are
-  // published by the role-loop FINISHED arrive + event release chain.
+  // No SMEM regions, no tag-flags: helpers run the dep-prefix at
+  // registration level (their only input hazard is g_attn_deq, event-
+  // ordered), and every role's GMEM stores are published by the role-loop
+  // FINISHED arrive (release.cta) -> controller acquire -> device-scope
+  // event release chain.
 }
 
 // ============================================================================
@@ -729,7 +1214,9 @@ __device__ __noinline__ void
 __device__ __noinline__ void
     oproj_task_impl(mirage::runtime::TaskDesc const *task_desc,
                     int task_offset,
-                    int num_tasks) {
+                    int num_tasks,
+                    int nwarps,
+                    unsigned long long sync_base) {
   float const *g_red = static_cast<float const *>(task_desc->input_ptrs[0]);
   __nv_fp8_e4m3 const *oproj_w =
       static_cast<__nv_fp8_e4m3 const *>(task_desc->input_ptrs[1]);
@@ -741,15 +1228,27 @@ __device__ __noinline__ void
   extern __shared__ char smem[];
   float *s_odeq = reinterpret_cast<float *>(
       smem + task_desc->smem_region_offset(OP_REGION_WORK));
+  uint64_t *s_flags = reinterpret_cast<uint64_t *>(
+      reinterpret_cast<char *>(s_odeq) + OP_FLAGS_OFF);
   uint4 *s_ring = reinterpret_cast<uint4 *>(
       smem + task_desc->smem_region_offset(OP_REGION_RING));
 
   int lane = threadIdx.x & 31, warpl = threadIdx.x >> 5;
+  bool const is_consumer = threadIdx.x < 128;
 
-  // v1 quant_ue8m0_block_smem body verbatim (outer warp stride 8 -> 4).
+  // Helpers need no consumer-produced data before the quant (g_red is a
+  // GMEM input), but they DO need this instruction's dep/page ordering:
+  // consumer thread 0 releases the entry flag right after its dep-prefix.
+  if (is_consumer) {
+    attnv2_go(s_flags, attnv2_tag(sync_base, 0));
+  } else {
+    attnv2_flag_wait(&s_flags[0], attnv2_tag(sync_base, 0));
+  }
+
+  // v1 quant_ue8m0_block_smem body verbatim (outer warp stride 8 -> nwarps).
   {
     int ng = K_OIN / K_GRP; // 16
-    for (int gx = warpl; gx < ng; gx += 4) {
+    for (int gx = warpl; gx < ng; gx += nwarps) {
       float const *s = g_red + gx * K_GRP + lane * 4;
       float4 a = *reinterpret_cast<float4 const *>(s);
       float v[4] = {a.x, a.y, a.z, a.w};
@@ -772,21 +1271,22 @@ __device__ __noinline__ void
       }
     }
   }
-  attn_consumer_sync(); // publishes s_odeq (v1's trailing __syncthreads)
+  // publishes s_odeq to every MAC warp (v1's trailing __syncthreads).
+  attnv2_xrole_barrier(s_flags, attnv2_tag(sync_base, 1), is_consumer);
 
-  uint4 *my_ring = s_ring + (size_t)warpl * (GEMV_RING_BYTES_PER_WARP / 16);
-  v1a::gemv_grid_cpa_oproj_smem_t<8, 4>(s_odeq,
+  uint4 *my_ring = s_ring + (size_t)warpl * (OP_RING_BYTES_PER_WARP / 16);
+  v1a::gemv_grid_cpa_oproj_smem_t<OP_GEMV_RBT, OP_GEMV_STAGES>(s_odeq,
                                         oproj_w,
                                         oproj_s,
                                         residual,
                                         out,
                                         K_HIDDEN,
                                         K_OIN,
-                                        task_offset * 4 + warpl,
-                                        num_tasks * 4,
+                                        task_offset * nwarps + warpl,
+                                        num_tasks * nwarps,
                                         lane,
                                         my_ring);
-  attn_task_epilogue();
+  attnv2_mac_epilogue(s_flags, attnv2_tag(sync_base, 2), is_consumer);
 }
 
 } // namespace dsv3_attn_v2

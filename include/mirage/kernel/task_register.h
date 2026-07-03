@@ -191,6 +191,8 @@ public:
                                          std::vector<int> const &params);
   int register_dsv3_attn_qb_rope_kv_v2_task(threadblock::Graph const &bgraph,
                                             std::vector<int> const &params);
+  int register_dsv3_attn_mla_fused_v2_task(threadblock::Graph const &bgraph,
+                                            std::vector<int> const &params);
   int register_dsv3_attn_mla_partial_v2_task(threadblock::Graph const &bgraph,
                                              std::vector<int> const &params);
   int register_dsv3_attn_mla_merge_v2_task(threadblock::Graph const &bgraph,
