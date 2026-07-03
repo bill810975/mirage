@@ -9262,6 +9262,143 @@ int TaskRegister::register_dsv3_ffn_w2_silu_v2_task(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Fusion-ladder experiment (scratch/v2_ffn_fuse):
+//   Rung A: w13_rqr_topk — the whole router_quant_rms op folded into the W13
+//           task prologue (incl. the FULL per-task router GEMV redundancy).
+//   Rung B: ffn_mega — the whole FFN slice as ONE op; tasks self-synchronize
+//           around the two in-op all-to-alls via monotonic GMEM barriers.
+//           num_tasks MUST equal num_workers (host-side asserted): the v2
+//           per-SM queues are strict FIFO, so two same-op tasks serialized on
+//           one worker would deadlock the in-op barrier.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// params: [nwarps, local_expert_start, num_local_experts, rsf_bits].
+int TaskRegister::register_dsv3_ffn_w13_rqr_topk_v2_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  assert(params.size() == 4);
+  int const nwarps = params[0];
+  int const les = params[1];
+  int const nle = params[2];
+  int const rsf_bits = params[3];
+  assert(nwarps == 4 || nwarps == 7);
+  int const num_tasks = (int)bgraph.grid_dim.x;
+  std::vector<tb::TBInputOp *> input_ops, output_ops;
+  ffn_v2_split_ops(bgraph, 14, 2, input_ops, output_ops);
+  bool const multi_role = nwarps > 4;
+
+  auto emit_body = [&](mirage::transpiler::CodeKeeper &c) {
+    c.e("kernel::dsv3_ffn_v2::w13_rqr_topk_task_impl(");
+    c.e("    task_desc,");
+    c.e("    static_cast<int>(task_desc->task_metadata.task_offset),");
+    c.e("    $, $,", num_tasks, nwarps);
+    if (multi_role) {
+      c.e("    ((unsigned long long)instruction_index + 1ull) * "
+          "0x9E3779B97F4A7C15ull,");
+    } else {
+      c.e("    0ull,");
+    }
+    c.e("    $, $,", les, nle);
+    c.e("    __int_as_float($));", rsf_bits);
+  };
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  emit_body(code);
+  int variant =
+      register_task_variant(TASK_DSV3_FFN_W13_RQR_TOPK_V2, code.to_string());
+
+  mirage::transpiler::CodeKeeper consumer_code;
+  consumer_code.inc_indent();
+  emit_dep_wait_consumer_prefix(consumer_code);
+  emit_body(consumer_code);
+
+  TaskRoleVariantCode role_code{/*init_semaphores=*/"",
+                                /*loader=*/"",
+                                /*launcher=*/"",
+                                /*consumer=*/consumer_code.to_string(),
+                                /*storer=*/""};
+  if (multi_role) {
+    // Helpers run NO dep-prefix: their first action is the NORM_READY tag
+    // acquire, which chains through the consumer's dep-wait transitively.
+    mirage::transpiler::CodeKeeper helper_code;
+    helper_code.inc_indent();
+    emit_body(helper_code);
+    role_code.loader = helper_code.to_string();
+    role_code.launcher = helper_code.to_string();
+    role_code.storer = helper_code.to_string();
+  }
+  register_v2_task_role_variant(
+      TASK_DSV3_FFN_W13_RQR_TOPK_V2, variant, role_code);
+  register_variant_smem_info(
+      TASK_DSV3_FFN_W13_RQR_TOPK_V2,
+      variant,
+      ::kernel::dsv3_ffn_v2::make_w13_rqr_topk_smem_info(nwarps));
+  return variant;
+}
+
+// params: [nwarps, local_expert_start, num_local_experts, rsf_bits, rblk].
+// NOTE: the salted sync_tag is passed UNCONDITIONALLY (even at nwarps=4) —
+// the mega body's GO1/GO2 intra-task fan-out flags need it regardless of the
+// helper roles; helper-only flags are gated on nwarps>4 inside the body.
+int TaskRegister::register_dsv3_ffn_mega_v2_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  assert(params.size() == 5);
+  int const nwarps = params[0];
+  int const les = params[1];
+  int const nle = params[2];
+  int const rsf_bits = params[3];
+  int const rblk = params[4];
+  assert(nwarps == 4 || nwarps == 7);
+  assert(rblk == 16 || rblk == 8);
+  int const num_tasks = (int)bgraph.grid_dim.x;
+  std::vector<tb::TBInputOp *> input_ops, output_ops;
+  ffn_v2_split_ops(bgraph, 12, 1, input_ops, output_ops);
+  bool const multi_role = nwarps > 4;
+
+  auto emit_body = [&](mirage::transpiler::CodeKeeper &c) {
+    c.e("kernel::dsv3_ffn_v2::ffn_mega_task_impl<$>(", rblk);
+    c.e("    task_desc,");
+    c.e("    static_cast<int>(task_desc->task_metadata.task_offset),");
+    c.e("    $, $,", num_tasks, nwarps);
+    c.e("    ((unsigned long long)instruction_index + 1ull) * "
+        "0x9E3779B97F4A7C15ull,");
+    c.e("    $, $,", les, nle);
+    c.e("    __int_as_float($),", rsf_bits);
+    c.e("    iter_num);");
+  };
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  emit_body(code);
+  int variant = register_task_variant(TASK_DSV3_FFN_MEGA_V2, code.to_string());
+
+  mirage::transpiler::CodeKeeper consumer_code;
+  consumer_code.inc_indent();
+  emit_dep_wait_consumer_prefix(consumer_code);
+  emit_body(consumer_code);
+
+  TaskRoleVariantCode role_code{/*init_semaphores=*/"",
+                                /*loader=*/"",
+                                /*launcher=*/"",
+                                /*consumer=*/consumer_code.to_string(),
+                                /*storer=*/""};
+  if (multi_role) {
+    mirage::transpiler::CodeKeeper helper_code;
+    helper_code.inc_indent();
+    emit_body(helper_code);
+    role_code.loader = helper_code.to_string();
+    role_code.launcher = helper_code.to_string();
+    role_code.storer = helper_code.to_string();
+  }
+  register_v2_task_role_variant(TASK_DSV3_FFN_MEGA_V2, variant, role_code);
+  register_variant_smem_info(
+      TASK_DSV3_FFN_MEGA_V2,
+      variant,
+      ::kernel::dsv3_ffn_v2::make_ffn_mega_smem_info(nwarps));
+  return variant;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // DSv3 fused-ATTN block as a v2 task chain (Step 3b of the V2 migration).
 // Task bodies live in tasks/blackwell_v2/dsv3_attn_v2.cuh (they call the v1
 // attn_block_megakernel helpers verbatim / exact-tree-emulated). Each MAC op

@@ -1761,6 +1761,34 @@ __device__ __forceinline__ float rms_rcp_block(float const *__restrict__ src,
 //    (uint8 AttnScratch base, barrier + activations)
 //  + out bound as output_ptrs[0] (the tracked bf16 attn_proj_out write).
 // ===========================================================================
+
+// ---- Optional per-phase probe (MPK_DSV3_ATTN_V1_PROBE builds only; NEVER set
+// in production — the default build is byte-identical, same pattern as the
+// FFN MPK_DSV3_FFN_WS_PROBE probe). Thread-0-of-CTA %globaltimer stamps at
+// the v1 phase boundaries; the standalone driver
+// (scratch/v2_attn/attn_ws_driver.cu) reads the symbol back.
+// Slot map (14 used of 16):
+//   [0] entry            [1] post P0-quant (rmsnorm_quant_hidden_block_smem)
+//   [2] post qkv_a GEMV  [3] post B1 grid barrier (qkv_a->ln)
+//   [4] post q_a-ln/kv-ln/rope_k (+__syncthreads)
+//   [5] post q_b+rope GEMV [6] post B2 grid barrier (q_b->MLA)
+//   [7] post mla_partial   [8] post atomic+merge (mla_merge_quant)
+//   [9] post W_UV (incl. head spin-wait) [10] post B3 grid barrier (W_UV->*)
+//   [11] post o_proj quant [12] post o_proj GEMV+residual [13] exit ----------
+#ifdef MPK_DSV3_ATTN_V1_PROBE
+__device__ unsigned long long attn_v1_probe_ts[ATTN_NUM_WORKERS * 16];
+#define ATTN_V1_TS(k)                                                          \
+  do {                                                                         \
+    if (threadIdx.x == 0) {                                                    \
+      unsigned long long t__;                                                  \
+      asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t__));                  \
+      attn_v1_probe_ts[worker_idx * 16 + (k)] = t__;                           \
+    }                                                                          \
+  } while (0)
+#else
+#define ATTN_V1_TS(k)
+#endif
+
 __device__ __noinline__ void attn_block_megakernel_sm100_task_impl(
     mirage::runtime::TaskDesc const *task_desc,
     int merge_task_offset,
@@ -1882,6 +1910,7 @@ __device__ __noinline__ void attn_block_megakernel_sm100_task_impl(
   int gwarp = gtid >> 5;
   int gwarps = gthreads >> 5;
   int KV = step + 1, pos = step;
+  ATTN_V1_TS(0); // entry
 
   // EVERY-step header (H4 check: does `step` actually advance across decode
   // steps?). Prints once per invocation from worker0/thread0 regardless of
@@ -1997,6 +2026,7 @@ __device__ __noinline__ void attn_block_megakernel_sm100_task_impl(
   // then quant into s_act. NO grid barrier added (block-local, same as below).
   rmsnorm_quant_hidden_block_smem(
       hidden /*=raw self.x*/, input_ln_w, s_act, red8, K_HIDDEN, warpl, lane);
+  ATTN_V1_TS(1); // post P0-quant (block-converged: trailing __syncthreads)
   gemv_grid_cpa_t<2, 6>(
       s_act, // qkv_a reads BLOCK-LOCAL s_act (no grid barrier)
       qkv_a_w,
@@ -2008,7 +2038,9 @@ __device__ __noinline__ void attn_block_megakernel_sm100_task_impl(
       gwarps,
       lane,
       my_wbuf);
+  ATTN_V1_TS(2); // post qkv_a GEMV (thread0/warp0 granularity — no block sync)
   attn_grid_barrier(barrier, ATTN_NUM_WORKERS); // qkv_a -> layernorm (KEPT)
+  ATTN_V1_TS(3); // post B1
   // tap S2: qkv_a_out [2176] = [q_a(1536) | c_latent(512) | k_pe(64) | pad(64)]
   ATTN_DBG_TAP("qkv_a_out", out, sc.g_qkva, K_QKVAN, step, worker_idx);
   // DECISIVE: tap the RAW per-slice GEMV outputs BEFORE any norm — q_a slice
@@ -2158,6 +2190,7 @@ __device__ __noinline__ void attn_block_megakernel_sm100_task_impl(
 #else
   __syncthreads();
 #endif
+  ATTN_V1_TS(4); // post q_a-ln + kv_a-ln + rope_k (block-converged)
   // tap S3/S5: q_a_normed-dequant (q_b input) [1536]; the appended kv_cache row
   // [c_latent(512) | k_pe_rot(64)] is tapped from the live buffer for this
   // step.
@@ -2268,6 +2301,7 @@ __device__ __noinline__ void attn_block_megakernel_sm100_task_impl(
                                      gwarps,
                                      lane,
                                      my_wbuf);
+  ATTN_V1_TS(5); // post q_b+rope GEMV (thread0/warp0 granularity)
   // === HAZARD #1: ZERO-BEFORE-BARRIER ===================================
   // Levers 4 & 5: zero the per-head completion counters AND readiness flags
   // BEFORE the q_b->MLA grid barrier below. That barrier's __threadfence
@@ -2286,6 +2320,7 @@ __device__ __noinline__ void attn_block_megakernel_sm100_task_impl(
                     ATTN_NUM_WORKERS); // q_b->MLA: publishes g_qpe, kv_cache,
                                        // AND the zeroed flags (the barrier's
                                        // __threadfence does the cross-CTA pub)
+  ATTN_V1_TS(6); // post B2
   // tap S4/S6: q_nope_pe post-rope [16*576] (the MLA query). Print head-0's
   // nope-start (first 4) + a checksum over all 16 heads.
   ATTN_DBG_TAP(
@@ -2357,6 +2392,7 @@ __device__ __noinline__ void attn_block_megakernel_sm100_task_impl(
                   r1,
                   sm,
                   step); // ends with __syncthreads (publishes acc into tid0)
+      ATTN_V1_TS(7); // post mla_partial (block-converged)
       if (threadIdx.x == 0) {
         __threadfence(); // device release (publish g_mla_acc)
         int old = atomicAdd(&sc.g_head_done[h], 1);
@@ -2382,7 +2418,13 @@ __device__ __noinline__ void attn_block_megakernel_sm100_task_impl(
                         sc.g_head_wuv_ready);
       }
     }
+#ifdef MPK_DSV3_ATTN_V1_PROBE
+    else {
+      ATTN_V1_TS(7); // non-participant CTA: zero-length MLA phase
+    }
+#endif
   }
+  ATTN_V1_TS(8); // post atomic+merge (merge ran only on last-arriver CTAs)
   // Lever 5 (WUV_HEAD_SPINWAIT): NO grid barrier here — wuv_bmm_grid spin-waits
   // per head on g_head_wuv_ready[h]. The merge-blocks make unconditional
   // progress so every flag is eventually set (no deadlock). The attn_out tap
@@ -2397,8 +2439,10 @@ __device__ __noinline__ void attn_block_megakernel_sm100_task_impl(
                gwarps,
                lane,
                sc.g_head_wuv_ready);
+  ATTN_V1_TS(9); // post W_UV incl. head spin-wait (thread0/warp0 granularity)
   attn_grid_barrier(barrier, ATTN_NUM_WORKERS); // W_UV -> * (KEPT: publishes
                                                 // g_red from all warps)
+  ATTN_V1_TS(10); // post B3
   // tap S9/S10/S11 RELOCATED here: the W_UV->* barrier above guarantees every
   // head's merge completed (W_UV consumed g_attn_deq), so g_attn is fully
   // visible cross-CTA now.
@@ -2415,6 +2459,7 @@ __device__ __noinline__ void attn_block_megakernel_sm100_task_impl(
   // UE8M0 quant to quant_ue8m0_grid. This merges the old two-barrier pair
   // (W_UV->quant + quant->o_proj) down to the single W_UV->* barrier above.
   quant_ue8m0_block_smem(sc.g_red, s_odeq, K_OIN, warpl, lane);
+  ATTN_V1_TS(11); // post o_proj quant (block-converged)
   gemv_grid_cpa_oproj_smem_t<8, 4>(s_odeq,
                                    oproj_w,
                                    oproj_s,
@@ -2426,6 +2471,7 @@ __device__ __noinline__ void attn_block_megakernel_sm100_task_impl(
                                    gwarps,
                                    lane,
                                    my_wbuf);
+  ATTN_V1_TS(12); // post o_proj GEMV+residual (thread0/warp0 granularity)
   // tap S13: final attn_proj_out [7168] (o_proj + residual, pre-AR) — the FULL
   // vector (the prior version was a worker-subset bug that summed only out[0]).
 #ifdef MPK_ATTN_DBG
@@ -2465,6 +2511,7 @@ __device__ __noinline__ void attn_block_megakernel_sm100_task_impl(
   // same class as the FFN mega-task's final __threadfence).
   __threadfence();
   __syncthreads();
+  ATTN_V1_TS(13); // exit (block-converged)
 }
 
 } // namespace attn_block_megakernel_sm100

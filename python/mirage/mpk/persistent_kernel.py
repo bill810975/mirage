@@ -363,6 +363,12 @@ def get_compile_command(
     _ffn_ws = os.environ.get("MPK_DSV3_FFN_WARPSPEC")
     if _ffn_ws and _ffn_ws != "0":
         flags = flags + [f"-DMPK_DSV3_FFN_WARPSPEC={int(_ffn_ws)}"]
+    # DIAGNOSTIC (ablation-3, default-OFF => default build byte-identical):
+    # null-body the DSv3 ATTN v2 chain task bodies (immediate return) so the
+    # chain wall measures the pure per-edge event + go-barrier + iteration
+    # overhead of the v2 per-op execution model.
+    if os.environ.get("MPK_DSV3_ATTN_V2_NULLBODY") == "1":
+        flags = flags + ["-DMPK_DSV3_ATTN_V2_NULLBODY"]
     # DSv3 decode FAST megakernels: the box-validated attention + FFN-full wins
     # (ATTN_FAST barrier-removal + Phase-0 RMSNorm deep-fusion + W0-tail-lighten +
     # GEMV scalar-ILP consumer; FFN_FAST packed-half2 GEMV + FFN_FAST_ROUTING
@@ -4127,6 +4133,99 @@ class PersistentKernel:
              wdn, wdn_scale, output], tb_graph)
         self.kn_graph.register_task(tb_graph, "dsv3_ffn_w2_silu_v2",
                                     [nwarps, rblk])
+
+    # ------------------------------------------------------------------
+    # FFN fusion-ladder experiment (scratch/v2_ffn_fuse):
+    #   Rung A: w13_rqr_topk — the whole router_quant_rms op folded into the
+    #           W13 task prologue (full per-task router redundancy, checked).
+    #   Rung B: ffn_mega — the whole FFN slice as ONE op; tasks synchronize
+    #           around the two in-op all-to-alls via monotonic GMEM barriers.
+    # ------------------------------------------------------------------
+    def dsv3_ffn_w13_rqr_topk_layer(
+        self,
+        input: DTensor,        # PRE-rmsnorm hidden bf16 (1,7168) [chain in]
+        rms_weight: DTensor,   # bf16 (7168,)
+        gate_weight: DTensor,  # router gate bf16 (256, 7168)
+        bias: DTensor,         # f32 (256,)
+        a_fp8: DTensor,        # u8 (7168,)    hidden write (task 0 artifact)
+        a_scale: DTensor,      # f32 (56,)     hidden write (t0)
+        rmsnorm_out: DTensor,  # bf16 (1,7168) hidden write (t0)
+        inter: DTensor,        # f32 (256,4)   hidden write (t0 artifact)
+        logits: DTensor,       # bf16 (256,)   hidden write (t0)
+        meta: DTensor,         # i32 (24,)     hidden write (t0; read by w2_silu)
+        w13: DTensor,          # u8 (128, 1024, 7168)
+        w13_scale: DTensor,    # f32 (128, 8, 56)
+        wgu: DTensor,          # u8 (512, 7168)
+        wgu_scale: DTensor,    # f32 (4, 56)
+        y13: DTensor,          # f32 (8, 1024) [chain edge out]
+        sg: DTensor,           # f32 (512,)    [chain edge out]
+        num_tasks: int,
+        local_expert_start: int,
+        num_local_experts: int,
+        routed_scaling_factor: float = 2.5,
+        nwarps: int = 7,
+    ):
+        assert self.use_v2_runtime, "dsv3_ffn_* layers are v2-only"
+        assert nwarps in (4, 7)
+        import struct
+        rsf_bits = struct.unpack("<i", struct.pack("<f",
+                                                   routed_scaling_factor))[0]
+        tb_graph = TBGraph(CyTBGraph((num_tasks, 1, 1), (128, 1, 1), 1, 64))
+        tensors = [input, rms_weight, gate_weight, bias, a_fp8, a_scale,
+                   rmsnorm_out, inter, logits, meta, w13, w13_scale, wgu,
+                   wgu_scale, y13, sg]
+        for t in tensors:
+            tb_graph.new_input(t, (-1, -1, -1), -1, True)
+        self.kn_graph.customized(tensors, tb_graph)
+        self.kn_graph.register_task(
+            tb_graph, "dsv3_ffn_w13_rqr_topk_v2",
+            [nwarps, local_expert_start, num_local_experts, rsf_bits])
+
+    def dsv3_ffn_mega_layer(
+        self,
+        input: DTensor,        # PRE-rmsnorm hidden bf16 (1,7168) [chain in]
+        rms_weight: DTensor,   # bf16 (7168,)
+        gate_weight: DTensor,  # router gate bf16 (256, 7168)
+        bias: DTensor,         # f32 (256,)
+        w13: DTensor,          # u8 (128, 1024, 7168)
+        wgu: DTensor,          # u8 (512, 7168)
+        w2: DTensor,           # u8 (128, 7168, 512)
+        wdn: DTensor,          # u8 (7168, 256)
+        scales: DTensor,       # f32 pack (MEGA_SC_*: w13_s|wgu_s|w2_s|wdn_s)
+        xfer: DTensor,         # f32 pack (MEGA_XFER_*: inter|y13|sg)
+        bar: DTensor,          # i64 (2,) ZEROED in-op barrier state
+        artifacts: DTensor,    # u8 pack (MEGA_ART_*: t0 compare surface)
+        output: DTensor,       # bf16 (1, 7168) FFN block output
+        num_tasks: int,
+        local_expert_start: int,
+        num_local_experts: int,
+        routed_scaling_factor: float = 2.5,
+        nwarps: int = 7,
+        rblk: int = 8,
+    ):
+        assert self.use_v2_runtime, "dsv3_ffn_* layers are v2-only"
+        assert nwarps in (4, 7) and rblk in (8, 16)
+        # CO-RESIDENCY HARD GATE: the in-op GMEM barrier is deadlock-safe only
+        # if every task of this op runs on its own worker. The v2 static plan
+        # round-robins each contiguous task range, so num_tasks == num_workers
+        # gives exactly one task per worker. (The harness re-verifies this
+        # from the compiled task graph before launching.)
+        assert num_tasks == self.num_workers, (
+            f"ffn_mega requires num_tasks == num_workers "
+            f"({num_tasks} != {self.num_workers}): 2 same-op tasks on one "
+            f"worker would deadlock the in-op barrier")
+        import struct
+        rsf_bits = struct.unpack("<i", struct.pack("<f",
+                                                   routed_scaling_factor))[0]
+        tb_graph = TBGraph(CyTBGraph((num_tasks, 1, 1), (128, 1, 1), 1, 64))
+        tensors = [input, rms_weight, gate_weight, bias, w13, wgu, w2, wdn,
+                   scales, xfer, bar, artifacts, output]
+        for t in tensors:
+            tb_graph.new_input(t, (-1, -1, -1), -1, True)
+        self.kn_graph.customized(tensors, tb_graph)
+        self.kn_graph.register_task(
+            tb_graph, "dsv3_ffn_mega_v2",
+            [nwarps, local_expert_start, num_local_experts, rsf_bits, rblk])
 
     # ------------------------------------------------------------------
     # DSv3 fused-ATTN block as a v2 task CHAIN (Step 3b of the V2 migration).

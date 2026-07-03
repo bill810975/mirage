@@ -558,6 +558,12 @@ def run_attn_perf_case(spec: dict, out_dir: str) -> dict:
 
             table = decode_window_table(prof, v2map["queues"],
                                         v2map["task_types"])
+            # Ablation-4 support: persist the raw per-(block,iter,q) consumer
+            # rows so begin-skew vs body-straggler decomposition is possible
+            # offline (r5 runs only kept the summary).
+            with open(os.path.join(out_dir, "v2_rows.json"), "w") as f:
+                json.dump({"rows": table["rows"],
+                           "n_window_iters": table["n_window_iters"]}, f)
             summary = summarize(
                 table, result["instances"],
                 os.path.join(out_dir, "compile", "task_graph_rank0.json"),

@@ -285,12 +285,20 @@ __device__ __forceinline__ float
 //            [2] qkv_a_w fp8[QKVAN,HIDDEN]  [3] qkv_a_s f32[17,56]
 //   outputs: [0] g_qkva f32[QKVAN]  (the T1->T2 chain edge)
 // ============================================================================
+// MPK_DSV3_ATTN_V2_NULLBODY (ablation-3 diagnostic build ONLY, default build
+// byte-identical): every chain task body returns immediately. The generated
+// wrapper still runs consumer_dep_prefix (event dep-wait) + the page-release
+// suffix + role FINISHED/event protocol, so the chain wall measures the pure
+// per-edge event + go-barrier + iteration cost with ~0 bodies.
 __device__ __noinline__ void
     p0_qkva_task_impl(mirage::runtime::TaskDesc const *task_desc,
                       int task_offset,
                       int num_tasks,
                       int nwarps,
                       unsigned long long sync_base) {
+#ifdef MPK_DSV3_ATTN_V2_NULLBODY
+  return;
+#endif
   __nv_bfloat16 const *x =
       static_cast<__nv_bfloat16 const *>(task_desc->input_ptrs[0]);
   __nv_bfloat16 const *input_ln_w =
@@ -462,6 +470,9 @@ __device__ __noinline__ void
                          int kv_offset,
                          int iter_num,
                          bool has_head_flags) {
+#ifdef MPK_DSV3_ATTN_V2_NULLBODY
+  return;
+#endif
   // Round-4 fold support: when the chain uses the FUSED partial+merge, T2
   // carries an 8th input g_head_done i32[16] and task 0 zeroes it every
   // iteration (ordered before the fused op's atomics by the T2->T3' event;
@@ -887,6 +898,9 @@ __device__ __noinline__ void
                           unsigned long long sync_base,
                           int kv_offset,
                           int iter_num) {
+#ifdef MPK_DSV3_ATTN_V2_NULLBODY
+  return;
+#endif
   float const *g_qpe = static_cast<float const *>(task_desc->input_ptrs[0]);
   __nv_bfloat16 const *kv_cache =
       static_cast<__nv_bfloat16 const *>(task_desc->input_ptrs[1]);
@@ -1087,6 +1101,9 @@ __device__ __noinline__ void
                         int task_offset,
                         int kv_offset,
                         int iter_num) {
+#ifdef MPK_DSV3_ATTN_V2_NULLBODY
+  return;
+#endif
   float const *g_mla_acc =
       static_cast<float const *>(task_desc->input_ptrs[0]);
   float const *g_mla_m = static_cast<float const *>(task_desc->input_ptrs[1]);
@@ -1178,6 +1195,9 @@ __device__ __noinline__ void
                   int task_offset,
                   int num_tasks,
                   int nwarps) {
+#ifdef MPK_DSV3_ATTN_V2_NULLBODY
+  return;
+#endif
   float const *g_attn_deq =
       static_cast<float const *>(task_desc->input_ptrs[0]);
   __nv_fp8_e4m3 const *kvbv_w =
@@ -1217,6 +1237,9 @@ __device__ __noinline__ void
                     int num_tasks,
                     int nwarps,
                     unsigned long long sync_base) {
+#ifdef MPK_DSV3_ATTN_V2_NULLBODY
+  return;
+#endif
   float const *g_red = static_cast<float const *>(task_desc->input_ptrs[0]);
   __nv_fp8_e4m3 const *oproj_w =
       static_cast<__nv_fp8_e4m3 const *>(task_desc->input_ptrs[1]);

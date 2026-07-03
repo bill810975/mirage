@@ -242,5 +242,143 @@ inline ::mirage::runtime::TaskSmemInfo make_w2_silu_smem_info(int nwarps) {
   return make_w2_smem_info(nwarps); // identical region shapes
 }
 
+// ============================================================================
+// FUSION-LADDER EXPERIMENT (scratch/v2_ffn_fuse): Rung A 2-op chain
+// (w13_rqr_topk -> w2_silu) and Rung B 1-op megakernel-shape (ffn_mega).
+// ============================================================================
+
+// Extra shape constants needed host-side by the packs (device side
+// static_asserts these against the v1 kernel's constants).
+inline constexpr int E_LOCAL = 128;
+inline constexpr int NB1 = W13_N / GRP;   // 8
+inline constexpr int NB2 = W2_N / GRP;    // 56
+inline constexpr int KG_SHGU = HIDDEN / GRP;  // 56
+inline constexpr int NB_SHGU = SH_GU_N / GRP; // 4
+inline constexpr int NB_SHDN = W2_N / GRP;    // 56
+
+// ---- Rung A: w13_rqr_topk regions ------------------------------------------
+// [0] NORM (RQR layout: staged hidden -> in-place normed + reduce scratch;
+//     the RQR flag tail is UNUSED here — Rung A's flags live in the TK region)
+// [1] ACT (w13 layout: a_fp8 | a_scale — COMPUTED by the in-task quant)
+// [2] RING (nwarps pages)
+// [3] TK: [s_inter f32[1024] @0 | TK work @4096 | flags u64[8] @A_TK_OFF_FLAGS]
+//     flags: [0] NORM_READY  [1..3] RDONE (helper router+quant done)
+//            [4] META_READY  [5..7] epilogue helper-done
+//            (mac_task_epilogue is handed &flags[4] so it touches [5..7])
+inline constexpr int A_REGION_NORM = 0;
+inline constexpr int A_REGION_ACT = 1;
+inline constexpr int A_REGION_RING = 2;
+inline constexpr int A_REGION_TK = 3;
+inline constexpr int A_TK_OFF_INTER = 0; // f32[ROUTER_N*RKSPLIT] = 4096 B
+inline constexpr int A_TK_OFF_WK = ROUTER_N * RKSPLIT * 4;
+inline constexpr int A_TK_OFF_FLAGS = A_TK_OFF_WK + align_up_16(TK_WORK_BYTES);
+inline constexpr int A_TK_BYTES = A_TK_OFF_FLAGS + 8 * 8;
+
+inline ::mirage::runtime::TaskSmemInfo make_w13_rqr_topk_smem_info(int nwarps) {
+  int const act_bytes = HIDDEN + KG1 * 4;
+  int const ring_bytes = nwarps * GEMV_RING_BYTES_PER_WARP;
+  ::mirage::runtime::TaskSmemInfo info{
+      RQR_NORM_BYTES + act_bytes + ring_bytes + A_TK_BYTES,
+      /*alignment=*/1024,
+      {}};
+  info.regions.push_back({"artk_norm", RQR_NORM_BYTES, 1024, /*page_count=*/1,
+                          /*can_pack=*/false, /*release_step=*/2,
+                          /*contiguous=*/true});
+  info.regions.push_back({"artk_act", act_bytes, 1024, /*page_count=*/1,
+                          /*can_pack=*/false, /*release_step=*/2,
+                          /*contiguous=*/true});
+  info.regions.push_back({"artk_ring", ring_bytes, 1024,
+                          /*page_count=*/nwarps, /*can_pack=*/false,
+                          /*release_step=*/2, /*contiguous=*/true});
+  info.regions.push_back({"artk_tk", A_TK_BYTES, 1024, /*page_count=*/1,
+                          /*can_pack=*/true, /*release_step=*/2,
+                          /*contiguous=*/true});
+  return info;
+}
+
+// ---- Rung B: ffn_mega regions ------------------------------------------------
+// [0] NORM (RQR layout, flag tail unused)  [1] ACT (w13 layout, quant-computed)
+// [2] RING (nwarps pages; W2-phase y13/sg staging borrows the first 34 KB =
+//     consumer slices, exactly like w2_silu)  [3] TK+flags  [4] W2ACT (w2
+//     layout: i_fp8|i_scale|si_fp8|si_scale, silu-computed; flag tail unused)
+// flags u64[16]: [0] NORM_READY  [1..3] PH1 (helper router done)  [4] GO1
+//   [5] META_READY  [6..8] PH2 (helper W13 done)  [9] GO2  [10] SILU_READY
+//   [11] (base for epilogue: mac_task_epilogue gets &flags[11] -> [12..14])
+inline constexpr int M_REGION_NORM = 0;
+inline constexpr int M_REGION_ACT = 1;
+inline constexpr int M_REGION_RING = 2;
+inline constexpr int M_REGION_TK = 3;
+inline constexpr int M_REGION_W2ACT = 4;
+inline constexpr int M_TK_OFF_WK = 0;
+inline constexpr int M_TK_OFF_FLAGS = align_up_16(TK_WORK_BYTES);
+inline constexpr int M_TK_BYTES = M_TK_OFF_FLAGS + 16 * 8;
+
+inline ::mirage::runtime::TaskSmemInfo make_ffn_mega_smem_info(int nwarps) {
+  int const act_bytes = HIDDEN + KG1 * 4;
+  int const ring_bytes = nwarps * GEMV_RING_BYTES_PER_WARP;
+  ::mirage::runtime::TaskSmemInfo info{
+      RQR_NORM_BYTES + act_bytes + ring_bytes + M_TK_BYTES + W2_ACT_BYTES,
+      /*alignment=*/1024,
+      {}};
+  info.regions.push_back({"mega_norm", RQR_NORM_BYTES, 1024, /*page_count=*/1,
+                          /*can_pack=*/false, /*release_step=*/2,
+                          /*contiguous=*/true});
+  info.regions.push_back({"mega_act", act_bytes, 1024, /*page_count=*/1,
+                          /*can_pack=*/false, /*release_step=*/2,
+                          /*contiguous=*/true});
+  info.regions.push_back({"mega_ring", ring_bytes, 1024,
+                          /*page_count=*/nwarps, /*can_pack=*/false,
+                          /*release_step=*/2, /*contiguous=*/true});
+  info.regions.push_back({"mega_tk", M_TK_BYTES, 1024, /*page_count=*/1,
+                          /*can_pack=*/true, /*release_step=*/2,
+                          /*contiguous=*/true});
+  info.regions.push_back({"mega_w2act", W2_ACT_BYTES, 1024, /*page_count=*/1,
+                          /*can_pack=*/true, /*release_step=*/2,
+                          /*contiguous=*/true});
+  return info;
+}
+
+// ---- Rung B GMEM pack layouts (host allocates; device + harness share) ------
+// xfer pack (f32 element offsets): the two in-op all-to-alls. inter and y13
+// lifetimes overlap ACROSS tasks (a task can still read inter while another
+// writes y13) so they get disjoint storage.
+inline constexpr int MEGA_XFER_OFF_INTER_F = 0;                    // [1024]
+inline constexpr int MEGA_XFER_OFF_Y13_F = ROUTER_N * RKSPLIT;     // [8*1024]
+inline constexpr int MEGA_XFER_OFF_SG_F =
+    MEGA_XFER_OFF_Y13_F + MAX_ACTIVE * W13_N;                      // [512]
+inline constexpr int MEGA_XFER_FLOATS = MEGA_XFER_OFF_SG_F + SH_GU_N;
+
+// scales pack (f32 element offsets): w13_s | wgu_s | w2_s | wdn_s.
+inline constexpr int MEGA_SC_OFF_W13 = 0;
+inline constexpr int MEGA_SC_OFF_WGU = MEGA_SC_OFF_W13 + E_LOCAL * NB1 * KG1;
+inline constexpr int MEGA_SC_OFF_W2 = MEGA_SC_OFF_WGU + NB_SHGU * KG_SHGU;
+inline constexpr int MEGA_SC_OFF_WDN = MEGA_SC_OFF_W2 + E_LOCAL * NB2 * KG2;
+inline constexpr int MEGA_SC_FLOATS = MEGA_SC_OFF_WDN + NB_SHDN * KG_SHDN;
+
+// artifacts pack (BYTE offsets, each 16B-aligned; task-0-published compare
+// artifacts — not dataflow):
+//   rmsnorm_out bf16[HIDDEN] | a_fp8 u8[HIDDEN] | a_scale f32[KG1]
+//   | logits bf16[ROUTER_N] | meta i32[META_INTS] | i_fp8 u8[8*512]
+//   | i_scale f32[8*4] | si_fp8 u8[256] | si_scale f32[2]
+inline constexpr int MEGA_ART_OFF_RMSNORM = 0;
+inline constexpr int MEGA_ART_OFF_AFP8 =
+    align_up_16(MEGA_ART_OFF_RMSNORM + HIDDEN * 2);
+inline constexpr int MEGA_ART_OFF_ASCALE =
+    align_up_16(MEGA_ART_OFF_AFP8 + HIDDEN);
+inline constexpr int MEGA_ART_OFF_LOGITS =
+    align_up_16(MEGA_ART_OFF_ASCALE + KG1 * 4);
+inline constexpr int MEGA_ART_OFF_META =
+    align_up_16(MEGA_ART_OFF_LOGITS + ROUTER_N * 2);
+inline constexpr int MEGA_ART_OFF_IFP8 =
+    align_up_16(MEGA_ART_OFF_META + META_INTS * 4);
+inline constexpr int MEGA_ART_OFF_ISCALE =
+    align_up_16(MEGA_ART_OFF_IFP8 + MAX_ACTIVE * W2_K);
+inline constexpr int MEGA_ART_OFF_SIFP8 =
+    align_up_16(MEGA_ART_OFF_ISCALE + MAX_ACTIVE * KG2 * 4);
+inline constexpr int MEGA_ART_OFF_SISCALE =
+    align_up_16(MEGA_ART_OFF_SIFP8 + SH_DN_K);
+inline constexpr int MEGA_ART_BYTES =
+    align_up_16(MEGA_ART_OFF_SISCALE + KG_SHDN * 4);
+
 } // namespace dsv3_ffn_v2
 } // namespace kernel

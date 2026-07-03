@@ -22,7 +22,8 @@ PY = sys.executable
 
 
 def build_cases(what: str, repeats: int, nwarps: int, L: int, iters: int,
-                fold: bool = False):
+                fold: bool = False, extra: dict | None = None):
+    extra = extra or {}
     cases = []
     if what in ("correctness", "all"):
         cases.append({"name": "ffn_corr_typical", "mode": "ffn_correctness",
@@ -42,6 +43,8 @@ def build_cases(what: str, repeats: int, nwarps: int, L: int, iters: int,
                       "profiled": True, "L": L, "iters": iters,
                       "force_local8": True, "nwarps": nwarps, "fold": fold,
                       "timeout_s": 3000})
+    for c in cases:
+        c.update(extra)
     return cases
 
 
@@ -90,6 +93,9 @@ def main():
                     help="folded 3-op chain (router_quant_rms/w13_topk/"
                          "w2_silu) instead of the 6-op chain")
     ap.add_argument("--tag", default="ffn_r0")
+    ap.add_argument("--extra", default=None,
+                    help="JSON dict merged into every case spec (e.g. "
+                         "'{\"rung\":\"mega\"}' for the fusion-ladder rungs)")
     args = ap.parse_args()
 
     device = args.devices.split(",")[0]
@@ -97,7 +103,8 @@ def main():
     os.makedirs(tag_dir, exist_ok=True)
 
     cases = build_cases(args.what, args.repeats, args.nwarps, args.L,
-                        args.iters, fold=args.fold)
+                        args.iters, fold=args.fold,
+                        extra=json.loads(args.extra) if args.extra else None)
     all_results = []
     for case in cases:  # serial (verdict-grade: quiet, one at a time)
         print(f"[ffn_suite] running {case['name']} on cuda:{device} ...",

@@ -297,7 +297,13 @@ enum TaskType {
   TASK_DSV3_ATTN_OPROJ_V2 = 345,
   // partial+merge fold (v1 lever-4 atomic last-arriver; step-3c round 4).
   TASK_DSV3_ATTN_MLA_FUSED_V2 = 346,
-  TASK_SM100_TASK_END = 347, // SM100 end placeholder, not a real task
+  // FFN fusion-ladder experiment (scratch/v2_ffn_fuse): Rung A 2-op chain
+  // (w13_rqr_topk -> w2_silu) and Rung B 1-op megakernel-shape (ffn_mega,
+  // num_tasks MUST equal num_workers — in-op GMEM barriers).
+  // TASK_SM100_TASK_END shifted 347 -> 349 (placeholder only).
+  TASK_DSV3_FFN_W13_RQR_TOPK_V2 = 347,
+  TASK_DSV3_FFN_MEGA_V2 = 348,
+  TASK_SM100_TASK_END = 349, // SM100 end placeholder, not a real task
   TASK_SCHD_TASKS = 200,
   TASK_SCHD_EVENTS = 201,
   TASK_GET_EVENT = 202,

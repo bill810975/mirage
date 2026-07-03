@@ -1402,5 +1402,709 @@ __device__ __noinline__ void
   mac_task_epilogue(is_consumer, s_flags, sync_tag);
 }
 
+// ============================================================================
+// FUSION-LADDER EXPERIMENT (scratch/v2_ffn_fuse): Rung A 2-op chain
+// (w13_rqr_topk -> w2_silu) and Rung B 1-op "megakernel shape" (ffn_mega).
+// All math is the exact committed/v1 code: the rms / quant / router / topk /
+// W13 / silu / W2 blocks below are verbatim copies of the tuned 3-op task
+// bodies (which are themselves verbatim v1 helper calls); only the
+// synchronization scaffolding differs.
+// ============================================================================
+
+static_assert(E_LOCAL == v1k::E_LOCAL && NB1 == v1k::NB1 && NB2 == v1k::NB2 &&
+                  KG_SHGU == v1k::KG_SHGU && NB_SHGU == v1k::NB_SHGU &&
+                  NB_SHDN == v1k::NB_SHDN,
+              "fusion-ladder spec shapes drifted from the v1 kernel");
+
+// Consumer-only: stage hidden into s_norm and rmsnorm IN PLACE. VERBATIM copy
+// of the router_quant_rms_task_impl block (identical instruction sequence =>
+// identical normed bytes). Caller handles flag release + artifact publish.
+__device__ __forceinline__ void
+    ffnv2_rms_stage_and_norm(__nv_bfloat16 const *x,
+                             __nv_bfloat16 const *rms_w,
+                             __nv_bfloat16 *s_norm,
+                             float *s_red) {
+  int const lane = threadIdx.x & 31;
+  int const ws = threadIdx.x >> 5;
+  uint32_t const sb = static_cast<uint32_t>(__cvta_generic_to_shared(s_norm));
+  uint4 const *g4 = reinterpret_cast<uint4 const *>(x);
+  constexpr int NU4 = HIDDEN * 2 / 16; // 896
+  for (int u = threadIdx.x; u < NU4; u += 128) {
+    v1k::cpasync16(sb + (uint32_t)u * 16, &g4[u]);
+  }
+  v1k::cpasync_commit();
+  v1k::cpasync_wait<0>();
+  consumer_sync();
+  uint4 *s_norm4 = reinterpret_cast<uint4 *>(s_norm);
+  float ss = 0.f;
+#pragma unroll
+  for (int r = 0; r < NU4 / 128; r++) { // 7 rounds, independent
+    uint4 const q = s_norm4[threadIdx.x + r * 128];
+    __nv_bfloat162 const *h2 = reinterpret_cast<__nv_bfloat162 const *>(&q);
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+      float2 const f = __bfloat1622float2(h2[j]);
+      ss += f.x * f.x + f.y * f.y;
+    }
+  }
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) {
+    ss += __shfl_xor_sync(0xffffffffu, ss, o);
+  }
+  if (lane == 0) {
+    s_red[ws] = ss;
+  }
+  consumer_sync();
+  float const tot = s_red[0] + s_red[1] + s_red[2] + s_red[3];
+  float const rms_rcp = rsqrtf(tot / float(HIDDEN) + v1k::RMS_EPS);
+  uint4 const *w4 = reinterpret_cast<uint4 const *>(rms_w);
+#pragma unroll
+  for (int r = 0; r < NU4 / 128; r++) {
+    int const u = threadIdx.x + r * 128;
+    uint4 const qx = s_norm4[u];
+    uint4 const qw = w4[u];
+    __nv_bfloat162 const *x2 = reinterpret_cast<__nv_bfloat162 const *>(&qx);
+    __nv_bfloat162 const *w2 = reinterpret_cast<__nv_bfloat162 const *>(&qw);
+    uint4 qo;
+    __nv_bfloat162 *o2 = reinterpret_cast<__nv_bfloat162 *>(&qo);
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+      float2 const fx = __bfloat1622float2(x2[j]);
+      float2 const fw = __bfloat1622float2(w2[j]);
+      o2[j] = __floats2bfloat162_rn(fx.x * rms_rcp * fw.x,
+                                    fx.y * rms_rcp * fw.y);
+    }
+    s_norm4[u] = qo;
+  }
+  consumer_sync();
+}
+
+// Consumer-cooperative bf16[HIDDEN] SMEM -> GMEM publish (task-0 artifact).
+__device__ __forceinline__ void
+    ffnv2_publish_norm(__nv_bfloat16 const *s_norm, __nv_bfloat16 *dst) {
+  uint4 const *s4 = reinterpret_cast<uint4 const *>(s_norm);
+  uint4 *d4 = reinterpret_cast<uint4 *>(dst);
+  constexpr int NU4 = HIDDEN * 2 / 16;
+#pragma unroll
+  for (int r = 0; r < NU4 / 128; r++) {
+    int const u = threadIdx.x + r * 128;
+    d4[u] = s4[u];
+  }
+}
+
+// ----------------------------------------------------------------------------
+// Rung A — w13_rqr_topk. The ENTIRE router_quant_rms op folded into the W13
+// task prologue: rmsnorm (redundant, vectorized) + quant of ALL 56 groups
+// (task-local, into SMEM — a_fp8 never round-trips GMEM) + the FULL router
+// GEMV (all 1024 pairs task-locally strided — the deliberately-checked 136x
+// redundancy: 3.67 MB bf16 router weight PER TASK) + redundant topk, then the
+// W13+sharedGU GEMV (global warp stride, verbatim).
+//   inputs : [0] hidden bf16[1,H]   [1] rms_w bf16[H]   [2] router_w bf16
+//            [3] bias f32[256]
+//            [4] a_fp8 u8[H] (hidden, t0 artifact)  [5] a_scale f32[56] (t0)
+//            [6] rmsnorm_out bf16[1,H] (t0)         [7] inter f32[256,4] (t0)
+//            [8] logits bf16[256] (t0)              [9] meta i32[24] (t0 —
+//                REAL consumer: the downstream w2_silu reads it)
+//            [10] w13   [11] w13_scale   [12] wgu   [13] wgu_scale
+//   outputs: [0] y13 f32[8,1024]   [1] sg f32[512]
+// Flags (A_TK region tail): [0] NORM_READY  [1..3] RDONE  [4] META_READY
+//   [5..7] epilogue (mac_task_epilogue base &flags[4]).
+// ----------------------------------------------------------------------------
+__device__ __noinline__ void
+    w13_rqr_topk_task_impl(mirage::runtime::TaskDesc const *task_desc,
+                           int task_offset,
+                           int num_tasks,
+                           int nwarps,
+                           unsigned long long sync_tag,
+                           int local_expert_start,
+                           int num_local_experts,
+                           float routed_scaling_factor) {
+  __nv_bfloat16 const *x =
+      static_cast<__nv_bfloat16 const *>(task_desc->input_ptrs[0]);
+  __nv_bfloat16 const *rms_w =
+      static_cast<__nv_bfloat16 const *>(task_desc->input_ptrs[1]);
+  __nv_bfloat16 const *wr =
+      static_cast<__nv_bfloat16 const *>(task_desc->input_ptrs[2]);
+  float const *bias = static_cast<float const *>(task_desc->input_ptrs[3]);
+  uint8_t *a_fp8_gmem = static_cast<uint8_t *>(task_desc->input_ptrs[4]);
+  float *a_scale_gmem = static_cast<float *>(task_desc->input_ptrs[5]);
+  __nv_bfloat16 *rmsnorm_out =
+      static_cast<__nv_bfloat16 *>(task_desc->input_ptrs[6]);
+  float *inter_gmem = static_cast<float *>(task_desc->input_ptrs[7]);
+  __nv_bfloat16 *logits_out =
+      static_cast<__nv_bfloat16 *>(task_desc->input_ptrs[8]);
+  int *meta_gmem = static_cast<int *>(task_desc->input_ptrs[9]);
+  uint8_t const *w13 = static_cast<uint8_t const *>(task_desc->input_ptrs[10]);
+  float const *w13_scale =
+      static_cast<float const *>(task_desc->input_ptrs[11]);
+  uint8_t const *wgu = static_cast<uint8_t const *>(task_desc->input_ptrs[12]);
+  float const *wgu_s = static_cast<float const *>(task_desc->input_ptrs[13]);
+  float *y13 = static_cast<float *>(task_desc->output_ptrs[0]);
+  float *sg = static_cast<float *>(task_desc->output_ptrs[1]);
+
+  extern __shared__ char smem[];
+  char *nb = smem + task_desc->smem_region_offset(A_REGION_NORM);
+  __nv_bfloat16 *s_norm = reinterpret_cast<__nv_bfloat16 *>(nb);
+  float *s_red = reinterpret_cast<float *>(nb + RQR_OFF_RED);
+  uint8_t *s_a = reinterpret_cast<uint8_t *>(
+      smem + task_desc->smem_region_offset(A_REGION_ACT));
+  float *s_as = reinterpret_cast<float *>(s_a + W13_ACT_SCALE_OFF);
+  uint4 *s_ring = reinterpret_cast<uint4 *>(
+      smem + task_desc->smem_region_offset(A_REGION_RING));
+  char *tk_base = smem + task_desc->smem_region_offset(A_REGION_TK);
+  float *s_inter = reinterpret_cast<float *>(tk_base + A_TK_OFF_INTER);
+  char *wk = tk_base + A_TK_OFF_WK;
+  int const *s_meta = reinterpret_cast<int const *>(wk + TK_OFF_META);
+  uint64_t *s_flags = reinterpret_cast<uint64_t *>(tk_base + A_TK_OFF_FLAGS);
+
+  int const lane = threadIdx.x & 31;
+  int const ws = threadIdx.x >> 5;
+  bool const is_consumer = threadIdx.x < 128;
+
+  if (is_consumer) {
+    ffnv2_rms_stage_and_norm(x, rms_w, s_norm, s_red);
+    // helpers may only see NORMED bytes.
+    if (sync_tag != 0 && threadIdx.x == 0) {
+      ffnv2_flag_store_release(&s_flags[0], sync_tag);
+    }
+    if (task_offset == 0) {
+      ffnv2_publish_norm(s_norm, rmsnorm_out);
+    }
+  } else {
+    ffnv2_flag_wait(&s_flags[0], sync_tag);
+    __syncwarp();
+  }
+
+  // quant: ALL 56 groups, TASK-LOCAL warp stride, into SMEM (group-local math
+  // verbatim; every task computes identical bytes).
+  for (int g = ws; g < KG1; g += nwarps) {
+    v1k::quant_group_warp<__nv_bfloat16>(s_norm, s_a, s_as, g, lane);
+  }
+  // router: ALL 1024 (e,sp) pairs, TASK-LOCAL warp stride, into SMEM s_inter.
+  // (This is the checked redundancy: the full 3.67 MB router weight per task.)
+  uint4 *my_ring = s_ring + (size_t)ws * (GEMV_RING_BYTES_PER_WARP / 16);
+  int const total_pairs = ROUTER_N * RKSPLIT;
+  for (int t = ws; t < total_pairs; t += nwarps) {
+    int const e = t / RKSPLIT, sp = t % RKSPLIT;
+    float const acc = v1k::router_partial_cpa<RKSPLIT, 4>(
+        s_norm, wr + (size_t)e * v1k::ROUTER_K, sp, lane, my_ring);
+    if (lane == 0) {
+      s_inter[e * RKSPLIT + sp] = acc;
+    }
+  }
+  v1k::cpasync_wait<0>();
+  __syncwarp();
+
+  if (is_consumer) {
+    // wait for the helpers' quant+router SMEM writes (whole-warp acquire).
+    if (sync_tag != 0) {
+      ffnv2_flag_wait(&s_flags[1], sync_tag);
+      ffnv2_flag_wait(&s_flags[2], sync_tag);
+      ffnv2_flag_wait(&s_flags[3], sync_tag);
+    }
+    consumer_sync(); // converge consumers; orders all quant/router writes
+    // task-0 artifacts: a_fp8 / a_scale / inter (compare + debug surface).
+    if (task_offset == 0) {
+      uint4 const *sa4 = reinterpret_cast<uint4 const *>(s_a);
+      uint4 *ga4 = reinterpret_cast<uint4 *>(a_fp8_gmem);
+      constexpr int NU4_A = HIDDEN / 16; // 448
+      for (int u = threadIdx.x; u < NU4_A; u += 128) {
+        ga4[u] = sa4[u];
+      }
+      for (int i = threadIdx.x; i < KG1; i += 128) {
+        a_scale_gmem[i] = s_as[i];
+      }
+      float4 const *si4 = reinterpret_cast<float4 const *>(s_inter);
+      float4 *gi4 = reinterpret_cast<float4 *>(inter_gmem);
+      for (int u = threadIdx.x; u < ROUTER_N; u += 128) { // 1024 f32 = 256 f4
+        if (u < (ROUTER_N * RKSPLIT) / 4) {
+          gi4[u] = si4[u];
+        }
+      }
+    }
+    // redundant per-task topk on the task's own SMEM logits partials.
+    topk_compute(wk, s_inter, bias,
+                 task_offset == 0 ? logits_out : nullptr,
+                 task_offset == 0 ? meta_gmem : nullptr,
+                 local_expert_start, num_local_experts,
+                 routed_scaling_factor);
+    if (sync_tag != 0 && threadIdx.x == 0) {
+      ffnv2_flag_store_release(&s_flags[4], sync_tag); // META_READY
+    }
+  } else {
+    if (lane == 0) {
+      ffnv2_flag_store_release(&s_flags[1 + (ws - 4)], sync_tag); // RDONE
+    }
+    ffnv2_flag_wait(&s_flags[4], sync_tag); // META_READY
+    __syncwarp();
+  }
+
+  RoutingMeta const m = load_meta(s_meta);
+
+  // W13 + sharedGU GEMV — verbatim w13_topk (global warp stride); the
+  // activation is ALREADY in SMEM (computed by the in-task quant).
+  constexpr int RBX_W13 = 8;
+  constexpr int ST_W13 = 4;
+  constexpr int RBX_SH = 4;
+  constexpr int ST_SH13 = 2;
+  int const n13 = m.active_count * (W13_N / RBX_W13);
+  int const nsh1 = SH_GU_N / RBX_SH;
+  int const ntot1 = n13 + nsh1;
+
+  for (int idx = task_offset * nwarps + ws; idx < ntot1;
+       idx += num_tasks * nwarps) {
+    if (idx < n13) {
+      int const slot = idx / (W13_N / RBX_W13);
+      int const n0 = (idx % (W13_N / RBX_W13)) * RBX_W13;
+      int const e = m.experts[slot];
+      uint8_t const *wb = w13 + (size_t)e * W13_N * HIDDEN;
+      float const *wsc = w13_scale + (size_t)e * v1k::NB1 * KG1 +
+                         (size_t)(n0 / GRP) * KG1;
+      float yb[RBX_W13];
+      v1k::dgemv_cpa16_h2<RBX_W13, ST_W13>(
+          s_a, s_as, wb, wsc, HIDDEN, KG1, n0, lane, my_ring, yb);
+      if (lane == 0) {
+#pragma unroll
+        for (int r = 0; r < RBX_W13; r++) {
+          y13[(size_t)slot * W13_N + n0 + r] = yb[r];
+        }
+      }
+    } else {
+      int const n0 = (idx - n13) * RBX_SH;
+      float const *wsc = wgu_s + (size_t)(n0 / GRP) * v1k::KG_SHGU;
+      float yb[RBX_SH];
+      v1k::dgemv_cpa16_h2<RBX_SH, ST_SH13>(
+          s_a, s_as, wgu, wsc, v1k::SH_GU_K, v1k::KG_SHGU, n0, lane, my_ring,
+          yb);
+      if (lane == 0) {
+#pragma unroll
+        for (int r = 0; r < RBX_SH; r++) {
+          sg[n0 + r] = yb[r];
+        }
+      }
+    }
+  }
+
+  mac_task_epilogue(is_consumer, &s_flags[4], sync_tag); // uses [5..7]
+}
+
+// ----------------------------------------------------------------------------
+// Rung B — ffn_mega: the whole FFN slice as ONE op whose 136 tasks (MUST equal
+// num_workers — asserted host-side; 2 same-op tasks serialized on one worker
+// would deadlock) self-synchronize around the two in-op all-to-alls (router
+// inter, W13 y13/sg) via monotonic-count GMEM barriers — v1's grid-barrier
+// algorithm rebuilt across co-resident v2 tasks. The router stays
+// GRID-strided (no Rung-A redundancy).
+//   inputs : [0] hidden   [1] rms_w   [2] router_w   [3] bias
+//            [4] w13   [5] wgu   [6] w2   [7] wdn
+//            [8] scales pack f32 (MEGA_SC_* offsets)
+//            [9] xfer pack f32 (MEGA_XFER_*: inter | y13 | sg)
+//            [10] bar u64[2] (zeroed at alloc; target NT*(iter_num+1))
+//            [11] artifacts pack u8 (MEGA_ART_*: task-0 compare surface)
+//   outputs: [0] out bf16[1,W2_N]
+// Flags (M_TK tail, u64[16]): [0] NORM_READY  [1..3] PH1  [4] GO1
+//   [5] META_READY  [6..8] PH2  [9] GO2  [10] SILU_READY  [11+] epilogue base.
+// ----------------------------------------------------------------------------
+template <int RBLK>
+__device__ __noinline__ void
+    ffn_mega_task_impl(mirage::runtime::TaskDesc const *task_desc,
+                       int task_offset,
+                       int num_tasks,
+                       int nwarps,
+                       unsigned long long sync_tag,
+                       int local_expert_start,
+                       int num_local_experts,
+                       float routed_scaling_factor,
+                       int iter_num) {
+  static_assert(RBLK == 16 || RBLK == 8, "RBLK must divide GRP and be >=4");
+  __nv_bfloat16 const *x =
+      static_cast<__nv_bfloat16 const *>(task_desc->input_ptrs[0]);
+  __nv_bfloat16 const *rms_w =
+      static_cast<__nv_bfloat16 const *>(task_desc->input_ptrs[1]);
+  __nv_bfloat16 const *wr =
+      static_cast<__nv_bfloat16 const *>(task_desc->input_ptrs[2]);
+  float const *bias = static_cast<float const *>(task_desc->input_ptrs[3]);
+  uint8_t const *w13 = static_cast<uint8_t const *>(task_desc->input_ptrs[4]);
+  uint8_t const *wgu = static_cast<uint8_t const *>(task_desc->input_ptrs[5]);
+  uint8_t const *w2 = static_cast<uint8_t const *>(task_desc->input_ptrs[6]);
+  uint8_t const *wdn = static_cast<uint8_t const *>(task_desc->input_ptrs[7]);
+  float const *sc = static_cast<float const *>(task_desc->input_ptrs[8]);
+  float const *w13_scale = sc + MEGA_SC_OFF_W13;
+  float const *wgu_s = sc + MEGA_SC_OFF_WGU;
+  float const *w2s = sc + MEGA_SC_OFF_W2;
+  float const *wdns = sc + MEGA_SC_OFF_WDN;
+  float *xfer = static_cast<float *>(task_desc->input_ptrs[9]);
+  float *g_inter = xfer + MEGA_XFER_OFF_INTER_F;
+  float *g_y13 = xfer + MEGA_XFER_OFF_Y13_F;
+  float *g_sg = xfer + MEGA_XFER_OFF_SG_F;
+  unsigned long long *bar =
+      static_cast<unsigned long long *>(task_desc->input_ptrs[10]);
+  uint8_t *art = static_cast<uint8_t *>(task_desc->input_ptrs[11]);
+  __nv_bfloat16 *out = static_cast<__nv_bfloat16 *>(task_desc->output_ptrs[0]);
+
+  extern __shared__ char smem[];
+  char *nb = smem + task_desc->smem_region_offset(M_REGION_NORM);
+  __nv_bfloat16 *s_norm = reinterpret_cast<__nv_bfloat16 *>(nb);
+  float *s_red = reinterpret_cast<float *>(nb + RQR_OFF_RED);
+  uint8_t *s_a = reinterpret_cast<uint8_t *>(
+      smem + task_desc->smem_region_offset(M_REGION_ACT));
+  float *s_as = reinterpret_cast<float *>(s_a + W13_ACT_SCALE_OFF);
+  uint4 *s_ring = reinterpret_cast<uint4 *>(
+      smem + task_desc->smem_region_offset(M_REGION_RING));
+  char *tk_base = smem + task_desc->smem_region_offset(M_REGION_TK);
+  char *wk = tk_base + M_TK_OFF_WK;
+  int const *s_meta = reinterpret_cast<int const *>(wk + TK_OFF_META);
+  uint64_t *s_flags = reinterpret_cast<uint64_t *>(tk_base + M_TK_OFF_FLAGS);
+  uint8_t *s_act = reinterpret_cast<uint8_t *>(
+      smem + task_desc->smem_region_offset(M_REGION_W2ACT));
+  uint8_t *s_ifp8 = s_act;
+  float *s_iscale = reinterpret_cast<float *>(s_act + W2_ACT_ISCALE_OFF);
+  uint8_t *s_sifp8 = s_act + W2_ACT_SIFP8_OFF;
+  float *s_siscale = reinterpret_cast<float *>(s_act + W2_ACT_SISCALE_OFF);
+  // y13/sg staging views over the ring (silu phase only; consumer slices).
+  float *s_y13 = reinterpret_cast<float *>(
+      reinterpret_cast<char *>(s_ring) + W2S_RING_Y13_OFF);
+  float *s_sg = reinterpret_cast<float *>(
+      reinterpret_cast<char *>(s_ring) + W2S_RING_SG_OFF);
+
+  int const lane = threadIdx.x & 31;
+  int const ws = threadIdx.x >> 5;
+  bool const is_consumer = threadIdx.x < 128;
+  bool const has_helpers = nwarps > 4;
+  unsigned long long const bar_need =
+      (unsigned long long)num_tasks * (unsigned long long)(iter_num + 1);
+
+  // ---- P0: rmsnorm (redundant, consumers) ---------------------------------
+  if (is_consumer) {
+    ffnv2_rms_stage_and_norm(x, rms_w, s_norm, s_red);
+    if (has_helpers && threadIdx.x == 0) {
+      ffnv2_flag_store_release(&s_flags[0], sync_tag); // NORM_READY
+    }
+    if (task_offset == 0) {
+      ffnv2_publish_norm(
+          s_norm,
+          reinterpret_cast<__nv_bfloat16 *>(art + MEGA_ART_OFF_RMSNORM));
+    }
+  } else {
+    ffnv2_flag_wait(&s_flags[0], sync_tag);
+    __syncwarp();
+  }
+
+  // ---- P1: quant (task-local, ALL warps) + router slice (GRID stride) -----
+  for (int g = ws; g < KG1; g += nwarps) {
+    v1k::quant_group_warp<__nv_bfloat16>(s_norm, s_a, s_as, g, lane);
+  }
+  uint4 *my_ring = s_ring + (size_t)ws * (GEMV_RING_BYTES_PER_WARP / 16);
+  int const total_pairs = ROUTER_N * RKSPLIT;
+  for (int t = task_offset * nwarps + ws; t < total_pairs;
+       t += num_tasks * nwarps) {
+    int const e = t / RKSPLIT, sp = t % RKSPLIT;
+    float const acc = v1k::router_partial_cpa<RKSPLIT, 4>(
+        s_norm, wr + (size_t)e * v1k::ROUTER_K, sp, lane, my_ring);
+    if (lane == 0) {
+      g_inter[e * RKSPLIT + sp] = acc;
+    }
+  }
+  v1k::cpasync_wait<0>();
+  __syncwarp();
+
+  // ---- GMEM BARRIER 1 (the inter all-to-all) ------------------------------
+  if (is_consumer) {
+    consumer_sync(); // all consumer router/quant work done + visible cta-scope
+    if (threadIdx.x == 0) {
+      if (has_helpers) {
+        ffnv2_flag_poll(&s_flags[1], sync_tag); // PH1: helper stores done
+        ffnv2_flag_poll(&s_flags[2], sync_tag);
+        ffnv2_flag_poll(&s_flags[3], sync_tag);
+      }
+      __threadfence(); // make the whole CTA's inter stores gpu-visible
+      atom_add_release_gpu_u64(&bar[0], 1ull);
+      while (ld_acquire_sys_u64(&bar[0]) < bar_need) {
+        __nanosleep(64);
+      }
+      ffnv2_flag_store_release(&s_flags[4], sync_tag); // GO1
+    }
+    if (ws == 0) {
+      __syncwarp();
+    } else {
+      ffnv2_flag_wait(&s_flags[4], sync_tag);
+    }
+  } else {
+    if (lane == 0) {
+      ffnv2_flag_store_release(&s_flags[1 + (ws - 4)], sync_tag); // PH1
+    }
+    ffnv2_flag_wait(&s_flags[4], sync_tag); // GO1
+  }
+
+  // ---- P2: redundant topk (consumers) + W13 slice (GRID stride) -----------
+  if (is_consumer) {
+    if (task_offset == 0) { // a_fp8/a_scale artifacts (quant done since GO1)
+      uint4 const *sa4 = reinterpret_cast<uint4 const *>(s_a);
+      uint4 *ga4 = reinterpret_cast<uint4 *>(art + MEGA_ART_OFF_AFP8);
+      constexpr int NU4_A = HIDDEN / 16;
+      for (int u = threadIdx.x; u < NU4_A; u += 128) {
+        ga4[u] = sa4[u];
+      }
+      float *gas = reinterpret_cast<float *>(art + MEGA_ART_OFF_ASCALE);
+      for (int i = threadIdx.x; i < KG1; i += 128) {
+        gas[i] = s_as[i];
+      }
+    }
+    topk_compute(
+        wk, g_inter, bias,
+        task_offset == 0
+            ? reinterpret_cast<__nv_bfloat16 *>(art + MEGA_ART_OFF_LOGITS)
+            : nullptr,
+        task_offset == 0 ? reinterpret_cast<int *>(art + MEGA_ART_OFF_META)
+                         : nullptr,
+        local_expert_start, num_local_experts, routed_scaling_factor);
+    if (has_helpers && threadIdx.x == 0) {
+      ffnv2_flag_store_release(&s_flags[5], sync_tag); // META_READY
+    }
+  } else {
+    ffnv2_flag_wait(&s_flags[5], sync_tag); // META_READY
+    __syncwarp();
+  }
+
+  RoutingMeta const m = load_meta(s_meta);
+
+  {
+    constexpr int RBX_W13 = 8;
+    constexpr int ST_W13 = 4;
+    constexpr int RBX_SH = 4;
+    constexpr int ST_SH13 = 2;
+    int const n13 = m.active_count * (W13_N / RBX_W13);
+    int const nsh1 = SH_GU_N / RBX_SH;
+    int const ntot1 = n13 + nsh1;
+    for (int idx = task_offset * nwarps + ws; idx < ntot1;
+         idx += num_tasks * nwarps) {
+      if (idx < n13) {
+        int const slot = idx / (W13_N / RBX_W13);
+        int const n0 = (idx % (W13_N / RBX_W13)) * RBX_W13;
+        int const e = m.experts[slot];
+        uint8_t const *wb = w13 + (size_t)e * W13_N * HIDDEN;
+        float const *wsc = w13_scale + (size_t)e * v1k::NB1 * KG1 +
+                           (size_t)(n0 / GRP) * KG1;
+        float yb[RBX_W13];
+        v1k::dgemv_cpa16_h2<RBX_W13, ST_W13>(
+            s_a, s_as, wb, wsc, HIDDEN, KG1, n0, lane, my_ring, yb);
+        if (lane == 0) {
+#pragma unroll
+          for (int r = 0; r < RBX_W13; r++) {
+            g_y13[(size_t)slot * W13_N + n0 + r] = yb[r];
+          }
+        }
+      } else {
+        int const n0 = (idx - n13) * RBX_SH;
+        float const *wsc = wgu_s + (size_t)(n0 / GRP) * v1k::KG_SHGU;
+        float yb[RBX_SH];
+        v1k::dgemv_cpa16_h2<RBX_SH, ST_SH13>(
+            s_a, s_as, wgu, wsc, v1k::SH_GU_K, v1k::KG_SHGU, n0, lane,
+            my_ring, yb);
+        if (lane == 0) {
+#pragma unroll
+          for (int r = 0; r < RBX_SH; r++) {
+            g_sg[n0 + r] = yb[r];
+          }
+        }
+      }
+    }
+  }
+  v1k::cpasync_wait<0>();
+  __syncwarp();
+
+  // ---- GMEM BARRIER 2 (the y13/sg all-to-all == the i_fp8 boundary) -------
+  if (is_consumer) {
+    consumer_sync();
+    if (threadIdx.x == 0) {
+      if (has_helpers) {
+        ffnv2_flag_poll(&s_flags[6], sync_tag); // PH2
+        ffnv2_flag_poll(&s_flags[7], sync_tag);
+        ffnv2_flag_poll(&s_flags[8], sync_tag);
+      }
+      __threadfence();
+      atom_add_release_gpu_u64(&bar[1], 1ull);
+      while (ld_acquire_sys_u64(&bar[1]) < bar_need) {
+        __nanosleep(64);
+      }
+      ffnv2_flag_store_release(&s_flags[9], sync_tag); // GO2
+    }
+    if (ws == 0) {
+      __syncwarp();
+    } else {
+      ffnv2_flag_wait(&s_flags[9], sync_tag);
+    }
+  } else {
+    if (lane == 0) {
+      ffnv2_flag_store_release(&s_flags[6 + (ws - 4)], sync_tag); // PH2
+    }
+    ffnv2_flag_wait(&s_flags[9], sync_tag); // GO2
+  }
+
+  // ---- P3: redundant silu+requant (consumers, verbatim w2_silu) -----------
+  if (is_consumer) {
+    uint32_t const sb =
+        static_cast<uint32_t>(__cvta_generic_to_shared(s_y13));
+    uint4 const *y4 = reinterpret_cast<uint4 const *>(g_y13);
+    int const nu4_y = (m.active_count * W13_N) >> 2;
+    for (int u = threadIdx.x; u < nu4_y; u += 128) {
+      v1k::cpasync16(sb + (uint32_t)u * 16, &y4[u]);
+    }
+    uint32_t const sbs =
+        static_cast<uint32_t>(__cvta_generic_to_shared(s_sg));
+    uint4 const *g4 = reinterpret_cast<uint4 const *>(g_sg);
+    constexpr int NU4_SG = SH_GU_N / 4;
+    for (int u = threadIdx.x; u < NU4_SG; u += 128) {
+      v1k::cpasync16(sbs + (uint32_t)u * 16, &g4[u]);
+    }
+    v1k::cpasync_commit();
+    v1k::cpasync_wait<0>();
+    consumer_sync();
+
+    int const wid = ws; // 0..3
+    int const ng = m.active_count * KG2;
+    for (int gg = wid; gg < ng; gg += 4) {
+      int const slot = gg / KG2;
+      int const g = gg % KG2;
+      float const *y = s_y13 + (size_t)slot * W13_N;
+      int const i0 = g * GRP + lane * 4;
+      float4 const gpart = *reinterpret_cast<float4 const *>(&y[i0]);
+      float4 const upart = *reinterpret_cast<float4 const *>(&y[512 + i0]);
+      float v[4], amax = 0.f;
+      v[0] = v1k::silu_fast(gpart.x) * upart.x;
+      v[1] = v1k::silu_fast(gpart.y) * upart.y;
+      v[2] = v1k::silu_fast(gpart.z) * upart.z;
+      v[3] = v1k::silu_fast(gpart.w) * upart.w;
+#pragma unroll
+      for (int t = 0; t < 4; t++) {
+        amax = fmaxf(amax, fabsf(v[t]));
+      }
+#pragma unroll
+      for (int o = 16; o > 0; o >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+      }
+      float const s = v1k::quant_scale(amax);
+      float const inv = 1.f / s;
+      if (lane == 0) {
+        s_iscale[slot * KG2 + g] = s;
+      }
+#pragma unroll
+      for (int t = 0; t < 4; t++) {
+        s_ifp8[(size_t)slot * W2_K + i0 + t] = v1k::to_f8(v[t] * inv);
+      }
+    }
+    for (int g = wid; g < KG_SHDN; g += 4) {
+      float v[4], amax = 0.f;
+#pragma unroll
+      for (int t = 0; t < 4; t++) {
+        int const i = g * GRP + lane * 4 + t;
+        float const val = v1k::silu_fast(s_sg[i]) * s_sg[256 + i];
+        v[t] = val;
+        amax = fmaxf(amax, fabsf(val));
+      }
+#pragma unroll
+      for (int o = 16; o > 0; o >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+      }
+      float const s = v1k::quant_scale(amax);
+      float const inv = 1.f / s;
+      if (lane == 0) {
+        s_siscale[g] = s;
+      }
+#pragma unroll
+      for (int t = 0; t < 4; t++) {
+        int const i = g * GRP + lane * 4 + t;
+        s_sifp8[i] = v1k::to_f8(v[t] * inv);
+      }
+    }
+    // ALL silu reads of the ring-staged y13/sg complete before this barrier;
+    // the GEMV below may then reuse the ring for weight staging.
+    consumer_sync();
+    if (has_helpers && threadIdx.x == 0) {
+      ffnv2_flag_store_release(&s_flags[10], sync_tag); // SILU_READY
+    }
+    if (task_offset == 0) {
+      uint8_t *gi = art + MEGA_ART_OFF_IFP8;
+      for (int i = threadIdx.x; i < m.active_count * W2_K; i += 128) {
+        gi[i] = s_ifp8[i];
+      }
+      float *gis = reinterpret_cast<float *>(art + MEGA_ART_OFF_ISCALE);
+      for (int i = threadIdx.x; i < m.active_count * KG2; i += 128) {
+        gis[i] = s_iscale[i];
+      }
+      uint8_t *gsi = art + MEGA_ART_OFF_SIFP8;
+      for (int i = threadIdx.x; i < SH_DN_K; i += 128) {
+        gsi[i] = s_sifp8[i];
+      }
+      float *gss = reinterpret_cast<float *>(art + MEGA_ART_OFF_SISCALE);
+      for (int i = threadIdx.x; i < KG_SHDN; i += 128) {
+        gss[i] = s_siscale[i];
+      }
+    }
+  } else {
+    ffnv2_flag_wait(&s_flags[10], sync_tag); // SILU_READY
+    __syncwarp();
+  }
+
+  // ---- W2 + sharedDN, output-stationary (verbatim w2_silu GEMV) -----------
+  {
+    constexpr int ST_W2 = 2;
+    constexpr int RBX_SH = 4;
+    constexpr int ST_SH2 = 3;
+    int const nblk = W2_N / RBLK;
+    for (int item = task_offset * nwarps + ws; item < nblk;
+         item += num_tasks * nwarps) {
+      int const n0 = item * RBLK;
+      float acc[RBLK];
+#pragma unroll
+      for (int r = 0; r < RBLK; r++) {
+        acc[r] = 0.f;
+      }
+      for (int slot = 0; slot < m.active_count; slot++) {
+        int const e = m.experts[slot];
+        float const ew = m.weights[slot];
+        float yb[RBLK];
+        v1k::dgemv_cpa16_h2<RBLK, ST_W2>(
+            s_ifp8 + (size_t)slot * W2_K,
+            s_iscale + slot * KG2,
+            w2 + (size_t)e * W2_N * W2_K,
+            w2s + (size_t)e * v1k::NB2 * KG2 + (size_t)(n0 / GRP) * KG2,
+            W2_K, KG2, n0, lane, my_ring, yb);
+        if (lane == 0) {
+#pragma unroll
+          for (int r = 0; r < RBLK; r++) {
+            acc[r] += ew * yb[r];
+          }
+        }
+      }
+#pragma unroll
+      for (int sb4 = 0; sb4 < RBLK / RBX_SH; sb4++) {
+        int const mm0 = n0 + sb4 * RBX_SH;
+        float yb4[RBX_SH];
+        v1k::dgemv_cpa<RBX_SH, ST_SH2>(
+            s_sifp8, s_siscale, wdn,
+            wdns + (size_t)(mm0 / GRP) * KG_SHDN,
+            SH_DN_K, KG_SHDN, mm0, lane,
+            reinterpret_cast<uint32_t *>(my_ring), yb4);
+        if (lane == 0) {
+#pragma unroll
+          for (int r = 0; r < RBX_SH; r++) {
+            acc[sb4 * RBX_SH + r] += yb4[r];
+          }
+        }
+      }
+      if (lane == 0) {
+#pragma unroll
+        for (int r = 0; r < RBLK; r++) {
+          out[n0 + r] = __float2bfloat16_rn(acc[r]);
+        }
+      }
+    }
+  }
+
+  mac_task_epilogue(is_consumer, &s_flags[11],
+                    has_helpers ? sync_tag : 0ull); // uses [12..14]
+}
+
 } // namespace dsv3_ffn_v2
 } // namespace kernel

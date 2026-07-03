@@ -185,6 +185,11 @@ public:
                                          std::vector<int> const &params);
   int register_dsv3_ffn_w2_silu_v2_task(threadblock::Graph const &bgraph,
                                         std::vector<int> const &params);
+  // Fusion-ladder experiment: Rung A (w13_rqr_topk) + Rung B (ffn_mega).
+  int register_dsv3_ffn_w13_rqr_topk_v2_task(threadblock::Graph const &bgraph,
+                                             std::vector<int> const &params);
+  int register_dsv3_ffn_mega_v2_task(threadblock::Graph const &bgraph,
+                                     std::vector<int> const &params);
   // DSv3 fused-ATTN block as a v2 task chain (Step 3b of the V2 migration).
   // See tasks/blackwell_v2/dsv3_attn_v2.cuh for the chain layout.
   int register_dsv3_attn_p0_qkva_v2_task(threadblock::Graph const &bgraph,

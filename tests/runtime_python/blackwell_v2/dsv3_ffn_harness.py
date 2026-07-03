@@ -87,24 +87,148 @@ def gen_block_inputs(seed: int, force_local8: bool = False) -> dict:
     return t
 
 
-def alloc_block_buffers() -> dict:
+def alloc_block_buffers(rung=None) -> dict:
     """Intermediate + output buffers for one block (all attached)."""
     z = lambda shape, dt: torch.zeros(shape, device=DEV, dtype=dt)
+    if rung != "mega":
+        return {
+            "rmsnorm_out": z((1, R.HIDDEN), torch.bfloat16),
+            "a_fp8": z((R.HIDDEN,), torch.uint8),
+            "a_scale": z((R.KG1,), torch.float32),
+            "inter": z((R.ROUTER_N, R.RKSPLIT), torch.float32),
+            "logits": z((R.ROUTER_N,), torch.bfloat16),
+            "meta": z((R.META_INTS,), torch.int32),
+            "y13": z((R.MAX_ACTIVE, R.W13_N), torch.float32),
+            "sg": z((R.SH_GU_N,), torch.float32),
+            "i_fp8": z((R.MAX_ACTIVE, R.W2_K), torch.uint8),
+            "i_scale": z((R.MAX_ACTIVE, R.KG2), torch.float32),
+            "si_fp8": z((R.SH_DN_K,), torch.uint8),
+            "si_scale": z((R.KG_SHDN,), torch.float32),
+            "out": z((1, R.W2_N), torch.bfloat16),
+        }
+    # Rung B (mega): MAX_INPUTS_PER_TASK=14 forces packed GMEM layouts.
+    # Offsets MUST stay in lockstep with dsv3_ffn_v2_spec.h (MEGA_* consts).
+    # The returned dict exposes the SAME keys as the unpacked layout, as
+    # views into the packs — the compare/poison/dump code paths are shared.
+    xfer = z((MEGA_XFER_FLOATS,), torch.float32)
+    art = z((MEGA_ART_BYTES,), torch.uint8)
+    bar = z((2,), torch.int64)  # in-op barrier state; int64 => poison-skipped
+    out = z((1, R.W2_N), torch.bfloat16)
+
+    def av(off, nbytes, dt, shape):
+        return art[off:off + nbytes].view(dt).view(shape)
+
     return {
-        "rmsnorm_out": z((1, R.HIDDEN), torch.bfloat16),
-        "a_fp8": z((R.HIDDEN,), torch.uint8),
-        "a_scale": z((R.KG1,), torch.float32),
-        "inter": z((R.ROUTER_N, R.RKSPLIT), torch.float32),
-        "logits": z((R.ROUTER_N,), torch.bfloat16),
-        "meta": z((R.META_INTS,), torch.int32),
-        "y13": z((R.MAX_ACTIVE, R.W13_N), torch.float32),
-        "sg": z((R.SH_GU_N,), torch.float32),
-        "i_fp8": z((R.MAX_ACTIVE, R.W2_K), torch.uint8),
-        "i_scale": z((R.MAX_ACTIVE, R.KG2), torch.float32),
-        "si_fp8": z((R.SH_DN_K,), torch.uint8),
-        "si_scale": z((R.KG_SHDN,), torch.float32),
-        "out": z((1, R.W2_N), torch.bfloat16),
+        "rmsnorm_out": av(MEGA_ART_OFF_RMSNORM, R.HIDDEN * 2,
+                          torch.bfloat16, (1, R.HIDDEN)),
+        "a_fp8": av(MEGA_ART_OFF_AFP8, R.HIDDEN, torch.uint8, (R.HIDDEN,)),
+        "a_scale": av(MEGA_ART_OFF_ASCALE, R.KG1 * 4, torch.float32,
+                      (R.KG1,)),
+        "logits": av(MEGA_ART_OFF_LOGITS, R.ROUTER_N * 2, torch.bfloat16,
+                     (R.ROUTER_N,)),
+        "meta": av(MEGA_ART_OFF_META, R.META_INTS * 4, torch.int32,
+                   (R.META_INTS,)),
+        "i_fp8": av(MEGA_ART_OFF_IFP8, R.MAX_ACTIVE * R.W2_K, torch.uint8,
+                    (R.MAX_ACTIVE, R.W2_K)),
+        "i_scale": av(MEGA_ART_OFF_ISCALE, R.MAX_ACTIVE * R.KG2 * 4,
+                      torch.float32, (R.MAX_ACTIVE, R.KG2)),
+        "si_fp8": av(MEGA_ART_OFF_SIFP8, R.SH_DN_K, torch.uint8,
+                     (R.SH_DN_K,)),
+        "si_scale": av(MEGA_ART_OFF_SISCALE, R.KG_SHDN * 4, torch.float32,
+                       (R.KG_SHDN,)),
+        "inter": xfer[MEGA_XFER_OFF_INTER_F:
+                      MEGA_XFER_OFF_INTER_F + R.ROUTER_N * R.RKSPLIT].view(
+            R.ROUTER_N, R.RKSPLIT),
+        "y13": xfer[MEGA_XFER_OFF_Y13_F:
+                    MEGA_XFER_OFF_Y13_F + R.MAX_ACTIVE * R.W13_N].view(
+            R.MAX_ACTIVE, R.W13_N),
+        "sg": xfer[MEGA_XFER_OFF_SG_F:MEGA_XFER_OFF_SG_F + R.SH_GU_N],
+        "out": out,
+        "_xfer": xfer,
+        "_art": art,
+        "_bar": bar,
     }
+
+
+# ---- Rung B packed-layout offsets: MUST mirror dsv3_ffn_v2_spec.h ----------
+def _a16(n):
+    return (n + 15) & ~15
+
+
+MEGA_XFER_OFF_INTER_F = 0
+MEGA_XFER_OFF_Y13_F = R.ROUTER_N * R.RKSPLIT
+MEGA_XFER_OFF_SG_F = MEGA_XFER_OFF_Y13_F + R.MAX_ACTIVE * R.W13_N
+MEGA_XFER_FLOATS = MEGA_XFER_OFF_SG_F + R.SH_GU_N
+
+MEGA_SC_OFF_W13 = 0
+MEGA_SC_OFF_WGU = MEGA_SC_OFF_W13 + R.E_LOCAL * R.NB1 * R.KG1
+MEGA_SC_OFF_W2 = MEGA_SC_OFF_WGU + R.NB_SHGU * R.KG_SHGU
+MEGA_SC_OFF_WDN = MEGA_SC_OFF_W2 + R.E_LOCAL * R.NB2 * R.KG2
+MEGA_SC_FLOATS = MEGA_SC_OFF_WDN + R.NB_SHDN * R.KG_SHDN
+
+MEGA_ART_OFF_RMSNORM = 0
+MEGA_ART_OFF_AFP8 = _a16(MEGA_ART_OFF_RMSNORM + R.HIDDEN * 2)
+MEGA_ART_OFF_ASCALE = _a16(MEGA_ART_OFF_AFP8 + R.HIDDEN)
+MEGA_ART_OFF_LOGITS = _a16(MEGA_ART_OFF_ASCALE + R.KG1 * 4)
+MEGA_ART_OFF_META = _a16(MEGA_ART_OFF_LOGITS + R.ROUTER_N * 2)
+MEGA_ART_OFF_IFP8 = _a16(MEGA_ART_OFF_META + R.META_INTS * 4)
+MEGA_ART_OFF_ISCALE = _a16(MEGA_ART_OFF_IFP8 + R.MAX_ACTIVE * R.W2_K)
+MEGA_ART_OFF_SIFP8 = _a16(MEGA_ART_OFF_ISCALE + R.MAX_ACTIVE * R.KG2 * 4)
+MEGA_ART_OFF_SISCALE = _a16(MEGA_ART_OFF_SIFP8 + R.SH_DN_K)
+MEGA_ART_BYTES = _a16(MEGA_ART_OFF_SISCALE + R.KG_SHDN * 4)
+
+
+def assert_mega_coresidency(compile_dir: str, num_workers: int,
+                            num_tasks: int):
+    """Rung-B deadlock-safety HARD GATE (run after compile, BEFORE launch):
+    from the compiled task graph + the exact per-SM plan twin, verify every
+    mega-op instance's tasks are (a) one contiguous id run of num_tasks and
+    (b) assigned to num_tasks DISTINCT workers. Two same-op tasks serialized
+    on one strict-FIFO worker would deadlock the in-op GMEM barrier."""
+    import json as _json
+
+    from mirage.mpk.v2_task_schedule import build_v2_worker_task_queues
+
+    tg_path = os.path.join(compile_dir, "task_graph_rank0.json")
+    with open(tg_path) as f:
+        tg = _json.load(f)
+    types = [int(t.get("task_type", -1)) for t in tg.get("all_tasks", [])]
+    from mirage.mpk.profiler_persistent import event_name_list
+    mega_ids = [tid for tid, name in event_name_list.items()
+                if name == "TASK_DSV3_FFN_MEGA_V2"]
+    assert len(mega_ids) == 1, f"mega enum resolution failed: {mega_ids}"
+    mega_tid = mega_ids[0]
+    mega_pos = [i for i, tt in enumerate(types) if tt == mega_tid]
+    assert mega_pos, "no mega tasks found in the compiled graph"
+
+    queues = build_v2_worker_task_queues(tg, num_workers)
+    worker_of = {}
+    for w, q in enumerate(queues):
+        for pos in q:
+            assert pos not in worker_of, f"task {pos} scheduled twice"
+            worker_of[pos] = w
+
+    # Multi-block chains register the L mega ops back-to-back, so all L*NT
+    # tasks form ONE contiguous id range in all_tasks (no gaps). Partition it
+    # into consecutive num_tasks-sized CHUNKS (one per block instance) and
+    # verify each chunk maps to num_tasks DISTINCT workers. Within one block's
+    # barrier every worker then holds exactly ONE task; the >1 tasks a worker
+    # gets across the whole graph are from DIFFERENT blocks, chain-serialized
+    # (block k+1 depends on block k's output), so they never co-spin.
+    assert mega_pos == list(range(mega_pos[0], mega_pos[0] + len(mega_pos))), (
+        "mega tasks are not one contiguous id range: "
+        f"{mega_pos[0]}..{mega_pos[-1]} vs {len(mega_pos)} tasks")
+    assert len(mega_pos) % num_tasks == 0, (
+        f"{len(mega_pos)} mega tasks not a multiple of num_tasks={num_tasks}")
+    n_inst = len(mega_pos) // num_tasks
+    for k in range(n_inst):
+        chunk = mega_pos[k * num_tasks:(k + 1) * num_tasks]
+        ws = [worker_of[p] for p in chunk]
+        assert len(set(ws)) == num_tasks, (
+            f"mega block {k} (tasks {chunk[0]}..{chunk[-1]}): only "
+            f"{len(set(ws))} distinct workers for {num_tasks} tasks — "
+            f"WOULD DEADLOCK the in-op barrier")
+    return n_inst
 
 
 # ---------------------------------------------------------------------------
@@ -115,6 +239,40 @@ def build_ffn_block(pk, prefix: str, weights: dict, bufs: dict,
     """hidden_dt: the DTensor for this block's input hidden state.
     Returns the out DTensor (feed to the next block)."""
     at = lambda t, nm: pk.attach_input(torch_tensor=t, name=f"{prefix}_{nm}")
+
+    if cfg.get("rung") == "mega":
+        # Rung B: ONE op per block; packed inputs (MAX_INPUTS_PER_TASK=14).
+        if "_scales_pack" not in weights:
+            sp = torch.empty(MEGA_SC_FLOATS, device=DEV, dtype=torch.float32)
+            sp[MEGA_SC_OFF_W13:MEGA_SC_OFF_WGU] = \
+                weights["w13_scale"].reshape(-1)
+            sp[MEGA_SC_OFF_WGU:MEGA_SC_OFF_W2] = \
+                weights["wgu_scale"].reshape(-1)
+            sp[MEGA_SC_OFF_W2:MEGA_SC_OFF_WDN] = \
+                weights["w2_scale"].reshape(-1)
+            sp[MEGA_SC_OFF_WDN:MEGA_SC_FLOATS] = \
+                weights["wdn_scale"].reshape(-1)
+            weights["_scales_pack"] = sp
+        out = at(bufs["out"], "out")
+        pk.dsv3_ffn_mega_layer(
+            input=hidden_dt,
+            rms_weight=at(weights["rms_w"], "rmsw"),
+            gate_weight=at(weights["router_w"], "routerw"),
+            bias=at(weights["bias"], "bias"),
+            w13=at(weights["w13"], "w13"),
+            wgu=at(weights["wgu"], "wgu"),
+            w2=at(weights["w2"], "w2"),
+            wdn=at(weights["wdn"], "wdn"),
+            scales=at(weights["_scales_pack"], "scpack"),
+            xfer=at(bufs["_xfer"], "xfer"),
+            bar=at(bufs["_bar"], "bar"),
+            artifacts=at(bufs["_art"], "art"),
+            output=out,
+            num_tasks=cfg["ntm"],
+            local_expert_start=cfg["les"], num_local_experts=cfg["nle"],
+            routed_scaling_factor=cfg["rsf"], nwarps=cfg["nwarps_m"],
+            rblk=cfg["rblk_m"])
+        return out
 
     rms_w = at(weights["rms_w"], "rmsw")
     router_w = at(weights["router_w"], "routerw")
@@ -151,6 +309,22 @@ def build_ffn_block(pk, prefix: str, weights: dict, bufs: dict,
     meta_al_w2 = at(bufs["meta"], "meta_alias_w2")
     i_scale_al = at(bufs["i_scale"], "iscale_alias")
     si_scale_al = at(bufs["si_scale"], "siscale_alias")
+
+    if cfg.get("rung") == "a":
+        # Rung A 2-op chain: [w13_rqr_topk] -> [w2_silu].
+        pk.dsv3_ffn_w13_rqr_topk_layer(
+            input=hidden_dt, rms_weight=rms_w, gate_weight=router_w,
+            bias=bias, a_fp8=a_fp8, a_scale=a_scale, rmsnorm_out=rmsnorm_out,
+            inter=inter, logits=logits, meta=meta, w13=w13, w13_scale=w13_s,
+            wgu=wgu, wgu_scale=wgu_s, y13=y13, sg=sg, num_tasks=cfg["nta"],
+            local_expert_start=cfg["les"], num_local_experts=cfg["nle"],
+            routed_scaling_factor=cfg["rsf"], nwarps=cfg["nwarps_a"])
+        pk.dsv3_ffn_w2_silu_layer(
+            y13=y13, sg=sg, meta=meta_al_w2, i_fp8=i_fp8, i_scale=i_scale,
+            si_fp8=si_fp8, si_scale=si_scale, w2=w2, w2_scale=w2_s,
+            wdn=wdn, wdn_scale=wdn_s, output=out, num_tasks=cfg["nt2"],
+            nwarps=cfg["nwarps_w2"], rblk=cfg["rblk"])
+        return out
 
     if cfg.get("fold"):
         # FOLDED 3-op chain: rmsnorm/topk/silu recomputed redundantly inside
@@ -222,11 +396,27 @@ def default_cfg(spec: dict) -> dict:
         "nle": spec.get("nle", 128),
         "rsf": spec.get("rsf", 2.5),
         "fold": spec.get("fold", False),
+        # fusion-ladder rungs (scratch/v2_ffn_fuse): None | "a" | "mega"
+        "rung": spec.get("rung"),
+        "nta": spec.get("nta", 136),          # rung A: w13_rqr_topk tasks
+        "nwarps_a": spec.get("nwarps_a", 7),
+        "ntm": spec.get("ntm", 136),          # rung B: MUST == num_workers
+        "nwarps_m": spec.get("nwarps_m", 7),
+        "rblk_m": spec.get("rblk_m", 8),
     }
 
 
 # per-block op instances (for v2_prof_decode.summarize)
 def block_instances(i: int, cfg: dict):
+    if cfg.get("rung") == "a":
+        return [
+            (i, "ffn_w13_rqr_topk", cfg["nta"]),
+            (i, "ffn_w2_silu", cfg["nt2"]),
+        ]
+    if cfg.get("rung") == "mega":
+        return [
+            (i, "ffn_mega", cfg["ntm"]),
+        ]
     if cfg.get("fold"):
         return [
             (i, "ffn_router_quant_rms", cfg["nr"]),
@@ -276,7 +466,7 @@ def run_ffn_correctness_case(spec: dict, out_dir: str) -> dict:
     seed = spec.get("seed", 20260702)
     weights = gen_block_inputs(seed, force_local8=spec.get("force_local8",
                                                            False))
-    bufs = alloc_block_buffers()
+    bufs = alloc_block_buffers(cfg.get("rung"))
 
     pk = make_pk("v2", M=1, test_mode=True)
     hidden_dt = pk.attach_input(torch_tensor=weights["hidden"], name="b0_hidden")
@@ -285,6 +475,11 @@ def run_ffn_correctness_case(spec: dict, out_dir: str) -> dict:
     t0 = time.time()
     pk.compile(output_dir=os.path.join(out_dir, "compile"))
     compile_s = time.time() - t0
+    if cfg.get("rung") == "mega":
+        # deadlock-safety HARD GATE before any launch
+        n_inst = assert_mega_coresidency(os.path.join(out_dir, "compile"),
+                                         pk.num_workers, cfg["ntm"])
+        print(f"[mega] co-residency gate PASSED ({n_inst} instances)")
     t0 = time.time()
     pk()
     torch.cuda.synchronize()
@@ -478,7 +673,7 @@ def run_ffn_perf_case(spec: dict, out_dir: str) -> dict:
     for i in range(L):
         w = gen_block_inputs(seed + 1000 * (i + 1),
                              force_local8=spec.get("force_local8", False))
-        b = alloc_block_buffers()
+        b = alloc_block_buffers(cfg.get("rung"))
         all_weights.append(w)
         all_bufs.append(b)
         out_dt = build_ffn_block(pk, f"b{i}", w, b, hidden_dt, cfg)
@@ -490,6 +685,12 @@ def run_ffn_perf_case(spec: dict, out_dir: str) -> dict:
     t0 = time.time()
     pk.compile(output_dir=os.path.join(out_dir, "compile"))
     result["compile_s"] = time.time() - t0
+    if cfg.get("rung") == "mega":
+        # deadlock-safety HARD GATE before any launch
+        n_inst = assert_mega_coresidency(os.path.join(out_dir, "compile"),
+                                         pk.num_workers, cfg["ntm"])
+        result["mega_coresidency_instances"] = n_inst
+        print(f"[mega] co-residency gate PASSED ({n_inst} instances)")
 
     # Reviewer-mandated skip/race gate: poison every intermediate + output
     # buffer (floats -> NaN, fp8 bytes -> 0xFF = e4m3 NaN, meta ints ->

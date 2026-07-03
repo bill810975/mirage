@@ -715,6 +715,16 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
         customized->bgraph, params);
     task_config[op] =
         std::make_tuple(11, 1, TASK_DSV3_FFN_W2_SILU_V2, variant_id);
+  } else if (name == "dsv3_ffn_w13_rqr_topk_v2") {
+    int variant_id = task_register->register_dsv3_ffn_w13_rqr_topk_v2_task(
+        customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(14, 2, TASK_DSV3_FFN_W13_RQR_TOPK_V2, variant_id);
+  } else if (name == "dsv3_ffn_mega_v2") {
+    int variant_id = task_register->register_dsv3_ffn_mega_v2_task(
+        customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(12, 1, TASK_DSV3_FFN_MEGA_V2, variant_id);
   } else if (name == "splitk_linear_sm100") {
     int variant_id = task_register->register_splitk_linear_sm100_task(
         customized->bgraph, params, false /*with_residual*/);
