@@ -90,7 +90,7 @@ def gen_block_inputs(seed: int, force_local8: bool = False) -> dict:
 def alloc_block_buffers(rung=None) -> dict:
     """Intermediate + output buffers for one block (all attached)."""
     z = lambda shape, dt: torch.zeros(shape, device=DEV, dtype=dt)
-    if rung != "mega":
+    if rung not in ("mega", "megafg"):
         return {
             "rmsnorm_out": z((1, R.HIDDEN), torch.bfloat16),
             "a_fp8": z((R.HIDDEN,), torch.uint8),
@@ -112,7 +112,9 @@ def alloc_block_buffers(rung=None) -> dict:
     # views into the packs — the compare/poison/dump code paths are shared.
     xfer = z((MEGA_XFER_FLOATS,), torch.float32)
     art = z((MEGA_ART_BYTES,), torch.uint8)
-    bar = z((2,), torch.int64)  # in-op barrier state; int64 => poison-skipped
+    # in-op barrier/counter state; int64 => poison-skipped. Coarse mega uses
+    # bar[2]; the fine-grained variant packs FGBAR_COUNT (21) per-slot counters.
+    bar = z((FGBAR_COUNT if rung == "megafg" else 2,), torch.int64)
     out = z((1, R.W2_N), torch.bfloat16)
 
     def av(off, nbytes, dt, shape):
@@ -177,9 +179,14 @@ MEGA_ART_OFF_SIFP8 = _a16(MEGA_ART_OFF_ISCALE + R.MAX_ACTIVE * R.KG2 * 4)
 MEGA_ART_OFF_SISCALE = _a16(MEGA_ART_OFF_SIFP8 + R.SH_DN_K)
 MEGA_ART_BYTES = _a16(MEGA_ART_OFF_SISCALE + R.KG_SHDN * 4)
 
+# fine-grained bar layout (mirror dsv3_ffn_v2_spec.h FGBAR_*): [GB1][rsv]
+# [y_done*8][sg_done][y_target*8][sg_target][epoch] = 21 u64 elements.
+FGBAR_COUNT = 2 + R.MAX_ACTIVE + 1 + R.MAX_ACTIVE + 1 + 1
+
 
 def assert_mega_coresidency(compile_dir: str, num_workers: int,
-                            num_tasks: int):
+                            num_tasks: int,
+                            enum_name: str = "TASK_DSV3_FFN_MEGA_V2"):
     """Rung-B deadlock-safety HARD GATE (run after compile, BEFORE launch):
     from the compiled task graph + the exact per-SM plan twin, verify every
     mega-op instance's tasks are (a) one contiguous id run of num_tasks and
@@ -195,7 +202,7 @@ def assert_mega_coresidency(compile_dir: str, num_workers: int,
     types = [int(t.get("task_type", -1)) for t in tg.get("all_tasks", [])]
     from mirage.mpk.profiler_persistent import event_name_list
     mega_ids = [tid for tid, name in event_name_list.items()
-                if name == "TASK_DSV3_FFN_MEGA_V2"]
+                if name == enum_name]
     assert len(mega_ids) == 1, f"mega enum resolution failed: {mega_ids}"
     mega_tid = mega_ids[0]
     mega_pos = [i for i, tt in enumerate(types) if tt == mega_tid]
@@ -240,7 +247,7 @@ def build_ffn_block(pk, prefix: str, weights: dict, bufs: dict,
     Returns the out DTensor (feed to the next block)."""
     at = lambda t, nm: pk.attach_input(torch_tensor=t, name=f"{prefix}_{nm}")
 
-    if cfg.get("rung") == "mega":
+    if cfg.get("rung") in ("mega", "megafg"):
         # Rung B: ONE op per block; packed inputs (MAX_INPUTS_PER_TASK=14).
         if "_scales_pack" not in weights:
             sp = torch.empty(MEGA_SC_FLOATS, device=DEV, dtype=torch.float32)
@@ -254,7 +261,7 @@ def build_ffn_block(pk, prefix: str, weights: dict, bufs: dict,
                 weights["wdn_scale"].reshape(-1)
             weights["_scales_pack"] = sp
         out = at(bufs["out"], "out")
-        pk.dsv3_ffn_mega_layer(
+        common = dict(
             input=hidden_dt,
             rms_weight=at(weights["rms_w"], "rmsw"),
             gate_weight=at(weights["router_w"], "routerw"),
@@ -272,6 +279,10 @@ def build_ffn_block(pk, prefix: str, weights: dict, bufs: dict,
             local_expert_start=cfg["les"], num_local_experts=cfg["nle"],
             routed_scaling_factor=cfg["rsf"], nwarps=cfg["nwarps_m"],
             rblk=cfg["rblk_m"])
+        if cfg.get("rung") == "megafg":
+            pk.dsv3_ffn_mega_fg_layer(stream=cfg["stream"], **common)
+        else:
+            pk.dsv3_ffn_mega_layer(**common)
         return out
 
     rms_w = at(weights["rms_w"], "rmsw")
@@ -403,6 +414,7 @@ def default_cfg(spec: dict) -> dict:
         "ntm": spec.get("ntm", 136),          # rung B: MUST == num_workers
         "nwarps_m": spec.get("nwarps_m", 7),
         "rblk_m": spec.get("rblk_m", 8),
+        "stream": spec.get("stream", 1),      # megafg: 1=stream, 0=FG0 control
     }
 
 
@@ -416,6 +428,10 @@ def block_instances(i: int, cfg: dict):
     if cfg.get("rung") == "mega":
         return [
             (i, "ffn_mega", cfg["ntm"]),
+        ]
+    if cfg.get("rung") == "megafg":
+        return [
+            (i, "ffn_mega_fg", cfg["ntm"]),
         ]
     if cfg.get("fold"):
         return [
@@ -475,11 +491,15 @@ def run_ffn_correctness_case(spec: dict, out_dir: str) -> dict:
     t0 = time.time()
     pk.compile(output_dir=os.path.join(out_dir, "compile"))
     compile_s = time.time() - t0
-    if cfg.get("rung") == "mega":
+    if cfg.get("rung") in ("mega", "megafg"):
         # deadlock-safety HARD GATE before any launch
+        _en = ("TASK_DSV3_FFN_MEGA_FG_V2" if cfg.get("rung") == "megafg"
+               else "TASK_DSV3_FFN_MEGA_V2")
         n_inst = assert_mega_coresidency(os.path.join(out_dir, "compile"),
-                                         pk.num_workers, cfg["ntm"])
-        print(f"[mega] co-residency gate PASSED ({n_inst} instances)")
+                                         pk.num_workers, cfg["ntm"],
+                                         enum_name=_en)
+        print(f"[{cfg.get('rung')}] co-residency gate PASSED "
+              f"({n_inst} instances)")
     t0 = time.time()
     pk()
     torch.cuda.synchronize()
@@ -685,12 +705,16 @@ def run_ffn_perf_case(spec: dict, out_dir: str) -> dict:
     t0 = time.time()
     pk.compile(output_dir=os.path.join(out_dir, "compile"))
     result["compile_s"] = time.time() - t0
-    if cfg.get("rung") == "mega":
+    if cfg.get("rung") in ("mega", "megafg"):
         # deadlock-safety HARD GATE before any launch
+        _en = ("TASK_DSV3_FFN_MEGA_FG_V2" if cfg.get("rung") == "megafg"
+               else "TASK_DSV3_FFN_MEGA_V2")
         n_inst = assert_mega_coresidency(os.path.join(out_dir, "compile"),
-                                         pk.num_workers, cfg["ntm"])
+                                         pk.num_workers, cfg["ntm"],
+                                         enum_name=_en)
         result["mega_coresidency_instances"] = n_inst
-        print(f"[mega] co-residency gate PASSED ({n_inst} instances)")
+        print(f"[{cfg.get('rung')}] co-residency gate PASSED "
+              f"({n_inst} instances)")
 
     # Reviewer-mandated skip/race gate: poison every intermediate + output
     # buffer (floats -> NaN, fp8 bytes -> 0xFF = e4m3 NaN, meta ints ->

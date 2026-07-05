@@ -190,6 +190,9 @@ public:
                                              std::vector<int> const &params);
   int register_dsv3_ffn_mega_v2_task(threadblock::Graph const &bgraph,
                                      std::vector<int> const &params);
+  // Fine-grained-release ffn_mega (round 2): GB2 -> per-slot counters.
+  int register_dsv3_ffn_mega_fg_v2_task(threadblock::Graph const &bgraph,
+                                        std::vector<int> const &params);
   // DSv3 fused-ATTN block as a v2 task chain (Step 3b of the V2 migration).
   // See tasks/blackwell_v2/dsv3_attn_v2.cuh for the chain layout.
   int register_dsv3_attn_p0_qkva_v2_task(threadblock::Graph const &bgraph,

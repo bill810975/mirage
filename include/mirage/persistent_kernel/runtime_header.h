@@ -303,7 +303,15 @@ enum TaskType {
   // TASK_SM100_TASK_END shifted 347 -> 349 (placeholder only).
   TASK_DSV3_FFN_W13_RQR_TOPK_V2 = 347,
   TASK_DSV3_FFN_MEGA_V2 = 348,
-  TASK_SM100_TASK_END = 349, // SM100 end placeholder, not a real task
+  // Fine-grained-release variant of ffn_mega (scratch/v2_ffn_fuse round 2):
+  // the GB2 whole-grid barrier (W13->silu/W2) is replaced by PER-SLOT
+  // monotonic producer counters so an early-finished worker streams
+  // silu+W2 on the slots that are ready while others finish late slots.
+  // GB1 (inter all-to-all, topk global gate) stays a count barrier.
+  // num_tasks MUST equal num_workers (same co-residency contract).
+  // TASK_SM100_TASK_END shifted 349 -> 350 (placeholder only).
+  TASK_DSV3_FFN_MEGA_FG_V2 = 349,
+  TASK_SM100_TASK_END = 350, // SM100 end placeholder, not a real task
   TASK_SCHD_TASKS = 200,
   TASK_SCHD_EVENTS = 201,
   TASK_GET_EVENT = 202,
@@ -314,7 +322,7 @@ enum TaskType {
   TASK_NVSHMEM_ALLGATHER_STRIDED_PUT = 301,
   TASK_NVSHMEM_TILE_ALLREDUCE = 302,
   TASK_NVSHMEM_GLOBAL_ARGMAX = 303,
-  TASK_MULTIGPU_TASK_END = 349, // end placeholder, not a real task
+  TASK_MULTIGPU_TASK_END = 350, // end placeholder, not a real task
 };
 
 enum EventType {

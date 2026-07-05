@@ -592,7 +592,8 @@ void register_mugraph(
                 task_type == TASK_DSV3_FFN_W13_TOPK_V2 ||
                 task_type == TASK_DSV3_FFN_W2_SILU_V2 ||
                 task_type == TASK_DSV3_FFN_W13_RQR_TOPK_V2 ||
-                task_type == TASK_DSV3_FFN_MEGA_V2) {
+                task_type == TASK_DSV3_FFN_MEGA_V2 ||
+                task_type == TASK_DSV3_FFN_MEGA_FG_V2) {
               task.task_metadata.task_offset = bid.x;
             }
             // DSv3 ATTN v2 chain: every op strides / indexes its item
@@ -2118,6 +2119,7 @@ TaskGraphResult print_task_graph(
   task_type_to_name[TASK_DSV3_FFN_W13_RQR_TOPK_V2] =
       "TASK_DSV3_FFN_W13_RQR_TOPK_V2";
   task_type_to_name[TASK_DSV3_FFN_MEGA_V2] = "TASK_DSV3_FFN_MEGA_V2";
+  task_type_to_name[TASK_DSV3_FFN_MEGA_FG_V2] = "TASK_DSV3_FFN_MEGA_FG_V2";
   task_type_to_name[TASK_SPLITK_LINEAR_SM100] = "TASK_SPLITK_LINEAR_SM100";
   task_type_to_name[TASK_ATTN_SM100] = "TASK_ATTN_SM100";
   task_type_to_name[TASK_ARGMAX_PARTIAL_SM100] = "TASK_ARGMAX_PARTIAL_SM100";

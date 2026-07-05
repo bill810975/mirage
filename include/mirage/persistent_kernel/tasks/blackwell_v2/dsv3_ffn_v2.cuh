@@ -2106,5 +2106,689 @@ __device__ __noinline__ void
                     has_helpers ? sync_tag : 0ull); // uses [12..14]
 }
 
+// ============================================================================
+// FINE-GRAINED-RELEASE ffn_mega (scratch/v2_ffn_fuse round 2). Answers the
+// user's direct hypothesis: does replacing the GB2 whole-grid barrier
+// (W13 -> silu/W2) with PER-SLOT monotonic producer counters — so an
+// early-finished worker STREAMS silu+W2 on the slots that are ready while
+// other workers finish late slots — BEAT the tuned 3-op chain (which the
+// coarse-barrier ffn_mega only TIES)?
+//
+// Fine-grained edges respected (first-principles, Codex 019f2fab-verified):
+//   * GB1 (P1 inter all-to-all) STAYS a count barrier: topk is a global
+//     top-8-of-256 reduction that genuinely needs the COMPLETE inter, and
+//     every task recomputes it redundantly. No per-tile flow exists there.
+//   * GB2 is NOT a first-principles all-to-all: g_y13 row `slot` is produced
+//     by many workers' disjoint n0-column blocks, but W2 is output-stationary
+//     and accumulates slots in a FIXED order (0..active-1 then shared-down).
+//     So a worker can silu+accumulate slot s the instant slot s's 128 row
+//     blocks are globally done (per-slot counter), overlapping the W13 tail
+//     of the still-in-flight late slots. Bit-exact: the per-output-block
+//     add order (slot 0,1,..,shared) is preserved; only the WALL time of
+//     each add changes.
+//
+// STREAM_W2 == true  : the aggressive fine-grained variant (per-slot stream).
+// STREAM_W2 == false : the FG0 NEGATIVE CONTROL — identical per-slot counters
+//     + per-pass publish, but the consumer waits ALL slots before any silu/W2
+//     (== coarse order). Isolates "real cross-phase flow" (true vs false Δ)
+//     from the counter/atomic overhead (false vs coarse Δ).
+//
+//   inputs : [0] hidden   [1] rms_w   [2] router_w   [3] bias
+//            [4] w13   [5] wgu   [6] w2   [7] wdn
+//            [8] scales pack   [9] xfer pack
+//            [10] bar u64[FGBAR_COUNT] (zeroed at alloc)
+//            [11] artifacts pack
+//   outputs: [0] out bf16[1,W2_N]
+// ============================================================================
+template <int RBLK, bool STREAM_W2>
+__device__ __noinline__ void
+    ffn_mega_fg_task_impl(mirage::runtime::TaskDesc const *task_desc,
+                          int task_offset,
+                          int num_tasks,
+                          int nwarps,
+                          unsigned long long sync_tag,
+                          int local_expert_start,
+                          int num_local_experts,
+                          float routed_scaling_factor,
+                          int iter_num) {
+  static_assert(RBLK == 16 || RBLK == 8, "RBLK must divide GRP and be >=4");
+  __nv_bfloat16 const *x =
+      static_cast<__nv_bfloat16 const *>(task_desc->input_ptrs[0]);
+  __nv_bfloat16 const *rms_w =
+      static_cast<__nv_bfloat16 const *>(task_desc->input_ptrs[1]);
+  __nv_bfloat16 const *wr =
+      static_cast<__nv_bfloat16 const *>(task_desc->input_ptrs[2]);
+  float const *bias = static_cast<float const *>(task_desc->input_ptrs[3]);
+  uint8_t const *w13 = static_cast<uint8_t const *>(task_desc->input_ptrs[4]);
+  uint8_t const *wgu = static_cast<uint8_t const *>(task_desc->input_ptrs[5]);
+  uint8_t const *w2 = static_cast<uint8_t const *>(task_desc->input_ptrs[6]);
+  uint8_t const *wdn = static_cast<uint8_t const *>(task_desc->input_ptrs[7]);
+  float const *sc = static_cast<float const *>(task_desc->input_ptrs[8]);
+  float const *w13_scale = sc + MEGA_SC_OFF_W13;
+  float const *wgu_s = sc + MEGA_SC_OFF_WGU;
+  float const *w2s = sc + MEGA_SC_OFF_W2;
+  float const *wdns = sc + MEGA_SC_OFF_WDN;
+  float *xfer = static_cast<float *>(task_desc->input_ptrs[9]);
+  float *g_inter = xfer + MEGA_XFER_OFF_INTER_F;
+  float *g_y13 = xfer + MEGA_XFER_OFF_Y13_F;
+  float *g_sg = xfer + MEGA_XFER_OFF_SG_F;
+  unsigned long long *bar =
+      static_cast<unsigned long long *>(task_desc->input_ptrs[10]);
+  uint8_t *art = static_cast<uint8_t *>(task_desc->input_ptrs[11]);
+  __nv_bfloat16 *out = static_cast<__nv_bfloat16 *>(task_desc->output_ptrs[0]);
+
+  // fg counter views into the enlarged bar tensor.
+  unsigned long long *y_done = bar + FGBAR_Y_DONE;
+  unsigned long long *sg_done = bar + FGBAR_SG_DONE;
+  unsigned long long *y_target = bar + FGBAR_Y_TARGET;
+  unsigned long long *sg_target = bar + FGBAR_SG_TARGET;
+  unsigned long long *epoch = bar + FGBAR_EPOCH;
+
+  extern __shared__ char smem[];
+  char *nb = smem + task_desc->smem_region_offset(M_REGION_NORM);
+  __nv_bfloat16 *s_norm = reinterpret_cast<__nv_bfloat16 *>(nb);
+  float *s_red = reinterpret_cast<float *>(nb + RQR_OFF_RED);
+  uint8_t *s_a = reinterpret_cast<uint8_t *>(
+      smem + task_desc->smem_region_offset(M_REGION_ACT));
+  float *s_as = reinterpret_cast<float *>(s_a + W13_ACT_SCALE_OFF);
+  uint4 *s_ring = reinterpret_cast<uint4 *>(
+      smem + task_desc->smem_region_offset(M_REGION_RING));
+  char *tk_base = smem + task_desc->smem_region_offset(M_REGION_TK);
+  char *wk = tk_base + FG_TK_OFF_WK;
+  int const *s_meta = reinterpret_cast<int const *>(wk + TK_OFF_META);
+  uint64_t *s_flags = reinterpret_cast<uint64_t *>(tk_base + FG_TK_OFF_FLAGS);
+  uint8_t *s_act = reinterpret_cast<uint8_t *>(
+      smem + task_desc->smem_region_offset(M_REGION_W2ACT));
+  uint8_t *s_ifp8 = s_act;
+  float *s_iscale = reinterpret_cast<float *>(s_act + W2_ACT_ISCALE_OFF);
+  uint8_t *s_sifp8 = s_act + W2_ACT_SIFP8_OFF;
+  float *s_siscale = reinterpret_cast<float *>(s_act + W2_ACT_SISCALE_OFF);
+  // per-slot y13 staging overlay into the ring (one slot at a time in stream
+  // mode; the whole active y13 in control mode).
+  float *s_y13 = reinterpret_cast<float *>(
+      reinterpret_cast<char *>(s_ring) + W2S_RING_Y13_OFF);
+  float *s_sg = reinterpret_cast<float *>(
+      reinterpret_cast<char *>(s_ring) + W2S_RING_SG_OFF);
+
+  int const lane = threadIdx.x & 31;
+  int const ws = threadIdx.x >> 5;
+  bool const is_consumer = threadIdx.x < 128;
+  bool const has_helpers = nwarps > 4;
+  unsigned long long const gb1_need =
+      (unsigned long long)num_tasks * (unsigned long long)(iter_num + 1);
+  unsigned long long const epoch_need = (unsigned long long)(iter_num + 1);
+
+  // ---- P0: rmsnorm (redundant, consumers) ---------------------------------
+  if (is_consumer) {
+    ffnv2_rms_stage_and_norm(x, rms_w, s_norm, s_red);
+    if (has_helpers && threadIdx.x == 0) {
+      ffnv2_flag_store_release(&s_flags[FG_FLAG_NORM], sync_tag);
+    }
+    if (task_offset == 0) {
+      ffnv2_publish_norm(
+          s_norm,
+          reinterpret_cast<__nv_bfloat16 *>(art + MEGA_ART_OFF_RMSNORM));
+    }
+  } else {
+    ffnv2_flag_wait(&s_flags[FG_FLAG_NORM], sync_tag);
+    __syncwarp();
+  }
+
+  // ---- P1: quant (task-local, ALL warps) + router slice (GRID stride) -----
+  for (int g = ws; g < KG1; g += nwarps) {
+    v1k::quant_group_warp<__nv_bfloat16>(s_norm, s_a, s_as, g, lane);
+  }
+  uint4 *my_ring = s_ring + (size_t)ws * (GEMV_RING_BYTES_PER_WARP / 16);
+  int const total_pairs = ROUTER_N * RKSPLIT;
+  for (int t = task_offset * nwarps + ws; t < total_pairs;
+       t += num_tasks * nwarps) {
+    int const e = t / RKSPLIT, sp = t % RKSPLIT;
+    float const acc = v1k::router_partial_cpa<RKSPLIT, 4>(
+        s_norm, wr + (size_t)e * v1k::ROUTER_K, sp, lane, my_ring);
+    if (lane == 0) {
+      g_inter[e * RKSPLIT + sp] = acc;
+    }
+  }
+  v1k::cpasync_wait<0>();
+  __syncwarp();
+
+  // ---- GMEM BARRIER 1 (the inter all-to-all — topk global gate) -----------
+  if (is_consumer) {
+    consumer_sync();
+    if (threadIdx.x == 0) {
+      if (has_helpers) {
+        ffnv2_flag_poll(&s_flags[FG_FLAG_PH1 + 0], sync_tag);
+        ffnv2_flag_poll(&s_flags[FG_FLAG_PH1 + 1], sync_tag);
+        ffnv2_flag_poll(&s_flags[FG_FLAG_PH1 + 2], sync_tag);
+      }
+      __threadfence();
+      atom_add_release_gpu_u64(&bar[FGBAR_GB1], 1ull);
+      while (ld_acquire_sys_u64(&bar[FGBAR_GB1]) < gb1_need) {
+        __nanosleep(64);
+      }
+      ffnv2_flag_store_release(&s_flags[FG_FLAG_GO1], sync_tag);
+    }
+    if (ws == 0) {
+      __syncwarp();
+    } else {
+      ffnv2_flag_wait(&s_flags[FG_FLAG_GO1], sync_tag);
+    }
+  } else {
+    if (lane == 0) {
+      ffnv2_flag_store_release(&s_flags[FG_FLAG_PH1 + (ws - 4)], sync_tag);
+    }
+    ffnv2_flag_wait(&s_flags[FG_FLAG_GO1], sync_tag);
+  }
+
+  // ---- P2: redundant topk (consumers) -------------------------------------
+  if (is_consumer) {
+    if (task_offset == 0) { // a_fp8/a_scale artifacts
+      uint4 const *sa4 = reinterpret_cast<uint4 const *>(s_a);
+      uint4 *ga4 = reinterpret_cast<uint4 *>(art + MEGA_ART_OFF_AFP8);
+      constexpr int NU4_A = HIDDEN / 16;
+      for (int u = threadIdx.x; u < NU4_A; u += 128) {
+        ga4[u] = sa4[u];
+      }
+      float *gas = reinterpret_cast<float *>(art + MEGA_ART_OFF_ASCALE);
+      for (int i = threadIdx.x; i < KG1; i += 128) {
+        gas[i] = s_as[i];
+      }
+    }
+    topk_compute(
+        wk, g_inter, bias,
+        task_offset == 0
+            ? reinterpret_cast<__nv_bfloat16 *>(art + MEGA_ART_OFF_LOGITS)
+            : nullptr,
+        task_offset == 0 ? reinterpret_cast<int *>(art + MEGA_ART_OFF_META)
+                         : nullptr,
+        local_expert_start, num_local_experts, routed_scaling_factor);
+    if (has_helpers && threadIdx.x == 0) {
+      ffnv2_flag_store_release(&s_flags[FG_FLAG_META], sync_tag);
+    }
+  } else {
+    ffnv2_flag_wait(&s_flags[FG_FLAG_META], sync_tag);
+    __syncwarp();
+  }
+
+  RoutingMeta const m = load_meta(s_meta);
+
+  // ---- FG target publish: task 0 sets this-iter per-slot targets, then all
+  // workers wait epoch >= iter+1 before touching y_done/sg_done. Monotonic:
+  // target = current cumulative done + this-iter block count (Codex-designed,
+  // robust to varying active_count; no reset). CRITICAL ordering: task-0's
+  // thread-0 snapshots y_done/sg_done BEFORE publishing epoch, and EVERY warp
+  // (all 7) blocks on epoch>=iter+1 BEFORE any P2 W13 atomicAdd below. So the
+  // snapshot is taken while all workers are still parked (y_done at its
+  // previous-iter final value) -> target = prev_final + this_iter_blocks is
+  // exactly reached this iter. No reset, robust to varying active_count.
+  if (task_offset == 0 && threadIdx.x == 0) {
+    for (int s = 0; s < m.active_count; s++) {
+      unsigned long long const cur = ld_acquire_gpu_u64(&y_done[s]);
+      st_relaxed_gpu_u64(&y_target[s],
+                         cur + (unsigned long long)FG_BLOCKS_PER_SLOT);
+    }
+    unsigned long long const cursg = ld_acquire_gpu_u64(sg_done);
+    st_relaxed_gpu_u64(sg_target, cursg + (unsigned long long)FG_SG_BLOCKS);
+    __threadfence();
+    atom_add_release_gpu_u64(epoch, 1ull); // publish target_epoch = iter+1
+  }
+  // EVERY warp (consumer + helper) blocks on epoch via its own lane-0 poll +
+  // syncwarp — no consumer_sync (that named barrier expects exactly 128
+  // threads; helpers would corrupt the count). The acquire load orders the
+  // published targets before this warp's atomicAdds.
+  if (lane == 0) {
+    while (ld_acquire_sys_u64(epoch) < epoch_need) {
+      __nanosleep(64);
+    }
+  }
+  __syncwarp();
+
+  // ---- P2 W13 GEMV, PER-PASS publish -------------------------------------
+  // Publish per-slot counts at EACH pass boundary (Codex 019f2fab: publishing
+  // only after the whole loop delays an early slot behind the worker's own
+  // late slot, collapsing the fine-grained surface). Max 2 passes for the
+  // decode shape (952 warp-slots, <= 8*128+128 = 1152 items).
+  {
+    constexpr int RBX_W13 = 8;
+    constexpr int ST_W13 = 4;
+    constexpr int RBX_SH = 4;
+    constexpr int ST_SH13 = 2;
+    int const n13 = m.active_count * (W13_N / RBX_W13);
+    int const nsh1 = SH_GU_N / RBX_SH;
+    int const ntot1 = n13 + nsh1;
+    int const stride = num_tasks * nwarps;
+    int const base = task_offset * nwarps + ws;
+
+    for (int idx = base; idx < ntot1; idx += stride) {
+      int touched_slot = -1; // >=0 => a W13 slot ; -2 => sg block
+      if (idx < n13) {
+        int const slot = idx / (W13_N / RBX_W13);
+        int const n0 = (idx % (W13_N / RBX_W13)) * RBX_W13;
+        int const e = m.experts[slot];
+        uint8_t const *wb = w13 + (size_t)e * W13_N * HIDDEN;
+        float const *wsc = w13_scale + (size_t)e * v1k::NB1 * KG1 +
+                           (size_t)(n0 / GRP) * KG1;
+        float yb[RBX_W13];
+        v1k::dgemv_cpa16_h2<RBX_W13, ST_W13>(
+            s_a, s_as, wb, wsc, HIDDEN, KG1, n0, lane, my_ring, yb);
+        if (lane == 0) {
+#pragma unroll
+          for (int r = 0; r < RBX_W13; r++) {
+            g_y13[(size_t)slot * W13_N + n0 + r] = yb[r];
+          }
+        }
+        touched_slot = slot;
+      } else {
+        int const n0 = (idx - n13) * RBX_SH;
+        float const *wsc = wgu_s + (size_t)(n0 / GRP) * v1k::KG_SHGU;
+        float yb[RBX_SH];
+        v1k::dgemv_cpa16_h2<RBX_SH, ST_SH13>(
+            s_a, s_as, wgu, wsc, v1k::SH_GU_K, v1k::KG_SHGU, n0, lane,
+            my_ring, yb);
+        if (lane == 0) {
+#pragma unroll
+          for (int r = 0; r < RBX_SH; r++) {
+            g_sg[n0 + r] = yb[r];
+          }
+        }
+        touched_slot = -2;
+      }
+      // per-pass publish: drain this warp's cp.async ring so the g_y13/g_sg
+      // stores are complete, fence to GPU scope, then bump the slot counter
+      // ONCE for this block (lane 0). Each active slot receives exactly
+      // FG_BLOCKS_PER_SLOT increments across the whole grid this iter.
+      v1k::cpasync_wait<0>();
+      __syncwarp();
+      if (lane == 0) {
+        __threadfence();
+        if (touched_slot >= 0) {
+          atom_add_release_gpu_u64(&y_done[touched_slot], 1ull);
+        } else if (touched_slot == -2) {
+          atom_add_release_gpu_u64(sg_done, 1ull);
+        }
+      }
+    }
+  }
+  __syncwarp();
+
+  // ---- P3 + W2: STREAM (fine-grained) or CONTROL (wait-all) ---------------
+  constexpr int ST_W2 = 2;
+  constexpr int RBX_SH = 4;
+  constexpr int ST_SH2 = 3;
+  int const nblk = W2_N / RBLK;
+
+  // per-slot silu of one staged y13 slot -> s_ifp8[slot] (verbatim group math
+  // over the 4 consumer warps). Caller stages g_y13[slot] into s_y13 first.
+  auto silu_slot = [&](int slot) {
+    int const wid = ws; // 0..3
+    for (int g = wid; g < KG2; g += 4) {
+      float const *y = s_y13; // one slot staged at s_y13
+      int const i0 = g * GRP + lane * 4;
+      float4 const gpart = *reinterpret_cast<float4 const *>(&y[i0]);
+      float4 const upart = *reinterpret_cast<float4 const *>(&y[512 + i0]);
+      float v[4], amax = 0.f;
+      v[0] = v1k::silu_fast(gpart.x) * upart.x;
+      v[1] = v1k::silu_fast(gpart.y) * upart.y;
+      v[2] = v1k::silu_fast(gpart.z) * upart.z;
+      v[3] = v1k::silu_fast(gpart.w) * upart.w;
+#pragma unroll
+      for (int t = 0; t < 4; t++) {
+        amax = fmaxf(amax, fabsf(v[t]));
+      }
+#pragma unroll
+      for (int o = 16; o > 0; o >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+      }
+      float const s = v1k::quant_scale(amax);
+      float const inv = 1.f / s;
+      if (lane == 0) {
+        s_iscale[slot * KG2 + g] = s;
+      }
+#pragma unroll
+      for (int t = 0; t < 4; t++) {
+        s_ifp8[(size_t)slot * W2_K + i0 + t] = v1k::to_f8(v[t] * inv);
+      }
+    }
+  };
+
+  if (STREAM_W2) {
+    // FINE-GRAINED STREAM. CTA-cooperative slot streaming: each warp holds its
+    // OWN out-block acc in registers across the slot loop and accumulates
+    // slots in order 0..active-1 (bit-exact vs coarse) as each slot becomes
+    // globally ready, then shared-down. At RBLK=8 nblk=896 <= stride=952 and
+    // at RBLK=16 nblk=448 <= 952, so each warp owns <= 1 out-block; we track
+    // exactly the owned block (item0). A warp that owns NO block (item0 >=
+    // nblk) still participates in the per-slot silu (consumers) + flag
+    // rendezvous so it never desyncs from the block-owning warps.
+    int const item0 = task_offset * nwarps + ws;
+    bool const owns_block = item0 < nblk;
+    int const n0 = owns_block ? item0 * RBLK : 0;
+    float acc[RBLK];
+#pragma unroll
+    for (int r = 0; r < RBLK; r++) {
+      acc[r] = 0.f;
+    }
+
+    for (int slot = 0; slot < m.active_count; slot++) {
+      // (1) globally-ready wait for this slot's y13 row (all workers' blocks).
+      if (is_consumer) {
+        if (threadIdx.x == 0) {
+          while (ld_acquire_sys_u64(&y_done[slot]) <
+                 ld_acquire_gpu_u64(&y_target[slot])) {
+            __nanosleep(64);
+          }
+        }
+        consumer_sync(); // fan the slot-ready acquire out to all consumers
+        // (2) stage g_y13[slot] -> s_y13 (ring overlay), silu -> s_ifp8[slot]
+        uint32_t const sb =
+            static_cast<uint32_t>(__cvta_generic_to_shared(s_y13));
+        uint4 const *y4 =
+            reinterpret_cast<uint4 const *>(g_y13 + (size_t)slot * W13_N);
+        constexpr int NU4_Y = W13_N / 4; // 256 uint4 = 1024 f32
+        for (int u = threadIdx.x; u < NU4_Y; u += 128) {
+          v1k::cpasync16(sb + (uint32_t)u * 16, &y4[u]);
+        }
+        v1k::cpasync_commit();
+        v1k::cpasync_wait<0>();
+        consumer_sync();
+        silu_slot(slot);
+        consumer_sync(); // s_ifp8[slot] visible to all consumer lanes
+        if (has_helpers && threadIdx.x == 0) {
+          ffnv2_flag_store_release(&s_flags[FG_FLAG_SLOT_SILU + slot],
+                                   sync_tag);
+        }
+      } else {
+        // helpers: wait this slot's silu, then W2-accumulate it.
+        ffnv2_flag_wait(&s_flags[FG_FLAG_SLOT_SILU + slot], sync_tag);
+        __syncwarp();
+      }
+      // (3) W2-accumulate slot `slot` into this warp's owned out-block.
+      if (owns_block) {
+        int const e = m.experts[slot];
+        float const ew = m.weights[slot];
+        float yb[RBLK];
+        v1k::dgemv_cpa16_h2<RBLK, ST_W2>(
+            s_ifp8 + (size_t)slot * W2_K,
+            s_iscale + slot * KG2,
+            w2 + (size_t)e * W2_N * W2_K,
+            w2s + (size_t)e * v1k::NB2 * KG2 + (size_t)(n0 / GRP) * KG2,
+            W2_K, KG2, n0, lane, my_ring, yb);
+        if (lane == 0) {
+#pragma unroll
+          for (int r = 0; r < RBLK; r++) {
+            acc[r] += ew * yb[r];
+          }
+        }
+      }
+      // consumers must drain their staging cp.async before reusing s_y13 for
+      // the next slot; the dgemv's own ring drain covers the W2 side.
+      v1k::cpasync_wait<0>();
+      __syncwarp();
+    }
+
+    // (4) shared-down: wait sg globally ready, silu it, accumulate.
+    if (is_consumer) {
+      if (threadIdx.x == 0) {
+        while (ld_acquire_sys_u64(sg_done) < ld_acquire_gpu_u64(sg_target)) {
+          __nanosleep(64);
+        }
+      }
+      consumer_sync();
+      uint32_t const sbs =
+          static_cast<uint32_t>(__cvta_generic_to_shared(s_sg));
+      uint4 const *g4 = reinterpret_cast<uint4 const *>(g_sg);
+      constexpr int NU4_SG = SH_GU_N / 4; // 128
+      for (int u = threadIdx.x; u < NU4_SG; u += 128) {
+        v1k::cpasync16(sbs + (uint32_t)u * 16, &g4[u]);
+      }
+      v1k::cpasync_commit();
+      v1k::cpasync_wait<0>();
+      consumer_sync();
+      int const wid = ws;
+      for (int g = wid; g < KG_SHDN; g += 4) {
+        float v[4], amax = 0.f;
+#pragma unroll
+        for (int t = 0; t < 4; t++) {
+          int const i = g * GRP + lane * 4 + t;
+          float const val = v1k::silu_fast(s_sg[i]) * s_sg[256 + i];
+          v[t] = val;
+          amax = fmaxf(amax, fabsf(val));
+        }
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+          amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+        }
+        float const s = v1k::quant_scale(amax);
+        float const inv = 1.f / s;
+        if (lane == 0) {
+          s_siscale[g] = s;
+        }
+#pragma unroll
+        for (int t = 0; t < 4; t++) {
+          int const i = g * GRP + lane * 4 + t;
+          s_sifp8[i] = v1k::to_f8(v[t] * inv);
+        }
+      }
+      consumer_sync();
+      if (has_helpers && threadIdx.x == 0) {
+        ffnv2_flag_store_release(&s_flags[FG_FLAG_SG_SILU], sync_tag);
+      }
+      if (task_offset == 0) { // artifacts (compare surface)
+        uint8_t *gi = art + MEGA_ART_OFF_IFP8;
+        for (int i = threadIdx.x; i < m.active_count * W2_K; i += 128) {
+          gi[i] = s_ifp8[i];
+        }
+        float *gis = reinterpret_cast<float *>(art + MEGA_ART_OFF_ISCALE);
+        for (int i = threadIdx.x; i < m.active_count * KG2; i += 128) {
+          gis[i] = s_iscale[i];
+        }
+        uint8_t *gsi = art + MEGA_ART_OFF_SIFP8;
+        for (int i = threadIdx.x; i < SH_DN_K; i += 128) {
+          gsi[i] = s_sifp8[i];
+        }
+        float *gss = reinterpret_cast<float *>(art + MEGA_ART_OFF_SISCALE);
+        for (int i = threadIdx.x; i < KG_SHDN; i += 128) {
+          gss[i] = s_siscale[i];
+        }
+      }
+    } else {
+      ffnv2_flag_wait(&s_flags[FG_FLAG_SG_SILU], sync_tag);
+      __syncwarp();
+    }
+    if (owns_block) {
+#pragma unroll
+      for (int sb4 = 0; sb4 < RBLK / RBX_SH; sb4++) {
+        int const mm0 = n0 + sb4 * RBX_SH;
+        float yb4[RBX_SH];
+        v1k::dgemv_cpa<RBX_SH, ST_SH2>(
+            s_sifp8, s_siscale, wdn,
+            wdns + (size_t)(mm0 / GRP) * KG_SHDN,
+            SH_DN_K, KG_SHDN, mm0, lane,
+            reinterpret_cast<uint32_t *>(my_ring), yb4);
+        if (lane == 0) {
+#pragma unroll
+          for (int r = 0; r < RBX_SH; r++) {
+            acc[sb4 * RBX_SH + r] += yb4[r];
+          }
+        }
+      }
+      if (lane == 0) {
+#pragma unroll
+        for (int r = 0; r < RBLK; r++) {
+          out[n0 + r] = __float2bfloat16_rn(acc[r]);
+        }
+      }
+    }
+  } else {
+    // FG0 NEGATIVE CONTROL: per-slot counters exist + were published per-pass,
+    // but wait ALL active slots + sg before any silu/W2 (== coarse order).
+    if (is_consumer) {
+      if (threadIdx.x == 0) {
+        for (int s = 0; s < m.active_count; s++) {
+          while (ld_acquire_sys_u64(&y_done[s]) <
+                 ld_acquire_gpu_u64(&y_target[s])) {
+            __nanosleep(64);
+          }
+        }
+        while (ld_acquire_sys_u64(sg_done) < ld_acquire_gpu_u64(sg_target)) {
+          __nanosleep(64);
+        }
+      }
+      consumer_sync();
+      // stage full active y13 + sg, silu all (verbatim coarse P3).
+      uint32_t const sb =
+          static_cast<uint32_t>(__cvta_generic_to_shared(s_y13));
+      uint4 const *y4 = reinterpret_cast<uint4 const *>(g_y13);
+      int const nu4_y = (m.active_count * W13_N) >> 2;
+      for (int u = threadIdx.x; u < nu4_y; u += 128) {
+        v1k::cpasync16(sb + (uint32_t)u * 16, &y4[u]);
+      }
+      uint32_t const sbs =
+          static_cast<uint32_t>(__cvta_generic_to_shared(s_sg));
+      uint4 const *g4 = reinterpret_cast<uint4 const *>(g_sg);
+      constexpr int NU4_SG = SH_GU_N / 4;
+      for (int u = threadIdx.x; u < NU4_SG; u += 128) {
+        v1k::cpasync16(sbs + (uint32_t)u * 16, &g4[u]);
+      }
+      v1k::cpasync_commit();
+      v1k::cpasync_wait<0>();
+      consumer_sync();
+      int const wid = ws;
+      int const ng = m.active_count * KG2;
+      for (int gg = wid; gg < ng; gg += 4) {
+        int const slot = gg / KG2;
+        int const g = gg % KG2;
+        float const *y = s_y13 + (size_t)slot * W13_N;
+        int const i0 = g * GRP + lane * 4;
+        float4 const gpart = *reinterpret_cast<float4 const *>(&y[i0]);
+        float4 const upart = *reinterpret_cast<float4 const *>(&y[512 + i0]);
+        float v[4], amax = 0.f;
+        v[0] = v1k::silu_fast(gpart.x) * upart.x;
+        v[1] = v1k::silu_fast(gpart.y) * upart.y;
+        v[2] = v1k::silu_fast(gpart.z) * upart.z;
+        v[3] = v1k::silu_fast(gpart.w) * upart.w;
+#pragma unroll
+        for (int t = 0; t < 4; t++) {
+          amax = fmaxf(amax, fabsf(v[t]));
+        }
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+          amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+        }
+        float const s = v1k::quant_scale(amax);
+        float const inv = 1.f / s;
+        if (lane == 0) {
+          s_iscale[slot * KG2 + g] = s;
+        }
+#pragma unroll
+        for (int t = 0; t < 4; t++) {
+          s_ifp8[(size_t)slot * W2_K + i0 + t] = v1k::to_f8(v[t] * inv);
+        }
+      }
+      for (int g = wid; g < KG_SHDN; g += 4) {
+        float v[4], amax = 0.f;
+#pragma unroll
+        for (int t = 0; t < 4; t++) {
+          int const i = g * GRP + lane * 4 + t;
+          float const val = v1k::silu_fast(s_sg[i]) * s_sg[256 + i];
+          v[t] = val;
+          amax = fmaxf(amax, fabsf(val));
+        }
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+          amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+        }
+        float const s = v1k::quant_scale(amax);
+        float const inv = 1.f / s;
+        if (lane == 0) {
+          s_siscale[g] = s;
+        }
+#pragma unroll
+        for (int t = 0; t < 4; t++) {
+          int const i = g * GRP + lane * 4 + t;
+          s_sifp8[i] = v1k::to_f8(v[t] * inv);
+        }
+      }
+      consumer_sync();
+      if (has_helpers && threadIdx.x == 0) {
+        ffnv2_flag_store_release(&s_flags[FG_FLAG_SG_SILU], sync_tag);
+      }
+      if (task_offset == 0) {
+        uint8_t *gi = art + MEGA_ART_OFF_IFP8;
+        for (int i = threadIdx.x; i < m.active_count * W2_K; i += 128) {
+          gi[i] = s_ifp8[i];
+        }
+        float *gis = reinterpret_cast<float *>(art + MEGA_ART_OFF_ISCALE);
+        for (int i = threadIdx.x; i < m.active_count * KG2; i += 128) {
+          gis[i] = s_iscale[i];
+        }
+        uint8_t *gsi = art + MEGA_ART_OFF_SIFP8;
+        for (int i = threadIdx.x; i < SH_DN_K; i += 128) {
+          gsi[i] = s_sifp8[i];
+        }
+        float *gss = reinterpret_cast<float *>(art + MEGA_ART_OFF_SISCALE);
+        for (int i = threadIdx.x; i < KG_SHDN; i += 128) {
+          gss[i] = s_siscale[i];
+        }
+      }
+    } else {
+      ffnv2_flag_wait(&s_flags[FG_FLAG_SG_SILU], sync_tag);
+      __syncwarp();
+    }
+    // W2 + sharedDN output-stationary (verbatim coarse), all slots resident.
+    for (int item = task_offset * nwarps + ws; item < nblk;
+         item += num_tasks * nwarps) {
+      int const n0 = item * RBLK;
+      float acc[RBLK];
+#pragma unroll
+      for (int r = 0; r < RBLK; r++) {
+        acc[r] = 0.f;
+      }
+      for (int slot = 0; slot < m.active_count; slot++) {
+        int const e = m.experts[slot];
+        float const ew = m.weights[slot];
+        float yb[RBLK];
+        v1k::dgemv_cpa16_h2<RBLK, ST_W2>(
+            s_ifp8 + (size_t)slot * W2_K,
+            s_iscale + slot * KG2,
+            w2 + (size_t)e * W2_N * W2_K,
+            w2s + (size_t)e * v1k::NB2 * KG2 + (size_t)(n0 / GRP) * KG2,
+            W2_K, KG2, n0, lane, my_ring, yb);
+        if (lane == 0) {
+#pragma unroll
+          for (int r = 0; r < RBLK; r++) {
+            acc[r] += ew * yb[r];
+          }
+        }
+      }
+#pragma unroll
+      for (int sb4 = 0; sb4 < RBLK / RBX_SH; sb4++) {
+        int const mm0 = n0 + sb4 * RBX_SH;
+        float yb4[RBX_SH];
+        v1k::dgemv_cpa<RBX_SH, ST_SH2>(
+            s_sifp8, s_siscale, wdn,
+            wdns + (size_t)(mm0 / GRP) * KG_SHDN,
+            SH_DN_K, KG_SHDN, mm0, lane,
+            reinterpret_cast<uint32_t *>(my_ring), yb4);
+        if (lane == 0) {
+#pragma unroll
+          for (int r = 0; r < RBX_SH; r++) {
+            acc[sb4 * RBX_SH + r] += yb4[r];
+          }
+        }
+      }
+      if (lane == 0) {
+#pragma unroll
+        for (int r = 0; r < RBLK; r++) {
+          out[n0 + r] = __float2bfloat16_rn(acc[r]);
+        }
+      }
+    }
+  }
+
+  mac_task_epilogue(is_consumer, &s_flags[FG_FLAG_EPI],
+                    has_helpers ? sync_tag : 0ull); // uses [+1..3]
+}
+
 } // namespace dsv3_ffn_v2
 } // namespace kernel

@@ -380,5 +380,84 @@ inline constexpr int MEGA_ART_OFF_SISCALE =
 inline constexpr int MEGA_ART_BYTES =
     align_up_16(MEGA_ART_OFF_SISCALE + KG_SHDN * 4);
 
+// ============================================================================
+// FINE-GRAINED-RELEASE variant (ffn_mega_fg, scratch/v2_ffn_fuse round 2).
+// Same SMEM shape + same GMEM packs as ffn_mega, but the GB2 whole-grid
+// barrier (W13 -> silu/W2) is replaced by PER-SLOT monotonic producer
+// counters living in an ENLARGED `bar` tensor. GB1 (inter all-to-all, the
+// topk global gate) keeps the single count barrier bar[FGBAR_GB1].
+//
+// bar tensor layout (u64/i64 elements; zero-alloc'd; poison loop skips i64):
+//   [0] GB1 count (P1 inter all-to-all — unchanged)
+//   [1] (reserved; the coarse GB2 slot, UNUSED by fg)
+//   [2 .. 2+MAX_ACTIVE)          y_done[MAX_ACTIVE]  (cumulative W13 row-block
+//                                completions per slot, summed across workers)
+//   [2+MAX_ACTIVE]               sg_done             (shared gate_up blocks)
+//   [3+MAX_ACTIVE .. +MAX_ACTIVE) y_target[MAX_ACTIVE] (this-iter target =
+//                                y_done + FG_BLOCKS_PER_SLOT, task-0 published)
+//   [3+2*MAX_ACTIVE]             sg_target
+//   [4+2*MAX_ACTIVE]             target_epoch        (iter_num+1 once targets
+//                                for this iter are published)
+// The monotonic-target scheme (Codex 019f2fab) is robust to varying
+// active_count across iterations: no counter reset, no sense flip.
+// ============================================================================
+inline constexpr int FG_BLOCKS_PER_SLOT = W13_N / 8;  // 1024/8 = 128 W13 blocks
+inline constexpr int FG_SG_BLOCKS = SH_GU_N / 4;      // 512/4  = 128 sg blocks
+
+inline constexpr int FGBAR_GB1 = 0;
+inline constexpr int FGBAR_Y_DONE = 2;                       // [MAX_ACTIVE]
+inline constexpr int FGBAR_SG_DONE = FGBAR_Y_DONE + MAX_ACTIVE;
+inline constexpr int FGBAR_Y_TARGET = FGBAR_SG_DONE + 1;     // [MAX_ACTIVE]
+inline constexpr int FGBAR_SG_TARGET = FGBAR_Y_TARGET + MAX_ACTIVE;
+inline constexpr int FGBAR_EPOCH = FGBAR_SG_TARGET + 1;
+inline constexpr int FGBAR_COUNT = FGBAR_EPOCH + 1;          // 21 u64 elements
+
+// FG flag layout (M_TK tail, u64[16] — same region as mega). The fg body uses
+// a DIFFERENT flag assignment than coarse mega past GO1:
+//   [0] NORM_READY  [1..3] PH1 (helper router done)  [4] GO1  [5] META_READY
+//   [6 .. 6+MAX_ACTIVE) SLOT_SILU_READY[MAX_ACTIVE] (consumer publishes each
+//        slot's requant to s_ifp8 -> helpers may W2-accumulate that slot)
+//   [6+MAX_ACTIVE] SG_SILU_READY
+//   [7+MAX_ACTIVE ..] epilogue base (mac_task_epilogue -> +[1..3])
+// 7 + MAX_ACTIVE(8) + 3 = 18 > 16 -> enlarge M_TK flags to u64[24] for fg.
+inline constexpr int FG_FLAG_NORM = 0;
+inline constexpr int FG_FLAG_PH1 = 1;                    // [1..3]
+inline constexpr int FG_FLAG_GO1 = 4;
+inline constexpr int FG_FLAG_META = 5;
+inline constexpr int FG_FLAG_SLOT_SILU = 6;              // [MAX_ACTIVE]
+inline constexpr int FG_FLAG_SG_SILU = FG_FLAG_SLOT_SILU + MAX_ACTIVE;
+inline constexpr int FG_FLAG_EPI = FG_FLAG_SG_SILU + 1;  // epilogue base (+1..3)
+inline constexpr int FG_FLAG_COUNT = FG_FLAG_EPI + 4;    // 19 -> round to 24
+
+// The fg TK region enlarges the flag tail vs mega (M_TK_OFF_FLAGS + 24 u64).
+inline constexpr int FG_TK_OFF_WK = 0;
+inline constexpr int FG_TK_OFF_FLAGS = align_up_16(TK_WORK_BYTES);
+inline constexpr int FG_TK_BYTES = FG_TK_OFF_FLAGS + FG_FLAG_COUNT * 8;
+
+inline ::mirage::runtime::TaskSmemInfo make_ffn_mega_fg_smem_info(int nwarps) {
+  int const act_bytes = HIDDEN + KG1 * 4;
+  int const ring_bytes = nwarps * GEMV_RING_BYTES_PER_WARP;
+  ::mirage::runtime::TaskSmemInfo info{
+      RQR_NORM_BYTES + act_bytes + ring_bytes + FG_TK_BYTES + W2_ACT_BYTES,
+      /*alignment=*/1024,
+      {}};
+  info.regions.push_back({"megafg_norm", RQR_NORM_BYTES, 1024, /*page_count=*/1,
+                          /*can_pack=*/false, /*release_step=*/2,
+                          /*contiguous=*/true});
+  info.regions.push_back({"megafg_act", act_bytes, 1024, /*page_count=*/1,
+                          /*can_pack=*/false, /*release_step=*/2,
+                          /*contiguous=*/true});
+  info.regions.push_back({"megafg_ring", ring_bytes, 1024,
+                          /*page_count=*/nwarps, /*can_pack=*/false,
+                          /*release_step=*/2, /*contiguous=*/true});
+  info.regions.push_back({"megafg_tk", FG_TK_BYTES, 1024, /*page_count=*/1,
+                          /*can_pack=*/true, /*release_step=*/2,
+                          /*contiguous=*/true});
+  info.regions.push_back({"megafg_w2act", W2_ACT_BYTES, 1024, /*page_count=*/1,
+                          /*can_pack=*/true, /*release_step=*/2,
+                          /*contiguous=*/true});
+  return info;
+}
+
 } // namespace dsv3_ffn_v2
 } // namespace kernel

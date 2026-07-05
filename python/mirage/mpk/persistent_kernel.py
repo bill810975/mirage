@@ -4227,6 +4227,54 @@ class PersistentKernel:
             tb_graph, "dsv3_ffn_mega_v2",
             [nwarps, local_expert_start, num_local_experts, rsf_bits, rblk])
 
+    def dsv3_ffn_mega_fg_layer(
+        self,
+        input: DTensor,        # PRE-rmsnorm hidden bf16 (1,7168) [chain in]
+        rms_weight: DTensor,   # bf16 (7168,)
+        gate_weight: DTensor,  # router gate bf16 (256, 7168)
+        bias: DTensor,         # f32 (256,)
+        w13: DTensor,          # u8 (128, 1024, 7168)
+        wgu: DTensor,          # u8 (512, 7168)
+        w2: DTensor,           # u8 (128, 7168, 512)
+        wdn: DTensor,          # u8 (7168, 256)
+        scales: DTensor,       # f32 pack (MEGA_SC_*: w13_s|wgu_s|w2_s|wdn_s)
+        xfer: DTensor,         # f32 pack (MEGA_XFER_*: inter|y13|sg)
+        bar: DTensor,          # i64 (FGBAR_COUNT=21,) ZEROED fg counter state
+        artifacts: DTensor,    # u8 pack (MEGA_ART_*: t0 compare surface)
+        output: DTensor,       # bf16 (1, 7168) FFN block output
+        num_tasks: int,
+        local_expert_start: int,
+        num_local_experts: int,
+        routed_scaling_factor: float = 2.5,
+        nwarps: int = 7,
+        rblk: int = 8,
+        stream: int = 1,       # 1 = fine-grained per-slot W2 stream (the
+                               # hypothesis); 0 = FG0 negative control
+    ):
+        """Fine-grained-release ffn_mega: the GB2 whole-grid barrier (W13 ->
+        silu/W2) is replaced by per-slot monotonic producer counters. Same
+        co-residency contract as dsv3_ffn_mega_layer (num_tasks==num_workers).
+        """
+        assert self.use_v2_runtime, "dsv3_ffn_* layers are v2-only"
+        assert nwarps in (4, 7) and rblk in (8, 16) and stream in (0, 1)
+        assert num_tasks == self.num_workers, (
+            f"ffn_mega_fg requires num_tasks == num_workers "
+            f"({num_tasks} != {self.num_workers}): 2 same-op tasks on one "
+            f"worker would deadlock the in-op barrier")
+        import struct
+        rsf_bits = struct.unpack("<i", struct.pack("<f",
+                                                   routed_scaling_factor))[0]
+        tb_graph = TBGraph(CyTBGraph((num_tasks, 1, 1), (128, 1, 1), 1, 64))
+        tensors = [input, rms_weight, gate_weight, bias, w13, wgu, w2, wdn,
+                   scales, xfer, bar, artifacts, output]
+        for t in tensors:
+            tb_graph.new_input(t, (-1, -1, -1), -1, True)
+        self.kn_graph.customized(tensors, tb_graph)
+        self.kn_graph.register_task(
+            tb_graph, "dsv3_ffn_mega_fg_v2",
+            [nwarps, local_expert_start, num_local_experts, rsf_bits, rblk,
+             stream])
+
     # ------------------------------------------------------------------
     # DSv3 fused-ATTN block as a v2 task CHAIN (Step 3b of the V2 migration).
     # v2-runtime only. The chain is:
