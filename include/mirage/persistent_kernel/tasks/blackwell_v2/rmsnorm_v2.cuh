@@ -72,7 +72,7 @@ __device__ __noinline__ void
   }
 
   static_assert(BATCH_SIZE == 1);
-  extern __shared__ char smem[];
+  extern __shared__ __align__(1024) char smem[];
   static_assert(HIDDEN_DIM % NUM_THREADS == 0);
   constexpr int ELTS_PER_THREAD = HIDDEN_DIM / NUM_THREADS;
   constexpr int BYTES_PER_THREAD = ELTS_PER_THREAD * sizeof(T);

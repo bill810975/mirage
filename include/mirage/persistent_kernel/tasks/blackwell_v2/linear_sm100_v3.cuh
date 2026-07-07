@@ -81,6 +81,30 @@ using ::kernel::linear::warp_uniform;
 
 using mpk::ch::By;
 
+// ── SMEM base 1024-byte alignment (128B-swizzle TMA requirement) ────────────
+// The W/A tiles are loaded by a 128B-swizzle cp.async.bulk.tensor whose SHARED
+// destination must be aligned to the 1024-byte swizzle tile. Declaring the
+// extern array `__align__(1024)` is NOT sufficient in the MPK v2 megakernel:
+// worker_v2_kernel places a static `__shared__ RuntimeSMEM rt_buf` BEFORE the
+// dynamic pool, so the dynamic `extern __shared__` base lands only 128-aligned
+// at runtime. The per-stage W/A addresses are `base + smem_region_offset(...)`
+// where the region offsets are page-multiples (16 KB, i.e. 1024-multiples), so
+// the low bits are inherited from the base — if the base isn't 1024-aligned the
+// TMA destination isn't either, and compute-sanitizer reports "Misaligned
+// shared or local address" at the first W load (linear_loader_task). Round the
+// base up to 1024 (identical workaround to mla_prefill_tp8_sm100.cuh). Costs
+// <=1 KB of SMEM and is applied uniformly by loader/launcher/consumer so the
+// int `smem` addr and the `char*` scratch reads resolve to the SAME bytes.
+__device__ __forceinline__ int aligned_smem_base(char *smem_ptr) {
+  int const raw = static_cast<int>(__cvta_generic_to_shared(smem_ptr));
+  return (raw + 1023) & ~1023;
+}
+__device__ __forceinline__ char *aligned_smem_ptr(char *smem_ptr) {
+  int const raw = static_cast<int>(__cvta_generic_to_shared(smem_ptr));
+  int const aligned = (raw + 1023) & ~1023;
+  return smem_ptr + (aligned - raw);
+}
+
 // ── Channel + ring type aliases (original design: sync ≠ storage) ───────────
 // Channels carry ONLY mbarriers:
 //   WChan/AChan: full = per-stream TMA-arrived; empty = SHARED mma_mbar.
@@ -283,6 +307,341 @@ __device__ __forceinline__ void tcgen05_fence_after_thread_sync() {
   asm volatile("tcgen05.fence::after_thread_sync;");
 }
 
+// UNCONDITIONAL probe-region size (u64 words) + init sentinel, appended after
+// the per-worker breadcrumb slots in the pinned buffer. Declared outside the
+// diagnostic guards so persistent_kernel_v2.cuh reserves the SAME region size /
+// sentinel regardless of whether MPK_V2_LINV3_PROBE is compiled — keeping the
+// device/host offset math identical. Kept in lockstep with the guarded
+// linv3_probe::* constants below (static_assert'd there).
+//
+// Layout of the appended probe region (u64 words), base = pinned buffer +
+// 2*num_workers*ROLES:
+//   [0 .. LINV3_META_WORDS)                       — the legacy single-slot
+//       TaskDesc-metadata + per-role PHASE block (worker==TARGET_WORKER-gated).
+//   [LINV3_META_WORDS .. +WTMA_PER_WORKER*WTMA_MAX_WORKERS) — the NEW
+//   per-worker
+//       raw W-TMA argument record (M3 debug): worker w's fields live at
+//       META + w*WTMA_PER_WORKER + <field>. Written by EVERY loader linear_v3
+//       task (elected lane) on EACH cp.async.bulk.tensor W-load (M3 FAULTING-
+//       load extension — the original "first load only, t==0&&i==0" gate MISSED
+//       the faulting later load, which is exactly the tail-band N-tile bug). On
+//       each load the loader computes the OOB/misalign check ON DEVICE and:
+//         * if BAD (dst&1023!=0 / null tmap / row-OOB / kchunk-OOB / src-OOB),
+//           it FREEZES that load's args into the slot + sets WT_BAD_FLAG
+//           (bitmask of tripped checks) and never overwrites it again;
+//         * else it keeps OVERWRITING the slot with the LAST good load so a
+//           no-bad-check crash still shows the last-issued operands.
+//       WT_COMPLETED is stamped after the TMA issue returns (dumped-but-unset
+//       == the faulting loader). WT_LOAD_IDX = the global load counter
+//       (t*iters+i) of the recorded load; WT_NUM_LOADS = total loads this task
+//       will issue. Per-worker slots mean the faulting worker's record is never
+//       overwritten by another; the start-of-loop freeze read of WT_BAD_FLAG
+//       protects an already-frozen bad record from a later good load (this or a
+//       later task).
+constexpr int LINV3_META_WORDS_HOST = 64;
+// 24 (was 16): M3 FAULTING-load extension appends WT_LOAD_IDX / WT_BAD_FLAG /
+// WT_SRC_LIMIT / WT_NUM_LOADS after the original 16-field record. Kept in
+// lockstep with linv3_probe::WTMA_WORDS_PER_WORKER (static_assert'd there).
+constexpr int LINV3_WTMA_PER_WORKER_HOST = 24;
+// Cover every worker in the TP8 grid (num_workers==136). The pre-fix sanitizer
+// showed the faulting set in workers 70..131; capturing [0,135] guarantees the
+// faulter's slot exists regardless of which worker it lands on.
+constexpr int LINV3_WTMA_MAX_WORKERS_HOST = 136;
+constexpr int LINV3_PROBE_WORDS_HOST =
+    LINV3_META_WORDS_HOST +
+    LINV3_WTMA_PER_WORKER_HOST * LINV3_WTMA_MAX_WORKERS_HOST;
+constexpr unsigned long long LINV3_PROBE_SENTINEL_HOST = 0xDEAD5107DEAD5107ull;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DIAGNOSTIC (M3 debug, default-OFF => default build byte-identical) — localize
+// a deterministic cudaErrorIllegalAddress breadcrumbed to worker=36 /
+// TASK_LINEAR_SM100_V3 / seq_in_iter=4 (an lm_head N-tile). Two env-gated
+// tools, both compiling to NOTHING unless their macro is defined:
+//   * MPK_V2_LINV3_PROBE   — dump this worker/tile's copied TaskDesc metadata +
+//     per-role PHASE markers to the host-mapped PINNED breadcrumb buffer (it
+//     survives the context-poisoning fault). Answers "is worker36's TaskDesc
+//     metadata valid, and WHICH phase reached the fault?".
+//   * MPK_V2_LINV3_SKIP36  — no-op the target task's body (skip data movement +
+//     compute + tcgen05.alloc/dealloc) while preserving ALL sync + page parity.
+//     Answers "does skipping worker36's tile make the crash VANISH/MOVE (real
+//     body/tile/metadata bug) or PERSIST (concurrent poisoner / false
+//     attribution)?".
+//   * MPK_V2_LINV3_SKIPALL — sibling of SKIP36: the SAME no-op skip stub, but
+//     applied to EVERY TASK_LINEAR_SM100_V3 task (drops the worker36/seq==4
+//     condition). Reuses the identical op-private + page sync skeleton (loader:
+//     reinit; launcher: reinit + arrive SEM_TMEM_READY + task-end page sweep +
+//     wait SEM_CONSUMER_DONE; consumer: wait SEM_TMEM_READY + arrive
+//     SEM_CONSUMER_DONE) so the megakernel's grid-barrier + page parity stay
+//     intact while linear_v3 does NO data movement/compute/tcgen05. Clean
+//     causal ablation for "is linear_v3 the faulter?": VANISHES (run completes,
+//     garbage lm_head logits) ⇒ linear_v3 IS the faulter; PERSISTS (same
+//     illegal-address) ⇒ the faulter is elsewhere. Needs NO attribution and NO
+//     breadcrumb buffer.
+// MPK_V2_LINV3_PROBE REQUIRES the pinned buffer, which is only allocated when
+// MPK_V2_BREADCRUMB is also set (persistent_kernel_v2.cuh). Force the coupling
+// explicit rather than silently writing nowhere:
+#if defined(MPK_V2_LINV3_PROBE) && !defined(MPK_V2_BREADCRUMB)
+#error                                                                         \
+    "MPK_V2_LINV3_PROBE needs the pinned breadcrumb buffer: also set MPK_V2_BREADCRUMB (and forward -x MPK_V2_BREADCRUMB -x MPK_V2_LINV3_PROBE)."
+#endif
+
+#if defined(MPK_V2_LINV3_PROBE) || defined(MPK_V2_LINV3_SKIP36) ||             \
+    defined(MPK_V2_LINV3_SKIPALL)
+namespace linv3_probe {
+
+// The breadcrumbed candidate: worker (blockIdx.x) and this-worker's
+// seq_in_iter. The tile bound (num_spatial_tiles for lm_head N=129280 / 128)
+// is 1010; task_offset >= that is itself the bug.
+constexpr int TARGET_WORKER = 36;
+constexpr int TARGET_SEQ_IN_ITER = 4;
+constexpr int LMHEAD_NUM_TILES = 1010; // 129280 / BLOCK_M(128); validity bound
+
+__device__ __forceinline__ bool
+    is_target(int seq_in_iter, mirage::runtime::TaskDesc const *task_desc) {
+  return blockIdx.x == TARGET_WORKER && seq_in_iter == TARGET_SEQ_IN_ITER &&
+         task_desc->task_type == mirage::runtime::TASK_LINEAR_SM100_V3;
+}
+
+// SKIPALL predicate: skip the body of EVERY linear_v3 task. Under SKIP36-only
+// it reduces to is_target() (worker36/seq==4) so the two gates can coexist in
+// the same build without changing SKIP36's meaning; under SKIPALL it fires for
+// any TASK_LINEAR_SM100_V3 task regardless of worker/seq. The three role bodies
+// gate their skip stub on THIS (not is_target) so both macros drive the
+// identical sync skeleton.
+__device__ __forceinline__ bool
+    should_skip(int seq_in_iter, mirage::runtime::TaskDesc const *task_desc) {
+#if defined(MPK_V2_LINV3_SKIPALL)
+  (void)seq_in_iter;
+  return task_desc->task_type == mirage::runtime::TASK_LINEAR_SM100_V3;
+#else
+  return is_target(seq_in_iter, task_desc);
+#endif
+}
+} // namespace linv3_probe
+#endif
+
+#ifdef MPK_V2_LINV3_PROBE
+namespace linv3_probe {
+// ── Probe region layout in the pinned breadcrumb buffer ─────────────────────
+// The region is a fixed 64-u64 window APPENDED after the per-worker breadcrumb
+// slots (persistent_kernel_v2.cuh reserves 2*num_workers*ROLES u64 first, then
+// LINV3_PROBE_WORDS more). Device + host compute the SAME base from
+// breadcrumb_num_slots (== num_workers) + the compile constant ROLES.
+// Slots are DISJOINT per role (loader / launcher / consumer run concurrently on
+// the SAME task+slot) so single-writer stores never race; each field has
+// exactly one writer thread (loader elected-lane / launcher lane0 / consumer
+// thread0). Every write is followed by __threadfence_system() so the host sees
+// it after the launch returns cudaErrorIllegalAddress.
+// Metadata/phase block size (worker==TARGET_WORKER-gated single slot).
+constexpr int LINV3_META_WORDS = 64;
+static_assert(LINV3_META_WORDS == ::kernel::linear_v3::LINV3_META_WORDS_HOST,
+              "linv3 metadata block size must match the host reservation");
+// Per-worker raw W-TMA record (M3 debug) — WORDS_PER_WORKER u64 for each of
+// WTMA_MAX_WORKERS workers, appended after the metadata block.
+constexpr int WTMA_WORDS_PER_WORKER =
+    ::kernel::linear_v3::LINV3_WTMA_PER_WORKER_HOST;
+constexpr int WTMA_MAX_WORKERS =
+    ::kernel::linear_v3::LINV3_WTMA_MAX_WORKERS_HOST;
+constexpr int LINV3_PROBE_WORDS =
+    LINV3_META_WORDS + WTMA_WORDS_PER_WORKER * WTMA_MAX_WORKERS;
+static_assert(LINV3_PROBE_WORDS == ::kernel::linear_v3::LINV3_PROBE_WORDS_HOST,
+              "linv3 probe region size must match the host reservation");
+constexpr unsigned long long SENTINEL = 0xDEAD5107DEAD5107ull; // "unwritten"
+static_assert(SENTINEL == ::kernel::linear_v3::LINV3_PROBE_SENTINEL_HOST,
+              "linv3 probe sentinel must match the host init");
+constexpr unsigned long long MAGIC = 0x4C494E5633000001ull; // "LINV3\0\0\x01"
+
+// Per-worker W-TMA record fields (offsets within a worker's
+// WTMA_WORDS_PER_WORKER-word slot). The record is written by the LOADER's
+// elected lane at its FIRST W-TMA (t==0,i==0) for EVERY TASK_LINEAR_SM100_V3
+// task (NOT worker-gated) so the faulting worker's operands are captured on
+// whichever SM it runs. WT_COMPLETED is written AFTER the cp.async.bulk.tensor
+// issue returns: dumped-but-COMPLETED-unset == the faulting loader.
+enum WtmaField {
+  WT_MAGIC = 0,     // WT_SLOT_MAGIC (proves this worker's slot was written)
+  WT_DST = 1,       // W_smem = Wr.slot_addr(pW.st) — the EXACT shared addr
+                    // the TMA sees (post aligned_smem_base()); low 12 bits
+                    // decoded host-side (is it REALLY 1024-aligned?).
+  WT_TMAP = 2,      // W_tmap_ptr (input_tma_desc_ptrs[1][0]) — null/garbage?
+  WT_COORD_X = 3,   // x coord passed to tma_3d_load_l2 (== 0)
+  WT_COORD_Y = 4,   // y coord == cur_off_m (row offset into N)
+  WT_COORD_Z = 5,   // z coord == z_coord (== iter_k * BLOCK_K/64)
+  WT_BOX_D0 = 6,    // box dim0 (== BK = 64)
+  WT_BOX_D1 = 7,    // box dim1 (== BLOCK_M = 128)
+  WT_BOX_D2 = 8,    // box dim2 (== BLOCK_K/BK = 2)
+  WT_GMEM_BASE = 9, // input_ptrs[1] — the W GMEM base ptr the desc encodes
+  WT_SRC_OFF = 10,  // computed source byte-offset from base:
+                    //   y*rowstride(=K*2) + z*kchunkstride(=128)
+  WT_N_REAL = 11,   // N_real (row bound for the coord-OOB check)
+  WT_K = 12,        // K (k-chunk bound: z + box_d2 <= K/BK)
+  WT_SEQ_IN_ITER = 13, // this worker's seq_in_iter (context)
+  WT_ITER_NUM = 14,    // iter_num (context)
+  WT_COMPLETED = 15, // WT_COMPLETED_MAGIC written AFTER the W-TMA issue of the
+                     // RECORDED load returns; still SENTINEL => this loader
+                     // faulted at/inside that cp.async.bulk.tensor. (For a
+                     // FROZEN bad load this stays SENTINEL because the recorded
+                     // load is the suspected faulter — its issue never
+                     // completes when it is the illegal access.)
+  // ── M3 FAULTING-load extension (fields 16..) ──────────────────────────────
+  WT_LOAD_IDX = 16,  // global load counter (t*iters + i) of the RECORDED load
+                     // — "which load # faulted / was last".
+  WT_BAD_FLAG = 17,  // bitmask of tripped checks for the recorded load (see
+                     // WtBad); SENTINEL until first written; 0 == a CLEAN load
+                     // was recorded (no static check tripped).
+  WT_SRC_LIMIT = 18, // weight_buffer_bytes bound (N_real*K*2) used for the
+                     // src_off-OOB cross-check (host context).
+  WT_NUM_LOADS = 19, // total loads this task issues (c.tiles*c.iters) —
+                     // context for WT_LOAD_IDX.
+  // 20..23 reserved (record padded to WTMA_WORDS_PER_WORKER=24).
+};
+// Bitmask values for WT_BAD_FLAG (which static OOB/misalign check tripped).
+enum WtBad {
+  WTBAD_DST_MISALIGN = 1, // dst & 1023 != 0 (not 1024-aligned for 128B swizzle)
+  WTBAD_TMAP_NULL = 2,    // W_tmap_ptr == nullptr
+  WTBAD_ROW_OOB = 4,      // coord_y + BLOCK_M > N_real (dim1=N box overrun)
+  WTBAD_KCHUNK_OOB = 8,   // coord_z + BLOCK_K/BK > K/BK (dim2=K/64 box overrun)
+  WTBAD_SRC_OOB = 16,     // src_off + W_SIZE > N_real*K*2 (buffer byte overrun;
+                          // fires only if N_real/K disagree with the descriptor
+  // dims baked on the host — a metadata mismatch signal)
+};
+static_assert(WT_NUM_LOADS < WTMA_WORDS_PER_WORKER,
+              "W-TMA record must fit in WTMA_WORDS_PER_WORKER");
+constexpr unsigned long long WT_SLOT_MAGIC =
+    0x5754414D41300001ull; // "WTAMA0\x01"
+constexpr unsigned long long WT_COMPLETED_MAGIC = 0x574F4E45444F4E01ull;
+
+enum Slot {
+  // ── loader block [0..24) — has instruction_index/iter_num/runtime_config ──
+  S_MAGIC = 0,         // MAGIC (proves loader block written)
+  S_LD_PHASE,          // loader phase marker (monotone; see LdPhase)
+  S_TASK_TYPE,         // task_desc->task_type
+  S_VARIANT_ID,        // task_desc->variant_id
+  S_TASK_OFFSET,       // task_metadata.task_offset  (== tile_idx)
+  S_TASK_OFFSET_VALID, // 1 iff 0 <= task_offset < num_tiles  (BUG if 0)
+  S_NUM_TILES,         // ctx num_tiles (num_spatial_tiles*SPLIT_K)
+  S_N_REAL,            // N_real
+  S_K,                 // K
+  S_MY_COUNT,          // this worker's tasks/iter
+  S_INSTR_IDX,         // instruction_index (ring sequence)
+  S_SEQ_IN_ITER,       // instruction_index % my_count
+  S_ITER_NUM,          // iter_num
+  S_DEP_EVENT,         // dependent_event (raw)
+  S_DEP_EVENT_IDX,     // decoded event position index (low 32b)
+  S_RAW_PAYLOAD,       // task_metadata.raw_payload
+  S_IN_PTR0,           // input_ptrs[0]  (A activation)
+  S_IN_PTR1,           // input_ptrs[1]  (W weight)
+  S_OUT_PTR0,          // output_ptrs[0] (C)
+  S_A_DESC,            // input_tma_desc_ptrs[0][0] (A-desc; -1 w/o TMA)
+  S_W_DESC,            // input_tma_desc_ptrs[1][0] (W-desc; -1 w/o TMA)
+  S_NUM_REGIONS,       // num_smem_regions
+  S_SMEM_BAD_MASK,     // bitmask of malformed linear SMEM regions (0 == ok)
+  S_LD_RESERVED,       // pad to 24
+  // ── launcher block [24..40) ──────────────────────────────────────────────
+  S_LC_PHASE = 24,     // launcher phase marker (see LcPhase)
+  S_LC_ITER,           // iter_num when the launcher last entered this body
+                       // (pairs with S_LC_PHASE; if != loader S_ITER_NUM the
+                       // launcher did NOT re-enter this crash iter => its phase
+                       // is stale, read it as "died in the launcher prefix").
+  S_LC_TADDR,          // tcgen05 alloc addr (SKIP -> not written)
+  S_LC_SMEM_BASE_LO12, // aligned_smem_base() low 12 bits
+  S_LC_SCRATCH_OFF,    // REGION_SCRATCH byte offset (region_offset)
+  S_LC_SCRATCH_PG,     // REGION_SCRATCH physical_page_start
+  S_LC_RESERVED,       // pad to 40
+  // ── consumer block [40..56) ───────────────────────────────────────────────
+  S_CN_PHASE = 40, // consumer phase marker (see CnPhase)
+  S_CN_ITER,       // iter_num when the consumer last entered (see S_LC_ITER)
+  S_CN_C_PTR,      // C_ptr as the consumer sees it
+  S_CN_TADDR,      // taddr the consumer read from SCRATCH
+  S_CN_RESERVED,   // pad to 56
+  // [56..64) reserved
+};
+
+// Loader phase markers — the LAST value written localizes the phase reached.
+// Prefix markers matter: the codegen loader page-prefix runs BEFORE this body,
+// so a prefix fault would leave S_LD_PHASE unwritten (== SENTINEL) which itself
+// is a signal ("died before/in the loader page-prefix").
+enum LdPhase {
+  LD_BODY_ENTERED = 1,
+  LD_AFTER_META_DUMP = 2,
+  LD_AFTER_REINIT = 3,
+  LD_BEFORE_FIRST_WTMA = 4,
+  LD_AFTER_FIRST_WTMA = 5,
+  LD_AFTER_DEP_WAIT = 6,
+  LD_LOOP_DONE = 7,
+  LD_SKIP_RETURN = 100, // SKIP36 path
+};
+enum LcPhase {
+  LC_BODY_ENTERED = 1,
+  LC_AFTER_REINIT = 2,
+  LC_AFTER_ALLOC = 3,
+  LC_TMEM_READY_ARRIVED = 4,
+  LC_MMA_LOOP_DONE = 5,
+  LC_PAGES_RELEASED = 6,
+  LC_CONSUMER_DONE_WAITED = 7,
+  LC_AFTER_DEALLOC = 8,
+  // SKIP36 path — monotone (100 < 101 < 102 < 103) so the max value present is
+  // the furthest skip phase reached.
+  LC_SKIP_ENTERED = 100,
+  LC_SKIP_TMEM_ARRIVED = 101,   // arrived SEM_TMEM_READY w/o alloc
+  LC_SKIP_PAGES_RELEASED = 102, // task-end page sweep done
+  LC_SKIP_RETURN = 103,         // waited SEM_CONSUMER_DONE, returning
+};
+enum CnPhase {
+  CN_BODY_ENTERED = 1,
+  CN_TMEM_READY_WAITED = 2,
+  CN_AFTER_TADDR_READ = 3,
+  CN_BEFORE_FIRST_STORE = 4,
+  CN_AFTER_FIRST_STORE = 5,
+  CN_LOOP_DONE = 6,
+  CN_CONSUMER_DONE_ARRIVED = 7,
+  CN_SKIP_RETURN = 100,
+};
+
+// Pinned probe-region base (or nullptr if no buffer). SAME expression as the
+// host dump in persistent_kernel_v2.cuh.
+__device__ __forceinline__ unsigned long long *
+    base(mirage::runtime::RuntimeConfig const &config) {
+  if (config.breadcrumb_device == nullptr || config.breadcrumb_num_slots <= 0) {
+    return nullptr;
+  }
+  return static_cast<unsigned long long *>(config.breadcrumb_device) +
+         2ull * static_cast<size_t>(config.breadcrumb_num_slots) *
+             MPK_V2_BREADCRUMB_ROLES;
+}
+
+// Single-writer field store + system fence (host must see it post-crash).
+__device__ __forceinline__ void
+    put(unsigned long long *p, int slot, unsigned long long v) {
+  if (p == nullptr) {
+    return;
+  }
+  p[slot] = v;
+  __threadfence_system();
+}
+
+// Monotone phase marker (never rewinds — later phases overwrite; the max value
+// present is the furthest phase reached).
+__device__ __forceinline__ void mark(unsigned long long *p, int slot, int ph) {
+  put(p, slot, static_cast<unsigned long long>(ph));
+}
+
+// Per-worker W-TMA record base for `worker` (nullptr if no buffer, or if the
+// worker index is outside the reserved [0, WTMA_MAX_WORKERS) range — a worker
+// beyond the reservation is simply NOT recorded rather than clobbering another
+// slot). SAME base expression as the metadata block, then + META offset +
+// worker stride, so the host dump derives identical addresses.
+__device__ __forceinline__ unsigned long long *
+    wtma_slot(mirage::runtime::RuntimeConfig const &config, int worker) {
+  unsigned long long *b = base(config);
+  if (b == nullptr || worker < 0 || worker >= WTMA_MAX_WORKERS) {
+    return nullptr;
+  }
+  return b + LINV3_META_WORDS +
+         static_cast<size_t>(worker) * WTMA_WORDS_PER_WORKER;
+}
+} // namespace linv3_probe
+#endif // MPK_V2_LINV3_PROBE
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Loader role (warp 4, elected lane only) — TMA loop + start-of-task re-init.
 // ═══════════════════════════════════════════════════════════════════════════
@@ -298,16 +657,149 @@ __device__ __noinline__ void
                        int tile_idx,
                        int instruction_index,
                        int iter_num,
-                       int dyn_sem_base) {
+                       int dyn_sem_base
+#if defined(MPK_V2_LINV3_PROBE) || defined(MPK_V2_LINV3_SKIP36) ||             \
+    defined(MPK_V2_LINV3_SKIPALL)
+                       ,
+                       int _linv3_seq_in_iter
+#endif
+    ) {
   if (!elect_sync()) {
     return;
   }
+
+#if defined(MPK_V2_LINV3_PROBE) || defined(MPK_V2_LINV3_SKIP36) ||             \
+    defined(MPK_V2_LINV3_SKIPALL)
+  bool const _linv3_hit = linv3_probe::is_target(_linv3_seq_in_iter, task_desc);
+  bool const _linv3_skip =
+      linv3_probe::should_skip(_linv3_seq_in_iter, task_desc);
+  (void)_linv3_hit;
+  (void)_linv3_skip;
+#endif
+#ifdef MPK_V2_LINV3_PROBE
+  // Metadata dump (loader block) — the loader is the only role with
+  // instruction_index / iter_num / runtime_config, so it dumps the full block.
+  // Written unconditionally of SKIP so a NON-skipped PROBE run still records
+  // it.
+  if (_linv3_hit) {
+    unsigned long long *_bp = linv3_probe::base(runtime_config);
+    linv3_probe::mark(
+        _bp, linv3_probe::S_LD_PHASE, linv3_probe::LD_BODY_ENTERED);
+    const TaskCtx _pc = ctx_from<SPLIT_K, TILES_PER_TASK>(N_real, K, tile_idx);
+    long long _to =
+        static_cast<long long>(task_desc->task_metadata.task_offset);
+    // Malformed-region mask over the linear SMEM regions the planner assigns:
+    // NUM_REGIONS regions must each land inside [0, MAX_SMEM_PAGES_PER_TASK)
+    // and have page_count > 0. A bad start/count/span is a copied-TaskDesc bug.
+    unsigned long long _bad = 0ull;
+    int const _nreg = task_desc->num_smem_regions;
+    for (int r = 0; r < ::kernel::linear::NUM_REGIONS && r < 63; r++) {
+      if (r >= _nreg) {
+        _bad |= (1ull << r);
+        continue;
+      }
+      mirage::runtime::SmemPageRegionDesc const &_rg =
+          task_desc->smem_regions[r];
+      int const _st = _rg.physical_page_start;
+      int const _pc2 = _rg.page_count;
+      if (_st < 0 || _pc2 <= 0 ||
+          _st + _pc2 > mirage::runtime::MAX_SMEM_PAGES_PER_TASK) {
+        _bad |= (1ull << r);
+      }
+    }
+    linv3_probe::put(_bp, linv3_probe::S_MAGIC, linv3_probe::MAGIC);
+    linv3_probe::put(_bp, linv3_probe::S_TASK_TYPE, task_desc->task_type);
+    linv3_probe::put(_bp, linv3_probe::S_VARIANT_ID, task_desc->variant_id);
+    linv3_probe::put(
+        _bp, linv3_probe::S_TASK_OFFSET, static_cast<unsigned long long>(_to));
+    linv3_probe::put(_bp,
+                     linv3_probe::S_TASK_OFFSET_VALID,
+                     (_to >= 0 && _to < static_cast<long long>(_pc.num_tiles))
+                         ? 1ull
+                         : 0ull);
+    linv3_probe::put(_bp, linv3_probe::S_NUM_TILES, _pc.num_tiles);
+    linv3_probe::put(_bp, linv3_probe::S_N_REAL, static_cast<unsigned>(N_real));
+    linv3_probe::put(_bp, linv3_probe::S_K, static_cast<unsigned>(K));
+    // my_count: this worker's tasks/iter (only reconstructable here).
+    int const _mc =
+        static_cast<int>(runtime_config.v2_per_sm_task_offsets[blockIdx.x + 1] -
+                         runtime_config.v2_per_sm_task_offsets[blockIdx.x]);
+    linv3_probe::put(_bp, linv3_probe::S_MY_COUNT, static_cast<unsigned>(_mc));
+    linv3_probe::put(_bp,
+                     linv3_probe::S_INSTR_IDX,
+                     static_cast<unsigned>(instruction_index));
+    linv3_probe::put(_bp,
+                     linv3_probe::S_SEQ_IN_ITER,
+                     static_cast<unsigned>(_linv3_seq_in_iter));
+    linv3_probe::put(
+        _bp, linv3_probe::S_ITER_NUM, static_cast<unsigned>(iter_num));
+    unsigned long long const _dep = task_desc->dependent_event;
+    linv3_probe::put(_bp, linv3_probe::S_DEP_EVENT, _dep);
+    linv3_probe::put(_bp,
+                     linv3_probe::S_DEP_EVENT_IDX,
+                     (_dep & 0xFFFFFFFFull)); // low-32b position index (safe)
+    linv3_probe::put(
+        _bp, linv3_probe::S_RAW_PAYLOAD, task_desc->task_metadata.raw_payload);
+    linv3_probe::put(
+        _bp,
+        linv3_probe::S_IN_PTR0,
+        reinterpret_cast<unsigned long long>(task_desc->input_ptrs[0]));
+    linv3_probe::put(
+        _bp,
+        linv3_probe::S_IN_PTR1,
+        reinterpret_cast<unsigned long long>(task_desc->input_ptrs[1]));
+    linv3_probe::put(
+        _bp,
+        linv3_probe::S_OUT_PTR0,
+        reinterpret_cast<unsigned long long>(task_desc->output_ptrs[0]));
+#ifdef MPK_ENABLE_TMA
+    linv3_probe::put(_bp,
+                     linv3_probe::S_A_DESC,
+                     reinterpret_cast<unsigned long long>(
+                         task_desc->input_tma_desc_ptrs[0][0]));
+    linv3_probe::put(_bp,
+                     linv3_probe::S_W_DESC,
+                     reinterpret_cast<unsigned long long>(
+                         task_desc->input_tma_desc_ptrs[1][0]));
+#else
+    linv3_probe::put(_bp, linv3_probe::S_A_DESC, ~0ull); // sentinel: no TMA
+    linv3_probe::put(_bp, linv3_probe::S_W_DESC, ~0ull);
+#endif
+    linv3_probe::put(
+        _bp, linv3_probe::S_NUM_REGIONS, static_cast<unsigned>(_nreg));
+    linv3_probe::put(_bp, linv3_probe::S_SMEM_BAD_MASK, _bad);
+    linv3_probe::mark(
+        _bp, linv3_probe::S_LD_PHASE, linv3_probe::LD_AFTER_META_DUMP);
+  }
+#endif // MPK_V2_LINV3_PROBE
+
+#if defined(MPK_V2_LINV3_SKIP36) || defined(MPK_V2_LINV3_SKIPALL)
+  // NO-OP the target task's loader: preserve only the sync the loader owns.
+  // The codegen loader page-prefix has ALREADY run before this body; at
+  // CROSS_TASK_PAGES=false the loader body owns NO page arrivals (the launcher
+  // task-end sweep frees all pages). So the ONLY thing to preserve here is the
+  // start-of-task re-init (clears stray async arrivals on the reused slot).
+  // Gate on _linv3_skip: worker36/seq==4 under SKIP36, EVERY linear_v3 task
+  // under SKIPALL (identical stub, broader condition).
+  if (_linv3_skip) {
+    ::kernel::linear::reinit_for_role(::kernel::linear::Role::Loader,
+                                      dyn_sem_base);
+#ifdef MPK_V2_LINV3_PROBE
+    linv3_probe::mark(linv3_probe::base(runtime_config),
+                      linv3_probe::S_LD_PHASE,
+                      linv3_probe::LD_SKIP_RETURN);
+#endif
+    return;
+  }
+#endif // MPK_V2_LINV3_SKIP36 || MPK_V2_LINV3_SKIPALL
 
   prefetch_tensormap(W_tmap_ptr);
   prefetch_tensormap(A_tmap_ptr);
 
   extern __shared__ __align__(1024) char smem_ptr[];
-  int const smem = static_cast<int>(__cvta_generic_to_shared(smem_ptr));
+  // 1024-align the dynamic SMEM base so 128B-swizzle W/A TMA destinations land
+  // on the swizzle tile (see aligned_smem_base note above).
+  int const smem = aligned_smem_base(smem_ptr);
 
   // Shape — one place, used by all three roles.
   const TaskCtx c = ctx_from<SPLIT_K, TILES_PER_TASK>(N_real, K, tile_idx);
@@ -330,12 +822,38 @@ __device__ __noinline__ void
   // Loader re-init from CHANNELS reinit_*_by policy (table-driven, Phase 2b).
   ::kernel::linear::reinit_for_role(::kernel::linear::Role::Loader,
                                     dyn_sem_base);
+#ifdef MPK_V2_LINV3_PROBE
+  if (_linv3_hit) {
+    linv3_probe::mark(linv3_probe::base(runtime_config),
+                      linv3_probe::S_LD_PHASE,
+                      linv3_probe::LD_AFTER_REINIT);
+  }
+#endif
 
   mpk::ch::Producer<WChan> pW{Wc};
   mpk::ch::Producer<AChan> pA{Ac};
   // Both ph start at 1 (pre-empty). pW.ph mirrors v2's `mma_phase`.
 
   bool dep_done = false;
+
+#ifdef MPK_V2_LINV3_PROBE
+  // M3 FAULTING-load capture (per-worker, EVERY load). Read the per-worker
+  // WT_BAD_FLAG ONCE before the loop: if a prior task on this worker already
+  // FROZE a bad load, we must not overwrite that record with a later good load,
+  // so start "frozen". Otherwise start unfrozen — the loop then overwrites the
+  // slot with each load (keeping the LAST good load) until it hits a bad one,
+  // which it freezes. Only the elected loader lane runs (elect_sync at entry),
+  // so this is single-writer per worker slot.
+  unsigned long long *const _wt_slot =
+      (task_desc->task_type == mirage::runtime::TASK_LINEAR_SM100_V3)
+          ? linv3_probe::wtma_slot(runtime_config, blockIdx.x)
+          : nullptr;
+  bool _wt_frozen =
+      (_wt_slot != nullptr) &&
+      (_wt_slot[linv3_probe::WT_BAD_FLAG] != linv3_probe::SENTINEL) &&
+      (_wt_slot[linv3_probe::WT_BAD_FLAG] != 0ull);
+  int const _wt_num_loads = c.tiles * c.iters;
+#endif
 
   for (int t = 0; t < c.tiles; t++) {
     int const cur_tile_idx = tile_idx + t;
@@ -371,16 +889,171 @@ __device__ __noinline__ void
                            pW.wait_free());
       int const W_smem = Wr.slot_addr(pW.st); // storage addr from the ring
 
+#ifdef MPK_V2_LINV3_PROBE
+      if (_linv3_hit && t == 0 && i == 0) {
+        linv3_probe::mark(linv3_probe::base(runtime_config),
+                          linv3_probe::S_LD_PHASE,
+                          linv3_probe::LD_BEFORE_FIRST_WTMA);
+      }
+      // ── RAW W-TMA argument capture (M3 FAULTING-load), PER-WORKER, EVERY ──
+      // load. The original probe captured only t==0&&i==0 (the FIRST load) —
+      // which is in-bounds — so it MISSED the faulting later (tail-band N-tile)
+      // load. Now, on EACH cp.async.bulk.tensor W-load, compute the
+      // OOB/misalign check ON DEVICE for THIS load's exact operands and either
+      // FREEZE the first bad one (never overwrite it) or overwrite the slot
+      // with the last good load. Single writer: this loader is the elected lane
+      // (elect_sync() at entry); each put() carries __threadfence_system() so
+      // the host sees it post-fault. WT_COMPLETED is stamped after the RECORDED
+      // load's TMA issue returns (below) — a frozen bad load leaves it SENTINEL
+      // (its issue is the suspected illegal access), pinning the faulter.
+      bool _wt_this_load_recorded = false;
+      unsigned long long _wt_this_bad = 0ull;
+      if (_wt_slot != nullptr && !_wt_frozen) {
+        // Box dims: compile-time constants matching the W descriptor in tma.cuh
+        // (param_id==1): bd = {BK=64, BLOCK_M=128, BLOCK_K/BK=2}.
+        constexpr int _BK = 64;
+        // Source byte-offset the descriptor resolves for (x=0, y=cur_off_m,
+        // z=z_coord): y*rowstride + z*kchunkstride, with gs={K*2, 128}. 64-bit
+        // to avoid overflow for the far tail (cur_off_m*K*2 ~ 129152*14336).
+        long long const _src_off = static_cast<long long>(cur_off_m) *
+                                       (static_cast<long long>(K) * 2) +
+                                   static_cast<long long>(z_coord) * 128;
+        long long const _buf_bytes =
+            static_cast<long long>(N_real) * static_cast<long long>(K) * 2;
+        // The 4 static checks. A box whose TOP coordinate EQUALS the global dim
+        // is fully in-bounds (last valid index = dim-1; box [s, s+bd) with
+        // s+bd==dim covers [dim-bd, dim-1]) — so `> dim` (NOT `>= dim`) is the
+        // correct OOB test. W_SIZE (32768) == the per-load tile bytes.
+        bool const _dst_mis =
+            ((static_cast<unsigned int>(W_smem)) & 1023u) != 0u;
+        bool const _tmap_null = (W_tmap_ptr == nullptr);
+        bool const _row_oob = (cur_off_m + BLOCK_M) > N_real;
+        bool const _kchunk_oob = (z_coord + (BLOCK_K / _BK)) > (K / _BK);
+        bool const _src_oob = (_src_off + W_SIZE) > _buf_bytes;
+        _wt_this_bad =
+            (_dst_mis ? (unsigned long long)linv3_probe::WTBAD_DST_MISALIGN
+                      : 0ull) |
+            (_tmap_null ? (unsigned long long)linv3_probe::WTBAD_TMAP_NULL
+                        : 0ull) |
+            (_row_oob ? (unsigned long long)linv3_probe::WTBAD_ROW_OOB : 0ull) |
+            (_kchunk_oob ? (unsigned long long)linv3_probe::WTBAD_KCHUNK_OOB
+                         : 0ull) |
+            (_src_oob ? (unsigned long long)linv3_probe::WTBAD_SRC_OOB : 0ull);
+        unsigned long long *_wt = _wt_slot;
+        // WT_MAGIC written LAST so "WT_MAGIC present => record complete" holds.
+        linv3_probe::put(
+            _wt,
+            linv3_probe::WT_DST,
+            static_cast<unsigned long long>(static_cast<unsigned int>(W_smem)));
+        linv3_probe::put(_wt,
+                         linv3_probe::WT_TMAP,
+                         reinterpret_cast<unsigned long long>(W_tmap_ptr));
+        linv3_probe::put(_wt, linv3_probe::WT_COORD_X, 0ull);
+        linv3_probe::put(_wt,
+                         linv3_probe::WT_COORD_Y,
+                         static_cast<unsigned long long>(
+                             static_cast<unsigned int>(cur_off_m)));
+        linv3_probe::put(_wt,
+                         linv3_probe::WT_COORD_Z,
+                         static_cast<unsigned long long>(
+                             static_cast<unsigned int>(z_coord)));
+        linv3_probe::put(
+            _wt, linv3_probe::WT_BOX_D0, static_cast<unsigned long long>(_BK));
+        linv3_probe::put(_wt,
+                         linv3_probe::WT_BOX_D1,
+                         static_cast<unsigned long long>(BLOCK_M));
+        linv3_probe::put(_wt,
+                         linv3_probe::WT_BOX_D2,
+                         static_cast<unsigned long long>(BLOCK_K / _BK));
+        linv3_probe::put(
+            _wt,
+            linv3_probe::WT_GMEM_BASE,
+            reinterpret_cast<unsigned long long>(task_desc->input_ptrs[1]));
+        linv3_probe::put(_wt,
+                         linv3_probe::WT_SRC_OFF,
+                         static_cast<unsigned long long>(_src_off));
+        linv3_probe::put(
+            _wt,
+            linv3_probe::WT_N_REAL,
+            static_cast<unsigned long long>(static_cast<unsigned int>(N_real)));
+        linv3_probe::put(
+            _wt,
+            linv3_probe::WT_K,
+            static_cast<unsigned long long>(static_cast<unsigned int>(K)));
+        linv3_probe::put(_wt,
+                         linv3_probe::WT_SEQ_IN_ITER,
+                         static_cast<unsigned long long>(
+                             static_cast<unsigned int>(_linv3_seq_in_iter)));
+        linv3_probe::put(_wt,
+                         linv3_probe::WT_ITER_NUM,
+                         static_cast<unsigned long long>(
+                             static_cast<unsigned int>(iter_num)));
+        // M3 extension fields.
+        linv3_probe::put(_wt,
+                         linv3_probe::WT_LOAD_IDX,
+                         static_cast<unsigned long long>(
+                             static_cast<unsigned int>(t * c.iters + i)));
+        linv3_probe::put(_wt, linv3_probe::WT_BAD_FLAG, _wt_this_bad);
+        linv3_probe::put(_wt,
+                         linv3_probe::WT_SRC_LIMIT,
+                         static_cast<unsigned long long>(_buf_bytes));
+        linv3_probe::put(_wt,
+                         linv3_probe::WT_NUM_LOADS,
+                         static_cast<unsigned long long>(
+                             static_cast<unsigned int>(_wt_num_loads)));
+        // Reset WT_COMPLETED to SENTINEL for THIS newly-recorded load (a prior
+        // good load may have stamped it COMPLETED); the post-issue stamp below
+        // re-sets it iff THIS load's issue returns. Written BEFORE WT_MAGIC.
+        linv3_probe::put(_wt, linv3_probe::WT_COMPLETED, linv3_probe::SENTINEL);
+        linv3_probe::put(
+            _wt, linv3_probe::WT_MAGIC, linv3_probe::WT_SLOT_MAGIC);
+        _wt_this_load_recorded = true;
+        // Freeze on the FIRST bad load so later (good) loads in this task — and
+        // later tasks (via the start-of-loop WT_BAD_FLAG read) — don't clobber
+        // the suspected faulter's operands.
+        if (_wt_this_bad != 0ull) {
+          _wt_frozen = true;
+        }
+      }
+#endif
       // W TMA — v2 order: cp.async.bulk first, expect_tx after.
       tma_3d_load_l2(
           W_smem, W_tmap_ptr, 0, cur_off_m, z_coord, pW.full_mbar(), W_HINT);
       mbarrier_arrive_expect_tx(pW.full_mbar(), W_SIZE);
+#ifdef MPK_V2_LINV3_PROBE
+      // The RECORDED load's W-TMA issue returned without a SYNCHRONOUS fault
+      // from this thread: stamp WT_COMPLETED so the host can tell a survived
+      // load from the faulting one (recorded-but-not-completed). Stamp ONLY
+      // when THIS load is the one just written to the slot (else a good load
+      // after a frozen bad one would wrongly mark the bad record completed).
+      // NOTE: cp.async.bulk.tensor is async — a bad-operand fault can surface
+      // later; the FROZEN operands still pin the bad argument. We do NOT stamp
+      // COMPLETED for a frozen-bad load (it is the suspected illegal access).
+      if (_wt_slot != nullptr && _wt_this_load_recorded &&
+          _wt_this_bad == 0ull) {
+        linv3_probe::put(_wt_slot,
+                         linv3_probe::WT_COMPLETED,
+                         linv3_probe::WT_COMPLETED_MAGIC);
+      }
+      if (_linv3_hit && t == 0 && i == 0) {
+        linv3_probe::mark(linv3_probe::base(runtime_config),
+                          linv3_probe::S_LD_PHASE,
+                          linv3_probe::LD_AFTER_FIRST_WTMA);
+      }
+#endif
 
       // Cross-SM dep wait once (gates A — matches v2's prefetch pattern).
       if (!dep_done) {
         mirage::runtime_v2::wait_task_dependency(
             runtime_config, task_desc, iter_num);
         dep_done = true;
+#ifdef MPK_V2_LINV3_PROBE
+        if (_linv3_hit) {
+          linv3_probe::mark(linv3_probe::base(runtime_config),
+                            linv3_probe::S_LD_PHASE,
+                            linv3_probe::LD_AFTER_DEP_WAIT);
+        }
+#endif
       }
 
       // A TMA — A shares the empty edge (already waited via pW), so no separate
@@ -395,6 +1068,13 @@ __device__ __noinline__ void
       pA.commit_tma();
     }
   }
+#ifdef MPK_V2_LINV3_PROBE
+  if (_linv3_hit) {
+    linv3_probe::mark(linv3_probe::base(runtime_config),
+                      linv3_probe::S_LD_PHASE,
+                      linv3_probe::LD_LOOP_DONE);
+  }
+#endif
   // No end-of-loader drain: blocking on the launcher's final mma_mbar (the
   // shared W/A empty edge) at task end deadlocks against cross-task slot reuse.
   // Stale arrivals are handled by the start-of-task re-init instead.
@@ -410,11 +1090,113 @@ __device__ __noinline__ void
                          int N_real,
                          int K,
                          int tile_idx,
-                         int dyn_sem_base) {
+                         int dyn_sem_base
+#if defined(MPK_V2_LINV3_PROBE) || defined(MPK_V2_LINV3_SKIP36) ||             \
+    defined(MPK_V2_LINV3_SKIPALL)
+                         ,
+                         int _linv3_seq_in_iter,
+                         int _linv3_iter_num,
+                         mirage::runtime::RuntimeConfig const &runtime_config
+#endif
+    ) {
   int const lane_id = threadIdx.x & 31;
 
   extern __shared__ __align__(1024) char smem_ptr[];
-  int const smem = static_cast<int>(__cvta_generic_to_shared(smem_ptr));
+  // 1024-align the dynamic SMEM base (see aligned_smem_base note above). Both
+  // the int `smem` addr (used for the W/A ring + tcgen05.alloc scratch) and the
+  // `char*` taddr readback below derive from this SAME rounded base.
+  int const smem = aligned_smem_base(smem_ptr);
+  char *const smem_aligned_ptr = aligned_smem_ptr(smem_ptr);
+
+#if defined(MPK_V2_LINV3_PROBE) || defined(MPK_V2_LINV3_SKIP36) ||             \
+    defined(MPK_V2_LINV3_SKIPALL)
+  // Compute the gate + the SKIP stub BEFORE the bounds-fail early return: if
+  // the copied-metadata bug is exactly task_offset>=num_tiles, the real body
+  // would take the bounds-fail return (skipping its page sweep + CONSUMER_DONE
+  // arrive = a slot wedge). The SKIP diagnostic must instead run its full sync
+  // skeleton regardless, so it produces a clean vanish/persist verdict, not a
+  // wedge.
+  bool const _linv3_hit = linv3_probe::is_target(_linv3_seq_in_iter, task_desc);
+  bool const _linv3_skip =
+      linv3_probe::should_skip(_linv3_seq_in_iter, task_desc);
+  (void)_linv3_hit;
+  (void)_linv3_skip;
+#endif
+#ifdef MPK_V2_LINV3_PROBE
+  if (_linv3_hit && lane_id == 0) {
+    // Stamp iter FIRST so the phase word is always paired with a fresh iter.
+    linv3_probe::put(linv3_probe::base(runtime_config),
+                     linv3_probe::S_LC_ITER,
+                     static_cast<unsigned>(_linv3_iter_num));
+    linv3_probe::mark(linv3_probe::base(runtime_config),
+                      linv3_probe::S_LC_PHASE,
+                      linv3_probe::LC_BODY_ENTERED);
+  }
+#endif
+
+#if defined(MPK_V2_LINV3_SKIP36) || defined(MPK_V2_LINV3_SKIPALL)
+  // NO-OP the target task's launcher: skip tcgen05.alloc/dealloc + the MMA
+  // loop, but preserve the EXACT op-private + page sync the real body owns so
+  // the consumer + the next slot occupant proceed normally:
+  //   1. lane0 reinit_for_role(Launcher)         — clears strays (LOAD-BEARING:
+  //                                                 re-inits
+  //                                                 SEM_CONSUMER_DONE).
+  //   2. lane0 arrive SEM_TMEM_READY             — the consumer waits it.
+  //   3. lane-parallel release ALL pages (== real body's !Wr.owns(lane) sweep,
+  //      which frees all 14 at PAGES_PER_SLOT=0).
+  //   4. lane0 wait SEM_CONSUMER_DONE            — the consumer arrives it
+  //   x128.
+  //   5. return (no dealloc — no alloc happened).
+  // Gate on _linv3_skip: worker36/seq==4 under SKIP36, EVERY linear_v3 task
+  // under SKIPALL (identical stub, broader condition).
+  if (_linv3_skip) {
+    if (lane_id == 0) {
+      ::kernel::linear::reinit_for_role(::kernel::linear::Role::Launcher,
+                                        dyn_sem_base);
+    }
+    __syncwarp();
+    if (lane_id == 0) {
+      mbarrier_arrive(dyn_sem_base + SEM_TMEM_READY * 8);
+    }
+    __syncwarp();
+#ifdef MPK_V2_LINV3_PROBE
+    if (_linv3_hit && lane_id == 0) {
+      linv3_probe::mark(linv3_probe::base(runtime_config),
+                        linv3_probe::S_LC_PHASE,
+                        linv3_probe::LC_SKIP_TMEM_ARRIVED);
+    }
+#endif
+    // Same page-release condition as the real body's task-end sweep.
+    WChan _Wc;
+    AChan _Ac;
+    WRing _Wr;
+    ARing _Ar;
+    make_wa(smem, dyn_sem_base, task_desc, _Wc, _Ac, _Wr, _Ar);
+    if (lane_id < MAX_SMEM_PAGES_PER_TASK && !_Wr.owns(lane_id)) {
+      mirage::runtime_v2::runtime_finish_page(runtime_smem, lane_id, 1);
+    }
+    __syncwarp();
+#ifdef MPK_V2_LINV3_PROBE
+    if (_linv3_hit && lane_id == 0) {
+      linv3_probe::mark(linv3_probe::base(runtime_config),
+                        linv3_probe::S_LC_PHASE,
+                        linv3_probe::LC_SKIP_PAGES_RELEASED);
+    }
+#endif
+    if (lane_id == 0) {
+      mbarrier_wait(dyn_sem_base + SEM_CONSUMER_DONE * 8, 0);
+    }
+    __syncwarp();
+#ifdef MPK_V2_LINV3_PROBE
+    if (_linv3_hit && lane_id == 0) {
+      linv3_probe::mark(linv3_probe::base(runtime_config),
+                        linv3_probe::S_LC_PHASE,
+                        linv3_probe::LC_SKIP_RETURN);
+    }
+#endif
+    return;
+  }
+#endif // MPK_V2_LINV3_SKIP36 || MPK_V2_LINV3_SKIPALL
 
   const TaskCtx c = ctx_from<SPLIT_K, TILES_PER_TASK>(N_real, K, tile_idx);
   // NOTE page protocol: this early return skips the blanket page-free below,
@@ -428,6 +1210,33 @@ __device__ __noinline__ void
 
   MPK_V2_PROF_SNAPSHOT()
 
+#ifdef MPK_V2_LINV3_PROBE
+  if (_linv3_hit && lane_id == 0) {
+    unsigned long long *_bp = linv3_probe::base(runtime_config);
+    // SCRATCH region — read WITHOUT smem_region_offset() unless present
+    // (guard).
+    if (task_desc->num_smem_regions > ::kernel::linear::REGION_SCRATCH) {
+      mirage::runtime::SmemPageRegionDesc const &_sr =
+          task_desc->smem_regions[::kernel::linear::REGION_SCRATCH];
+      linv3_probe::put(
+          _bp,
+          linv3_probe::S_LC_SCRATCH_OFF,
+          static_cast<unsigned>(_sr.physical_page_start *
+                                    mirage::runtime::TASK_SMEM_PAGE_SIZE +
+                                _sr.byte_offset));
+      linv3_probe::put(_bp,
+                       linv3_probe::S_LC_SCRATCH_PG,
+                       static_cast<unsigned>(_sr.physical_page_start));
+    } else {
+      linv3_probe::put(_bp, linv3_probe::S_LC_SCRATCH_OFF, ~0ull);
+      linv3_probe::put(_bp, linv3_probe::S_LC_SCRATCH_PG, ~0ull);
+    }
+    linv3_probe::put(_bp,
+                     linv3_probe::S_LC_SMEM_BASE_LO12,
+                     static_cast<unsigned>(smem & 0xFFF));
+  }
+#endif
+
   // Launcher re-init from CHANNELS/ONESHOT reinit_*_by policy (table-driven,
   // Phase 2b).
   if (lane_id == 0) {
@@ -435,6 +1244,13 @@ __device__ __noinline__ void
                                       dyn_sem_base);
   }
   __syncwarp();
+#ifdef MPK_V2_LINV3_PROBE
+  if (_linv3_hit && lane_id == 0) {
+    linv3_probe::mark(linv3_probe::base(runtime_config),
+                      linv3_probe::S_LC_PHASE,
+                      linv3_probe::LC_AFTER_REINIT);
+  }
+#endif
 
   // ── TMEM alloc + publish (v2-identical) ─────────────────────────────────
   int const scratch_smem_addr =
@@ -444,11 +1260,27 @@ __device__ __noinline__ void
           scratch_smem_addr),
       "r"(BLOCK_N * 2));
   int const taddr = *reinterpret_cast<int *>(
-      smem_ptr +
+      smem_aligned_ptr +
       task_desc->smem_region_offset(::kernel::linear::REGION_SCRATCH));
+#ifdef MPK_V2_LINV3_PROBE
+  if (_linv3_hit && lane_id == 0) {
+    unsigned long long *_bp = linv3_probe::base(runtime_config);
+    linv3_probe::put(
+        _bp, linv3_probe::S_LC_TADDR, static_cast<unsigned>(taddr));
+    linv3_probe::mark(
+        _bp, linv3_probe::S_LC_PHASE, linv3_probe::LC_AFTER_ALLOC);
+  }
+#endif
   if (lane_id == 0) {
     mbarrier_arrive(dyn_sem_base + SEM_TMEM_READY * 8);
   }
+#ifdef MPK_V2_LINV3_PROBE
+  if (_linv3_hit && lane_id == 0) {
+    linv3_probe::mark(linv3_probe::base(runtime_config),
+                      linv3_probe::S_LC_PHASE,
+                      linv3_probe::LC_TMEM_READY_ARRIVED);
+  }
+#endif
 
   // ── Channels (sync) + rings (storage) + cursors ─────────────────────────
   WChan Wc;
@@ -526,6 +1358,13 @@ __device__ __noinline__ void
       }
     }
   }
+#ifdef MPK_V2_LINV3_PROBE
+  if (_linv3_hit && lane_id == 0) {
+    linv3_probe::mark(linv3_probe::base(runtime_config),
+                      linv3_probe::S_LC_PHASE,
+                      linv3_probe::LC_MMA_LOOP_DONE);
+  }
+#endif
 
   // Reconverge before freeing pages. The MMA loop ran only on the elected
   // lane; under Volta+ ITS the other lanes are not rejoined at the if-block
@@ -543,6 +1382,13 @@ __device__ __noinline__ void
     mirage::runtime_v2::runtime_finish_page(runtime_smem, lane_id, 1);
   }
   __syncwarp();
+#ifdef MPK_V2_LINV3_PROBE
+  if (_linv3_hit && lane_id == 0) {
+    linv3_probe::mark(linv3_probe::base(runtime_config),
+                      linv3_probe::S_LC_PHASE,
+                      linv3_probe::LC_PAGES_RELEASED);
+  }
+#endif
 
   // Wait consumer_done — one-shot, kept raw (matches v2).
   if (lane_id == 0) {
@@ -553,10 +1399,24 @@ __device__ __noinline__ void
         mbarrier_wait(dyn_sem_base + SEM_CONSUMER_DONE * 8, 0));
   }
   __syncwarp();
+#ifdef MPK_V2_LINV3_PROBE
+  if (_linv3_hit && lane_id == 0) {
+    linv3_probe::mark(linv3_probe::base(runtime_config),
+                      linv3_probe::S_LC_PHASE,
+                      linv3_probe::LC_CONSUMER_DONE_WAITED);
+  }
+#endif
 
   asm volatile(
       "tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" ::"r"(taddr),
       "r"(BLOCK_N * 2));
+#ifdef MPK_V2_LINV3_PROBE
+  if (_linv3_hit && lane_id == 0) {
+    linv3_probe::mark(linv3_probe::base(runtime_config),
+                      linv3_probe::S_LC_PHASE,
+                      linv3_probe::LC_AFTER_DEALLOC);
+  }
+#endif
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -574,11 +1434,69 @@ __device__ __noinline__ void
                          int K,
                          int tile_idx,
                          float *workspace,
-                         int dyn_sem_base) {
+                         int dyn_sem_base
+#if defined(MPK_V2_LINV3_PROBE) || defined(MPK_V2_LINV3_SKIP36) ||             \
+    defined(MPK_V2_LINV3_SKIPALL)
+                         ,
+                         int _linv3_seq_in_iter,
+                         int _linv3_iter_num,
+                         mirage::runtime::RuntimeConfig const &runtime_config
+#endif
+    ) {
   int const warp_id = warp_uniform(threadIdx.x / WARP_SIZE);
   int const lane_id = threadIdx.x & 31;
 
   extern __shared__ __align__(1024) char smem_ptr[];
+
+#if defined(MPK_V2_LINV3_PROBE) || defined(MPK_V2_LINV3_SKIP36) ||             \
+    defined(MPK_V2_LINV3_SKIPALL)
+  // Gate + SKIP stub BEFORE the bounds-fail early return (see the launcher
+  // note): a task_offset>=num_tiles metadata bug must still run the full skip
+  // sync skeleton, not take the wedge-prone bounds-fail return.
+  bool const _linv3_hit = linv3_probe::is_target(_linv3_seq_in_iter, task_desc);
+  bool const _linv3_skip =
+      linv3_probe::should_skip(_linv3_seq_in_iter, task_desc);
+  (void)_linv3_hit;
+  (void)_linv3_skip;
+#endif
+#ifdef MPK_V2_LINV3_PROBE
+  if (_linv3_hit && threadIdx.x == 0) {
+    unsigned long long *_bp = linv3_probe::base(runtime_config);
+    // Stamp iter FIRST so the phase word is always paired with a fresh iter.
+    linv3_probe::put(
+        _bp, linv3_probe::S_CN_ITER, static_cast<unsigned>(_linv3_iter_num));
+    linv3_probe::mark(
+        _bp, linv3_probe::S_CN_PHASE, linv3_probe::CN_BODY_ENTERED);
+    linv3_probe::put(_bp,
+                     linv3_probe::S_CN_C_PTR,
+                     reinterpret_cast<unsigned long long>(C_ptr));
+  }
+#endif
+
+#if defined(MPK_V2_LINV3_SKIP36) || defined(MPK_V2_LINV3_SKIPALL)
+  // NO-OP the target task's consumer: the codegen consumer_dep_prefix already
+  // arrived/waited SEM_DEP_READY (do NOT touch it). Preserve only the
+  // op-private handshake the body owns: lane0-of-each-warp waits SEM_TMEM_READY
+  // (the launcher arrives it), then ALL 128 threads arrive SEM_CONSUMER_DONE
+  // (the launcher waits it x128). Skip the taddr read + tcgen05.ld + the
+  // stores. Gate on _linv3_skip: worker36/seq==4 under SKIP36, EVERY linear_v3
+  // task under SKIPALL (identical stub, broader condition).
+  if (_linv3_skip) {
+    if (lane_id == 0) {
+      mbarrier_wait(dyn_sem_base + SEM_TMEM_READY * 8, 0);
+    }
+    __syncwarp();
+    mbarrier_arrive(dyn_sem_base + SEM_CONSUMER_DONE * 8);
+#ifdef MPK_V2_LINV3_PROBE
+    if (_linv3_hit && threadIdx.x == 0) {
+      linv3_probe::mark(linv3_probe::base(runtime_config),
+                        linv3_probe::S_CN_PHASE,
+                        linv3_probe::CN_SKIP_RETURN);
+    }
+#endif
+    return;
+  }
+#endif // MPK_V2_LINV3_SKIP36 || MPK_V2_LINV3_SKIPALL
 
   const TaskCtx c = ctx_from<SPLIT_K, TILES_PER_TASK>(N_real, K, tile_idx);
   if (c.bounds_fail(tile_idx)) {
@@ -597,9 +1515,28 @@ __device__ __noinline__ void
                          mbarrier_wait(dyn_sem_base + SEM_TMEM_READY * 8, 0));
   }
   __syncwarp();
+#ifdef MPK_V2_LINV3_PROBE
+  if (_linv3_hit && threadIdx.x == 0) {
+    linv3_probe::mark(linv3_probe::base(runtime_config),
+                      linv3_probe::S_CN_PHASE,
+                      linv3_probe::CN_TMEM_READY_WAITED);
+  }
+#endif
+  // Read the TMEM addr the launcher published into the SCRATCH region, using
+  // the SAME 1024-rounded base the launcher wrote through (see
+  // aligned_smem_base).
   int const taddr = *reinterpret_cast<int *>(
-      smem_ptr +
+      aligned_smem_ptr(smem_ptr) +
       task_desc->smem_region_offset(::kernel::linear::REGION_SCRATCH));
+#ifdef MPK_V2_LINV3_PROBE
+  if (_linv3_hit && threadIdx.x == 0) {
+    unsigned long long *_bp = linv3_probe::base(runtime_config);
+    linv3_probe::put(
+        _bp, linv3_probe::S_CN_TADDR, static_cast<unsigned>(taddr));
+    linv3_probe::mark(
+        _bp, linv3_probe::S_CN_PHASE, linv3_probe::CN_AFTER_TADDR_READ);
+  }
+#endif
 
   AccChan Acc = make_acc_channel(dyn_sem_base);
   mpk::ch::TmemConsumer<AccChan> cAcc{Acc};
@@ -619,6 +1556,13 @@ __device__ __noinline__ void
                          V2_PROF_GROUP_CONSUMER_PHASE,
                          V2_PROF_MAINLOOP_WAIT,
                          t_col = cAcc.wait_full());
+#ifdef MPK_V2_LINV3_PROBE
+    if (_linv3_hit && threadIdx.x == 0 && t == 0) {
+      linv3_probe::mark(linv3_probe::base(runtime_config),
+                        linv3_probe::S_CN_PHASE,
+                        linv3_probe::CN_BEFORE_FIRST_STORE);
+    }
+#endif
 #ifdef MPK_ENABLE_PROFILING
     // RECONVERGE: in profiling builds the thread-0 timing branch diverges
     // warp 0 (Volta+ ITS doesn't rejoin at the merge) and the tcgen05.ld
@@ -662,12 +1606,33 @@ __device__ __noinline__ void
       }
     }
 
+#ifdef MPK_V2_LINV3_PROBE
+    if (_linv3_hit && threadIdx.x == 0 && t == 0) {
+      linv3_probe::mark(linv3_probe::base(runtime_config),
+                        linv3_probe::S_CN_PHASE,
+                        linv3_probe::CN_AFTER_FIRST_STORE);
+    }
+#endif
     // Release epilogue_mbar (128-thread sync arrival).
     cAcc.release_warp();
   }
+#ifdef MPK_V2_LINV3_PROBE
+  if (_linv3_hit && threadIdx.x == 0) {
+    linv3_probe::mark(linv3_probe::base(runtime_config),
+                      linv3_probe::S_CN_PHASE,
+                      linv3_probe::CN_LOOP_DONE);
+  }
+#endif
 
   // Signal consumer_done (128 threads, sync) — one-shot, kept raw.
   mbarrier_arrive(dyn_sem_base + SEM_CONSUMER_DONE * 8);
+#ifdef MPK_V2_LINV3_PROBE
+  if (_linv3_hit && threadIdx.x == 0) {
+    linv3_probe::mark(linv3_probe::base(runtime_config),
+                      linv3_probe::S_CN_PHASE,
+                      linv3_probe::CN_CONSUMER_DONE_ARRIVED);
+  }
+#endif
 }
 
 } // namespace linear_v3

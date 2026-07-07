@@ -12,6 +12,8 @@ import hashlib
 
 from mirage.mpk.models.deepseek_v3.builder import DeepSeekV3Builder
 from mirage.mpk.models.graph_builder import MirageModelConfig
+from mirage.mpk.persistent_kernel import add_v2_region_smem_plan
+from mirage.mpk.v2_task_schedule import build_v2_worker_task_queues
 
 
 DEFAULT_SAVE_DIR = os.path.join("outputs", "deepseek_v3")
@@ -129,6 +131,11 @@ if __name__ == "__main__":
     parser.add_argument("--disable-vocab-parallel-lm-head", action="store_true",
                         help="Disable the TP vocab-parallel LM head fast path. "
                              "By default it is enabled for TP>1.")
+    parser.add_argument("--use-v2", action="store_true",
+                        help="Use v2 runtime (static per-SM task plan, no "
+                             "scheduler). Assembles the DSv3 decode task graph "
+                             "with v2 role-split tasks (attn/FFN megakernels, "
+                             "AllReduce, tensor_init, tail linear/argmax).")
     parser.add_argument("--output-dir", help="Output files directory")
     parser.add_argument("--trace-name", default="", help="Perfetto trace output name")
     parser.add_argument("--ignore-eos", action="store_true",
@@ -481,6 +488,7 @@ if __name__ == "__main__":
                 f"{args.trace_name}_rank{rank}" if args.trace_name else ""
             ),
             use_cutlass_kernel=True,
+            use_v2_runtime=args.use_v2,
         )
         mpk.ep_size = args.ep_size
         mpk.deepseek_vocab_parallel_lm_head = vocab_parallel_lm_head

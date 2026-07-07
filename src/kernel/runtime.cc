@@ -569,7 +569,9 @@ void register_mugraph(
               task.task_metadata.request_id = bid.x;
             }
             if (task_type == TASK_NVSHMEM_TILE_ALLREDUCE ||
-                task_type == TASK_NVSHMEM_GLOBAL_ARGMAX) {
+                task_type == TASK_NVSHMEM_GLOBAL_ARGMAX ||
+                task_type == TASK_NVSHMEM_TILE_ALLREDUCE_V2 ||
+                task_type == TASK_NVSHMEM_TILE_ALLREDUCE_WITH_RESIDUAL_V2) {
               task.task_metadata.task_offset =
                   bid.x + bid.y * bgraph.grid_dim.x +
                   bid.z * bgraph.grid_dim.x * bgraph.grid_dim.y;
@@ -579,6 +581,11 @@ void register_mugraph(
                 task_type == TASK_LINEAR_WITH_RESIDUAL_SM100_V2 ||
                 task_type == TASK_LINEAR_SM100_V3 ||
                 task_type == TASK_LINEAR_WITH_RESIDUAL_SM100_V3) {
+              task.task_metadata.task_offset = bid.x;
+            }
+            // v2 tail lm_head GEMV: task owns the N-tile at task_offset (=
+            // bid.x); the kernel computes rows [bid.x*BLOCK_N, +BLOCK_N).
+            if (task_type == TASK_DSV3_LMHEAD_GEMV_V2) {
               task.task_metadata.task_offset = bid.x;
             }
             // DSv3 FFN v2 chain: every multi-task op strides its item space
@@ -596,6 +603,14 @@ void register_mugraph(
                 task_type == TASK_DSV3_FFN_MEGA_FG_V2) {
               task.task_metadata.task_offset = bid.x;
             }
+            // DSv3 fused DENSE-MLP megakernel v2 (M5; one task per worker): the
+            // in-op GMEM grid barrier + the W13/W2 GEMV grid-stride index by
+            // the logical CTA id, carried in task_offset (the v2 body reads
+            // task_metadata.task_offset, NOT merge_task_offset). Omitting this
+            // -> garbage CTA index -> grid_barrier deadlock (silent, lethal).
+            if (task_type == TASK_DSV3_DENSE_MLP_FUSED_V2) {
+              task.task_metadata.task_offset = bid.x;
+            }
             // DSv3 ATTN v2 chain: every op strides / indexes its item
             // space by task_offset (= bid.x).
             if (task_type == TASK_DSV3_ATTN_P0_QKVA_V2 ||
@@ -606,6 +621,17 @@ void register_mugraph(
                 task_type == TASK_DSV3_ATTN_WUV_V2 ||
                 task_type == TASK_DSV3_ATTN_OPROJ_V2) {
               task.task_metadata.task_offset = bid.x;
+            }
+            // DSv3 fused ATTN megakernel v2 (Form-2, one task per worker): the
+            // in-op GMEM grid_barrier + the GEMV/BMM grid-stride index by the
+            // logical CTA id, carried in task_offset (NOT merge_task_offset —
+            // that union member is the v1 mega's; the v2 body reads
+            // task_metadata.task_offset). Omitting this -> garbage CTA index ->
+            // grid_barrier deadlock (silent, lethal).
+            if (task_type == TASK_ATTN_BLOCK_MEGAKERNEL_V2) {
+              task.task_metadata.task_offset =
+                  bid.x + bid.y * bgraph.grid_dim.x +
+                  bid.z * bgraph.grid_dim.x * bgraph.grid_dim.y;
             }
             // Initialize input tensors to the task
             for (auto const &input : input_ops) {
@@ -2197,12 +2223,18 @@ TaskGraphResult print_task_graph(
       "TASK_DSV3_DENSE_MLP_FUSED_SM100";
   task_type_to_name[TASK_ATTN_BLOCK_MEGAKERNEL_SM100] =
       "TASK_ATTN_BLOCK_MEGAKERNEL_SM100";
+  task_type_to_name[TASK_ATTN_BLOCK_MEGAKERNEL_V2] =
+      "TASK_ATTN_BLOCK_MEGAKERNEL_V2";
+  task_type_to_name[TASK_DSV3_DENSE_MLP_FUSED_V2] =
+      "TASK_DSV3_DENSE_MLP_FUSED_V2";
   task_type_to_name[TASK_MOE_PERMUTE_SM100] = "TASK_MOE_PERMUTE_SM100";
   task_type_to_name[TASK_MOE_UNPERMUTE_SM100] = "TASK_MOE_UNPERMUTE_SM100";
   task_type_to_name[TASK_TRANSPOSE_SCALE_SM100] = "TASK_TRANSPOSE_SCALE_SM100";
   task_type_to_name[TASK_ASSEMBLE_Q_DECODE_SM100] =
       "TASK_ASSEMBLE_Q_DECODE_SM100";
   task_type_to_name[TASK_TENSOR_INIT] = "TASK_TENSOR_INIT";
+  task_type_to_name[TASK_TENSOR_INIT_V2] = "TASK_TENSOR_INIT_V2";
+  task_type_to_name[TASK_DSV3_LMHEAD_GEMV_V2] = "TASK_DSV3_LMHEAD_GEMV_V2";
   task_type_to_name[TASK_MOE_TOPK_SOFTMAX_SM100] =
       "TASK_MOE_TOPK_SOFTMAX_SM100";
   task_type_to_name[TASK_MOE_TOPK_SIGMOID_SM100] =
@@ -2235,6 +2267,10 @@ TaskGraphResult print_task_graph(
   task_type_to_name[TASK_NVSHMEM_TILE_ALLREDUCE] =
       "TASK_NVSHMEM_TILE_ALLREDUCE";
   task_type_to_name[TASK_NVSHMEM_GLOBAL_ARGMAX] = "TASK_NVSHMEM_GLOBAL_ARGMAX";
+  task_type_to_name[TASK_NVSHMEM_TILE_ALLREDUCE_V2] =
+      "TASK_NVSHMEM_TILE_ALLREDUCE_V2";
+  task_type_to_name[TASK_NVSHMEM_TILE_ALLREDUCE_WITH_RESIDUAL_V2] =
+      "TASK_NVSHMEM_TILE_ALLREDUCE_WITH_RESIDUAL_V2";
 
   TaskRegister *task_register = TaskRegister::get_instance();
   bool has_legacy_task_variants = false;
@@ -2263,6 +2299,31 @@ TaskGraphResult print_task_graph(
   std::map<TaskType, std::set<int>> used_task_variants;
   for (FullTaskDesc const &task_desc : all_tasks) {
     used_task_variants[task_desc.task_type].insert(task_desc.variant_id);
+  }
+  // V2 deadlock guard (build-time). Collect graph-used task types that have a
+  // legacy (v1) body but NO v2 role variant. Under the v2 runtime such a task
+  // hits the consumer role dispatcher's `default: break`, so its per-slot
+  // SEM_DEP_READY is never arrived (the controller only arrives it for
+  // BEGIN_TASK_GRAPH, runtime_v2.cuh) -> the next task reusing that ring slot
+  // spins forever = box wedge (D-state zombies, no graceful degrade). We can't
+  // branch on use_v2_runtime here (print_task_graph emits both v1+v2 dispatch;
+  // the USE_RUNTIME_V2 compile flag selects at runtime), so we just publish the
+  // offending names into the task-graph json; Python compile() raises on a
+  // non-empty list WHEN use_v2_runtime (harmless for v1 builds). Sentinels like
+  // BEGIN_TASK_GRAPH have no legacy body, so the all_task_variants check
+  // excludes them.
+  std::set<std::string> v2_unsafe_task_type_names;
+  for (auto const &kv : used_task_variants) {
+    if (task_register->all_v2_task_role_variants.count(kv.first) > 0) {
+      continue; // has a v2 role variant -> safe under v2
+    }
+    if (task_register->all_task_variants.count(kv.first) == 0) {
+      continue; // no legacy body either (runtime sentinel) -> not a real task
+    }
+    auto name_it = task_type_to_name.find(kv.first);
+    if (name_it != task_type_to_name.end()) {
+      v2_unsafe_task_type_names.insert(name_it->second);
+    }
   }
   bool first_task = true;
   for (auto const &task : task_register->all_task_variants) {
@@ -2327,6 +2388,11 @@ TaskGraphResult print_task_graph(
   code.e("}");
 
   generate_v2_role_dispatch_code(code, task_type_to_name, *task_register);
+
+  // Publish the v2 deadlock-guard list (see the collection loop above). Python
+  // compile() raises on a non-empty list when use_v2_runtime.
+  json_task_graph["v2_unsafe_task_types"] = std::vector<std::string>(
+      v2_unsafe_task_type_names.begin(), v2_unsafe_task_type_names.end());
 
   // Write json to output file
   // std::ofstream out("task_graph.json");

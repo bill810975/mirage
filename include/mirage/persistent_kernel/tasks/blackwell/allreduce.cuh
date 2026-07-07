@@ -747,7 +747,8 @@ static __device__ __forceinline__ void
 //   * flag-before-data:  __syncthreads() + __threadfence_system() BEFORE the
 //     start-flag store; the store itself is st.release.sys → data
 //     happens-before flag, visible to peer GPUs over NVLink (device-scope
-//     __threadfence()/ld.acquire.gpu are TOO WEAK for peer devices — Codex Q1a).
+//     __threadfence()/ld.acquire.gpu are TOO WEAK for peer devices — Codex
+//     Q1a).
 //   * weak-ld_reduce-as-readiness: readiness comes ONLY from the all-8 acquire
 //     of start-flags; the ld_reduce is never treated as its own sync (Q1b).
 //   * ABA / epoch reuse: strictly-monotonic 64-bit per-(CTA,gate) epoch, wait
@@ -807,8 +808,7 @@ static __device__ __forceinline__ void
   unsigned long long *dst = peer_flags + slot_idx;
   // st.release.sys: release-orders all prior stores/fences (incl. the data
   // __threadfence_system()) before this flag becomes visible to peer GPUs.
-  asm volatile("st.release.sys.global.u64 [%0], %1;" ::"l"(dst),
-               "l"(epoch)
+  asm volatile("st.release.sys.global.u64 [%0], %1;" ::"l"(dst), "l"(epoch)
                : "memory");
 }
 
@@ -887,17 +887,17 @@ static __device__ __forceinline__ void
 // as mpkar_nvls_reduce{,_add_residual}_v4_block, but the cross-rank rendezvous
 // is the flat gate pair instead of the dissemination barrier.
 template <typename T, bool ADD_RESIDUAL>
-static __device__ __forceinline__ void mpkar_pt_reduce_v4_block(
-    int4 *__restrict__ dst,
-    int4 const *__restrict__ mc_src,
-    int4 const *__restrict__ residual,
-    int nelems_v4,
-    unsigned long long *flags_base_local,
-    long start_region_off,
-    long end_region_off,
-    int cta,
-    nvshmemi_team_t *teami,
-    unsigned long long epoch) {
+static __device__ __forceinline__ void
+    mpkar_pt_reduce_v4_block(int4 *__restrict__ dst,
+                             int4 const *__restrict__ mc_src,
+                             int4 const *__restrict__ residual,
+                             int nelems_v4,
+                             unsigned long long *flags_base_local,
+                             long start_region_off,
+                             long end_region_off,
+                             int cta,
+                             nvshmemi_team_t *teami,
+                             unsigned long long epoch) {
   int const npes = teami->size;
 
   // --- data-ready fence: local slice globally visible to peer GPUs ---
@@ -989,8 +989,7 @@ __device__ __forceinline__ void
   // the next call uses the next epoch.
   long volatile *sync_counter =
       (long volatile *)mpkar_team_get_sync_counter(teami);
-  unsigned long long const epoch =
-      (unsigned long long)(sync_counter[0]) + 1ULL;
+  unsigned long long const epoch = (unsigned long long)(sync_counter[0]) + 1ULL;
 
   unsigned long long *flags_base_local =
       reinterpret_cast<unsigned long long *>(flags_ptr);
@@ -1073,9 +1072,8 @@ __device__ __forceinline__ void
                                                        row * STRIDE_V4,
                                                    V4_PER_ROW);
       } else {
-        mpkar_nvls_reduce_v4_block<T>(dst_v4 + row * STRIDE_V4,
-                                      src_mc_v4 + row * STRIDE_V4,
-                                      V4_PER_ROW);
+        mpkar_nvls_reduce_v4_block<T>(
+            dst_v4 + row * STRIDE_V4, src_mc_v4 + row * STRIDE_V4, V4_PER_ROW);
       }
     }
     __syncthreads();

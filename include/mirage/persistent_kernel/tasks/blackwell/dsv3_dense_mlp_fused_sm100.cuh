@@ -18,8 +18,10 @@
 //  * extern __shared__ __align__(1024) (megakernel smem convention).
 //  * grid.x == NUM_WORKERS == 136 (barrier participants).
 //  * thread partition DERIVED from blockDim.x (256 production / 512 contract).
-//  * ACTIVATION scales UE8M0 (quant_scale); WEIGHT scales RAW float32 [n>>7][k>>7].
-//  * silu interleave = 384 (6 chunk-pairs): out[c]=silu(y13[cp*768+wc])*y13[cp*768+384+wc].
+//  * ACTIVATION scales UE8M0 (quant_scale); WEIGHT scales RAW float32
+//  [n>>7][k>>7].
+//  * silu interleave = 384 (6 chunk-pairs):
+//  out[c]=silu(y13[cp*768+wc])*y13[cp*768+384+wc].
 // =============================================================================
 #pragma once
 
@@ -32,15 +34,16 @@
 // The harness provides mirage::runtime::{TaskDesc,RuntimeConfig} before it
 // #includes this header. We forward-declare nothing; we use those types.
 
-// ---- MPK grid barrier (semantics VERBATIM from ffn_full_megakernel_sm100.cuh) -
+// ---- MPK grid barrier (semantics VERBATIM from ffn_full_megakernel_sm100.cuh)
+// -
 struct DenseMlpGridBarrier {
   unsigned int *count; // [1] arrivals in the current generation
   unsigned int *gen;   // [1] generation (sense) counter
 };
 
 // Block-collective double-fence barrier; only thread 0 touches global mem.
-__device__ __forceinline__ void
-    dense_mlp_grid_barrier(DenseMlpGridBarrier b, int num_participants) {
+__device__ __forceinline__ void dense_mlp_grid_barrier(DenseMlpGridBarrier b,
+                                                       int num_participants) {
   __syncthreads();
   __threadfence();
   __syncthreads();
@@ -74,7 +77,8 @@ static constexpr int KG1 = HIDDEN / GRP; // 56 (W13 K-groups)
 static constexpr int NB1 = W13_N / GRP;  // 36 (W13 N-blocks)
 static constexpr int KG2 = W2_K / GRP;   // 18 (W2 K-groups)
 static constexpr int NB2 = HIDDEN / GRP; // 56 (W2 N-blocks)
-static constexpr int NUM_WORKERS = 136;  // B200 worker pool (barrier participants)
+static constexpr int NUM_WORKERS =
+    136; // B200 worker pool (barrier participants)
 static constexpr float RMS_EPS = 1e-6f;
 
 // ============================================================================
@@ -141,8 +145,8 @@ __device__ __forceinline__ __half2 dm_f8x2_h2(uint32_t v16) {
       (__nv_fp8x2_storage_t)(v16 & 0xffff), __NV_E4M3);
   return *reinterpret_cast<__half2 *>(&r);
 }
-__device__ __forceinline__ void dm_f8x4_h2(uint32_t v, __half2 &b0,
-                                            __half2 &b1) {
+__device__ __forceinline__ void
+    dm_f8x4_h2(uint32_t v, __half2 &b0, __half2 &b1) {
   b0 = dm_f8x2_h2(v & 0xffff);
   b1 = dm_f8x2_h2((v >> 16) & 0xffff);
 }
@@ -196,7 +200,7 @@ __device__ __forceinline__ void cpasync4(uint32_t smem_addr, void const *gptr) {
                "l"(gptr));
 }
 __device__ __forceinline__ void cpasync16(uint32_t smem_addr,
-                                           void const *gptr) {
+                                          void const *gptr) {
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(smem_addr),
                "l"(gptr));
 }
@@ -422,19 +426,19 @@ __device__ __forceinline__ void
 //  KG = K/128 quant groups (18 for W2). Plain weight-scale load (NO __ldg).
 // ============================================================================
 template <int RBX, int STAGES>
-__device__ __forceinline__ void
-    dgemv_cpa(uint8_t const *__restrict__ a_fp8,
-              float const *__restrict__ a_scale,
-              uint8_t const *__restrict__ w_fp8,
-              float const *__restrict__ w_scale_row,
-              int K,
-              int KG,
-              int n0,
-              int lane,
-              uint32_t *wbuf_base,
-              float *y_out) {
+__device__ __forceinline__ void dgemv_cpa(uint8_t const *__restrict__ a_fp8,
+                                          float const *__restrict__ a_scale,
+                                          uint8_t const *__restrict__ w_fp8,
+                                          float const *__restrict__ w_scale_row,
+                                          int K,
+                                          int KG,
+                                          int n0,
+                                          int lane,
+                                          uint32_t *wbuf_base,
+                                          float *y_out) {
   uint32_t const *a4 = reinterpret_cast<uint32_t const *>(a_fp8);
-  uint32_t const *w4 = reinterpret_cast<uint32_t const *>(w_fp8 + (size_t)n0 * K);
+  uint32_t const *w4 =
+      reinterpret_cast<uint32_t const *>(w_fp8 + (size_t)n0 * K);
   int Kw = K / 4;
   float y[RBX];
 #pragma unroll
@@ -549,7 +553,8 @@ __device__ __noinline__ void dsv3_dense_mlp_fused_task_impl(
   int const nwl = TPB >> 5;            // warps per worker
 
   // GEMV row-block / pipeline stages. RBX_* must divide GRP=128 (the shared
-  // per-N-block weight-scale row is keyed by n0/GRP and shared by all RBX rows).
+  // per-N-block weight-scale row is keyed by n0/GRP and shared by all RBX
+  // rows).
   constexpr int RBX_W13 = 8;
   constexpr int RBX_W2 = 16;
   constexpr int ST_W13 = 4;
@@ -667,8 +672,8 @@ __device__ __noinline__ void dsv3_dense_mlp_fused_task_impl(
     int n0 = idx * RBX_W13;
     float const *ws = w13_scale + (size_t)(n0 / GRP) * KG1;
     float yb[RBX_W13];
-    dgemv_cpa16<RBX_W13, ST_W13>(s_a, s_as, w13, ws, HIDDEN, n0, lane, my_wbuf,
-                                 yb);
+    dgemv_cpa16<RBX_W13, ST_W13>(
+        s_a, s_as, w13, ws, HIDDEN, n0, lane, my_wbuf, yb);
     if (lane == 0) {
 #pragma unroll
       for (int r = 0; r < RBX_W13; r++) {
@@ -736,8 +741,8 @@ __device__ __noinline__ void dsv3_dense_mlp_fused_task_impl(
     int n0 = idx * RBX_W2;
     float const *ws = w2_scale + (size_t)(n0 / GRP) * KG2;
     float yb[RBX_W2];
-    dgemv_cpa<RBX_W2, ST_W2>(s_ifp8, s_iscale, w2, ws, W2_K, KG2, n0, lane,
-                             my_wbuf4, yb);
+    dgemv_cpa<RBX_W2, ST_W2>(
+        s_ifp8, s_iscale, w2, ws, W2_K, KG2, n0, lane, my_wbuf4, yb);
     if (lane == 0) {
 #pragma unroll
       for (int r = 0; r < RBX_W2; r++) {

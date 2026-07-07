@@ -1017,7 +1017,8 @@ __device__ __forceinline__ void router_cpa_drain() {
 // ============================================================================
 //  MPK_DSV3_FFN_WARPSPEC — hand-rolled warp specialization (Runtime-V2
 //  mechanism, self-scheduled; env-gated, default-OFF, default build
-//  byte-identical). Design + Codex review: scratch/warpspec/DESIGN_ffn_warpspec.md
+//  byte-identical). Design + Codex review:
+//  scratch/warpspec/DESIGN_ffn_warpspec.md
 //
 //  Roles (stage 1, MPK_DSV3_FFN_WARPSPEC>=1):
 //    W7  = LOADER. (a) at t0 stages this CTA's 8 router-GEMV weight K-slices
@@ -1080,10 +1081,10 @@ __device__ __forceinline__ int ws_smem_addr(void const *p) {
   return static_cast<int>(__cvta_generic_to_shared(p));
 }
 __device__ __forceinline__ void ws_mbar_init(uint64_t *mbar, int count) {
-  asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(
-                   ws_smem_addr(mbar)),
-               "r"(count)
-               : "memory");
+  asm volatile(
+      "mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(ws_smem_addr(mbar)),
+      "r"(count)
+      : "memory");
 }
 __device__ __forceinline__ void ws_mbar_init_fence() {
   asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
@@ -1122,15 +1123,15 @@ __device__ __forceinline__ bool ws_mbar_poll(uint64_t *mbar, int phase) {
   return ok != 0;
 }
 __device__ __forceinline__ void ws_mbar_arrive(uint64_t *mbar) {
-  asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(
-                   ws_smem_addr(mbar))
-               : "memory");
+  asm volatile(
+      "mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(ws_smem_addr(mbar))
+      : "memory");
 }
 __device__ __forceinline__ void ws_mbar_arrive_cnt(uint64_t *mbar, int count) {
-  asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0], %1;" ::"r"(
-                   ws_smem_addr(mbar)),
-               "r"(count)
-               : "memory");
+  asm volatile(
+      "mbarrier.arrive.shared::cta.b64 _, [%0], %1;" ::"r"(ws_smem_addr(mbar)),
+      "r"(count)
+      : "memory");
 }
 // Partial barrier for the 7 consumer warps (id 1). W7 never touches it.
 __device__ __forceinline__ void ws_bar_consumers() {
@@ -1138,10 +1139,9 @@ __device__ __forceinline__ void ws_bar_consumers() {
                : "memory");
 }
 __device__ __forceinline__ void ws_st_release_u32(uint32_t *p, uint32_t v) {
-  asm volatile("st.release.cta.shared::cta.u32 [%0], %1;" ::"r"(
-                   ws_smem_addr(p)),
-               "r"(v)
-               : "memory");
+  asm volatile(
+      "st.release.cta.shared::cta.u32 [%0], %1;" ::"r"(ws_smem_addr(p)), "r"(v)
+      : "memory");
 }
 __device__ __forceinline__ uint32_t ws_ld_acquire_u32(uint32_t *p) {
   uint32_t v;
@@ -1236,11 +1236,8 @@ __device__ __noinline__ void
 // CTA's 1/NUM_WORKERS slice of [ptr, ptr+bytes); polls `stop` (if non-null)
 // every chunk and returns early once it is set, so the loader never steals
 // bandwidth from the real phase work that follows.
-__device__ __forceinline__ void ws_stream_slice(uint8_t const *ptr,
-                                                size_t bytes,
-                                                int cta,
-                                                int lane,
-                                                uint32_t *stop) {
+__device__ __forceinline__ void ws_stream_slice(
+    uint8_t const *ptr, size_t bytes, int cta, int lane, uint32_t *stop) {
   size_t const total_u4 = bytes >> 4;
   size_t const per_cta = (total_u4 + NUM_WORKERS - 1) / NUM_WORKERS;
   size_t const start = (size_t)cta * per_cta;
@@ -1273,7 +1270,7 @@ __device__ __forceinline__ void ws_stream_slice(uint8_t const *ptr,
     acc ^= a.x ^ b.x ^ c.x ^ d.x;
     if (stop != nullptr) {
       if (__shfl_sync(0xffffffffu,
-                      (lane == 0) ? *(volatile uint32_t *)stop : 0u,
+                      (lane == 0) ? *(uint32_t volatile *)stop : 0u,
                       0) != 0u) {
         stopped = true;
         break;
@@ -1296,11 +1293,8 @@ __device__ __forceinline__ void ws_stream_slice(uint8_t const *ptr,
 // the SAME fp32 accumulation as router_partial_cpa (same per-lane index set
 // u = lane, lane+32, ... ascending; same x/y/z/w pairwise order) => the
 // sc.inter partial is BIT-IDENTICAL to the baseline path.
-__device__ __forceinline__ float
-    ws_router_partial_page(__nv_bfloat16 const *normed,
-                           __nv_bfloat16 const *wpage,
-                           int sp,
-                           int lane) {
+__device__ __forceinline__ float ws_router_partial_page(
+    __nv_bfloat16 const *normed, __nv_bfloat16 const *wpage, int sp, int lane) {
   int const Kc = ROUTER_K / RKSPLIT;
   int const base = sp * Kc;
   uint4 const *nrm4 = reinterpret_cast<uint4 const *>(normed + base);
@@ -1347,17 +1341,16 @@ __device__ __forceinline__ float
 // overlap remainder is winnable). Every stream polls s_topk_done and aborts
 // the moment the consumers' authoritative topk completes, so the loader never
 // competes with the real Phase-1 reads. No shared-state writes, no block syncs.
-__device__ __noinline__ void
-    ws_private_topk_prefetch(float const *inter,
-                             float const *bias_g,
-                             uint8_t const *w13,
-                             uint8_t const *w2,
-                             uint8_t const *wdn,
-                             uint32_t *stop,
-                             int les,
-                             int nle,
-                             int cta,
-                             int lane) {
+__device__ __noinline__ void ws_private_topk_prefetch(float const *inter,
+                                                      float const *bias_g,
+                                                      uint8_t const *w13,
+                                                      uint8_t const *w2,
+                                                      uint8_t const *wdn,
+                                                      uint32_t *stop,
+                                                      int les,
+                                                      int nle,
+                                                      int cta,
+                                                      int lane) {
   // lane l owns experts [l*8, l*8+8)
   float biased[8];
 #pragma unroll
@@ -1460,14 +1453,20 @@ __device__ __noinline__ void
   // Priority 1: routed W2 (consumed in Phase 3, ~20us away).
   for (int s = 0; s < nlocal; s++) {
     ws_stream_slice(w2 + (size_t)local_e[s] * W2_N * W2_K,
-                    (size_t)W2_N * W2_K, cta, lane, stop);
+                    (size_t)W2_N * W2_K,
+                    cta,
+                    lane,
+                    stop);
   }
   // Priority 2: shared down (also Phase 3).
   ws_stream_slice(wdn, (size_t)SH_DN_N * SH_DN_K, cta, lane, stop);
   // Priority 3: routed W13 (consumed the moment topk ends; leftover time only).
   for (int s = 0; s < nlocal; s++) {
     ws_stream_slice(w13 + (size_t)local_e[s] * W13_N * HIDDEN,
-                    (size_t)W13_N * HIDDEN, cta, lane, stop);
+                    (size_t)W13_N * HIDDEN,
+                    cta,
+                    lane,
+                    stop);
   }
 }
 
@@ -1502,11 +1501,8 @@ __device__ __forceinline__ int ws_pipe_nfed(int cta, int w, int n2) {
 
 // Fill one W2 task's page: byte-for-byte the layout dgemv_cpa16_h2's producer
 // side writes for K=512 (SS=1): dst (r*32+lane)*16, src w16[r*32 + lane].
-__device__ __forceinline__ void ws_pipe_fill_w2_page(uint8_t const *w2,
-                                                     int e,
-                                                     int n0,
-                                                     uint32_t page_saddr,
-                                                     int lane) {
+__device__ __forceinline__ void ws_pipe_fill_w2_page(
+    uint8_t const *w2, int e, int n0, uint32_t page_saddr, int lane) {
   uint4 const *w16 = reinterpret_cast<uint4 const *>(
       w2 + (size_t)e * W2_N * W2_K + (size_t)n0 * W2_K);
 #pragma unroll
@@ -1589,7 +1585,7 @@ __device__ __forceinline__ bool ws_p1_all_done(uint32_t *s_p1_done, int lane) {
     d = 1;
 #pragma unroll
     for (int w = 0; w < WS_NUM_CONSUMER_WARPS; w++) {
-      if (*(volatile uint32_t *)&s_p1_done[w] == 0u) {
+      if (*(uint32_t volatile *)&s_p1_done[w] == 0u) {
         d = 0;
       }
     }
@@ -1650,17 +1646,16 @@ __device__ __noinline__ void ws_w2_stream_phase1(uint8_t const *w2,
 // first <=WS_PIPE_PAGES pages. No empty waits (pre-armed) => cannot block on
 // consumer progress; terminates unconditionally (p1_done is released by every
 // consumer before it can reach GB2).
-__device__ __noinline__ void
-    ws_pipe_loader_prefill(uint8_t const *w2,
-                           int const *active_experts,
-                           int n2,
-                           uint32_t *s_p1_done,
-                           uint64_t *s_pipe_full,
-                           uint4 *s_wbuf,
-                           size_t wbuf_u4_per_warp,
-                           int cta,
-                           int lane,
-                           int *next_k) {
+__device__ __noinline__ void ws_pipe_loader_prefill(uint8_t const *w2,
+                                                    int const *active_experts,
+                                                    int n2,
+                                                    uint32_t *s_p1_done,
+                                                    uint64_t *s_pipe_full,
+                                                    uint4 *s_wbuf,
+                                                    size_t wbuf_u4_per_warp,
+                                                    int cta,
+                                                    int lane,
+                                                    int *next_k) {
   int const cwarps = NUM_WORKERS * WS_NUM_CONSUMER_WARPS;
   int remaining = 0;
   int target[WS_NUM_CONSUMER_WARPS];
@@ -1681,7 +1676,7 @@ __device__ __noinline__ void
       if (!seen[w]) {
         uint32_t d = 0;
         if (lane == 0) {
-          d = *(volatile uint32_t *)&s_p1_done[w];
+          d = *(uint32_t volatile *)&s_p1_done[w];
         }
         if (__shfl_sync(0xffffffffu, d, 0) == 0u) {
           continue;
@@ -1708,17 +1703,16 @@ __device__ __noinline__ void
 // Loader window B: poll-based refill of laps >= 1 until every fed task's page
 // has been issued. Bounded buffer: the empty edge is arrived by consumer MACs,
 // which only ever wait on pages this loop is about to fill.
-__device__ __noinline__ void
-    ws_pipe_loader_refill(uint8_t const *w2,
-                          int const *active_experts,
-                          int n2,
-                          uint64_t *s_pipe_full,
-                          uint64_t *s_pipe_empty,
-                          uint4 *s_wbuf,
-                          size_t wbuf_u4_per_warp,
-                          int cta,
-                          int lane,
-                          int *next_k) {
+__device__ __noinline__ void ws_pipe_loader_refill(uint8_t const *w2,
+                                                   int const *active_experts,
+                                                   int n2,
+                                                   uint64_t *s_pipe_full,
+                                                   uint64_t *s_pipe_empty,
+                                                   uint4 *s_wbuf,
+                                                   size_t wbuf_u4_per_warp,
+                                                   int cta,
+                                                   int lane,
+                                                   int *next_k) {
   int const cwarps = NUM_WORKERS * WS_NUM_CONSUMER_WARPS;
   int remaining = 0;
   int nfed[WS_NUM_CONSUMER_WARPS];
@@ -2134,9 +2128,9 @@ __device__ __noinline__ void ffn_full_megakernel_sm100_task_impl(
     router_cpa_drain(); // flush any pending cp.async before grid_barrier
   }
 #endif
-  FFN_WS_TS(3); // post-B (router GEMV)
+  FFN_WS_TS(3);                                // post-B (router GEMV)
   ffn_full_grid_barrier(barrier, NUM_WORKERS); // router partials visible
-  FFN_WS_TS(4); // post-GB1
+  FFN_WS_TS(4);                                // post-GB1
 
   // ====================================================================
   //  Phase C — reduce the RKSPLIT router partials -> bf16 logits, then run
@@ -2343,16 +2337,23 @@ __device__ __noinline__ void ffn_full_megakernel_sm100_task_impl(
       }
     }
     ws_bar_consumers(); // s_gacte/s_gactw visible to the 7 consumer warps
-    FFN_WS_TS(15); // after merge + publish barrier
+    FFN_WS_TS(15);      // after merge + publish barrier
     if (threadIdx.x == 0) {
       ws_st_release_u32(s_topk_done, 1u); // publish to the detoured W7
     }
   } else {
     // W7 detour: private prefetch topk + stop-bounded warm-up streams, then
     // wait the authoritative publish.
-    ws_private_topk_prefetch(sc.inter, bias, w13, w2, wdn, s_topk_done,
-                             local_expert_start, num_local_experts,
-                             worker_idx, lane);
+    ws_private_topk_prefetch(sc.inter,
+                             bias,
+                             w13,
+                             w2,
+                             wdn,
+                             s_topk_done,
+                             local_expert_start,
+                             num_local_experts,
+                             worker_idx,
+                             lane);
     // Gentle spin: a tight ld.acquire loop measurably slowed the consumers'
     // warp-0 merge (SMEM/issue interference); 256ns sleep makes it near-silent
     // while costing W7 at most ~256ns of Phase-1 join latency.
@@ -2531,7 +2532,7 @@ __device__ __noinline__ void ffn_full_megakernel_sm100_task_impl(
     }
   }
   __syncthreads(); // s_gacte/s_gactw visible to all warps in this block
-  FFN_WS_TS(15); // after merge + publish barrier
+  FFN_WS_TS(15);   // after merge + publish barrier
 #endif // MPK_DSV3_FFN_WARPSPEC Phase-C split
 
   // ====================================================================
@@ -2631,12 +2632,20 @@ __device__ __noinline__ void ffn_full_megakernel_sm100_task_impl(
     }
   } else {
 #if !defined(MPK_DSV3_FFN_WS_PIPE_NOFEED)
-    ws_pipe_loader_prefill(w2, active_experts, ws_n2, s_p1_done, s_pipe_full,
-                           s_wbuf, WBUF_U4, worker_idx, lane, ws_next_k);
+    ws_pipe_loader_prefill(w2,
+                           active_experts,
+                           ws_n2,
+                           s_p1_done,
+                           s_pipe_full,
+                           s_wbuf,
+                           WBUF_U4,
+                           worker_idx,
+                           lane,
+                           ws_next_k);
 #elif defined(MPK_DSV3_FFN_WS_W2STREAM)
     (void)ws_next_k;
-    ws_w2_stream_phase1(w2, wdn, active_experts, active_count, s_p1_done,
-                        worker_idx, lane);
+    ws_w2_stream_phase1(
+        w2, wdn, active_experts, active_count, s_p1_done, worker_idx, lane);
 #else
     (void)ws_next_k; // ablation arm: loader idle (isolates the restructure)
 #endif
@@ -2673,7 +2682,7 @@ __device__ __noinline__ void ffn_full_megakernel_sm100_task_impl(
       }
     }
   }
-#endif // MPK_DSV3_FFN_WS_PIPE Phase-1 split
+#endif          // MPK_DSV3_FFN_WS_PIPE Phase-1 split
   FFN_WS_TS(6); // post-1 (W13 + shared GU)
   ffn_full_grid_barrier(barrier, NUM_WORKERS);
   FFN_WS_TS(7); // post-GB2
@@ -2785,8 +2794,15 @@ __device__ __noinline__ void ffn_full_megakernel_sm100_task_impl(
       }
     } else {
 #if !defined(MPK_DSV3_FFN_WS_PIPE_NOFEED)
-      ws_pipe_loader_refill(w2, active_experts, ws_n2, s_pipe_full,
-                            s_pipe_empty, s_wbuf, WBUF_U4, worker_idx, lane,
+      ws_pipe_loader_refill(w2,
+                            active_experts,
+                            ws_n2,
+                            s_pipe_full,
+                            s_pipe_empty,
+                            s_wbuf,
+                            WBUF_U4,
+                            worker_idx,
+                            lane,
                             ws_next_k);
 #endif
     }
@@ -2887,7 +2903,7 @@ __device__ __noinline__ void ffn_full_megakernel_sm100_task_impl(
       }
     }
   }
-#endif // MPK_DSV3_FFN_WS_PIPE Phase-2 split
+#endif          // MPK_DSV3_FFN_WS_PIPE Phase-2 split
   FFN_WS_TS(8); // post-2 (silu + requant)
 
   // ====================================================================
@@ -2917,10 +2933,9 @@ __device__ __noinline__ void ffn_full_megakernel_sm100_task_impl(
         int slot = idx / (W2_N / RBX_W2);
         int n0 = (idx % (W2_N / RBX_W2)) * RBX_W2;
         float ew = active_weights[slot];
-        float const *ws = w2_scale +
-                          static_cast<size_t>(active_experts[slot]) * NB2 *
-                              KG2 +
-                          static_cast<size_t>(n0 / GRP) * KG2;
+        float const *ws =
+            w2_scale + static_cast<size_t>(active_experts[slot]) * NB2 * KG2 +
+            static_cast<size_t>(n0 / GRP) * KG2;
         float yb[RBX_W2];
 #if defined(MPK_DSV3_FFN_WS_PIPE_NOFEED)
         // ablation arm: self-load exactly as baseline (loader idle; my_wbuf
@@ -2928,19 +2943,28 @@ __device__ __noinline__ void ffn_full_megakernel_sm100_task_impl(
         (void)p;
         (void)lap;
         dgemv_cpa16_h2<RBX_W2, ST_W2>(
-            s_ifp8 + static_cast<size_t>(slot) * W2_K, s_iscale + slot * KG2,
-            w2 + static_cast<size_t>(active_experts[slot]) * W2_N * W2_K, ws,
-            W2_K, KG2, n0, lane, my_wbuf, yb);
+            s_ifp8 + static_cast<size_t>(slot) * W2_K,
+            s_iscale + slot * KG2,
+            w2 + static_cast<size_t>(active_experts[slot]) * W2_N * W2_K,
+            ws,
+            W2_K,
+            KG2,
+            n0,
+            lane,
+            my_wbuf,
+            yb);
 #else
-        ws_mbar_wait_parity(&s_pipe_full[wlocal * WS_PIPE_PAGES + p],
-                            lap & 1);
+        ws_mbar_wait_parity(&s_pipe_full[wlocal * WS_PIPE_PAGES + p], lap & 1);
         __syncwarp();
-        uint32_t const page_saddr = __cvta_generic_to_shared(
-            reinterpret_cast<uint8_t *>(my_wbuf) +
-            (size_t)p * WS_PIPE_PAGE_BYTES);
+        uint32_t const page_saddr =
+            __cvta_generic_to_shared(reinterpret_cast<uint8_t *>(my_wbuf) +
+                                     (size_t)p * WS_PIPE_PAGE_BYTES);
         ws_dgemv_page16_h2<RBX_W2>(s_ifp8 + static_cast<size_t>(slot) * W2_K,
-                                   s_iscale + slot * KG2, ws, page_saddr,
-                                   lane, yb);
+                                   s_iscale + slot * KG2,
+                                   ws,
+                                   page_saddr,
+                                   lane,
+                                   yb);
         __syncwarp(); // all lanes done reading the page
         ws_mbar_arrive(&s_pipe_empty[wlocal * WS_PIPE_PAGES + p]);
 #endif
@@ -3024,7 +3048,7 @@ __device__ __noinline__ void ffn_full_megakernel_sm100_task_impl(
       }
     }
   }
-#endif // MPK_DSV3_FFN_WS_PIPE Phase-3 split
+#endif          // MPK_DSV3_FFN_WS_PIPE Phase-3 split
   FFN_WS_TS(9); // post-3 (W2 + shared down)
   ffn_full_grid_barrier(barrier, NUM_WORKERS);
   FFN_WS_TS(10); // post-GB3

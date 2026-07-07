@@ -2040,7 +2040,7 @@ __device__ __noinline__ void attn_block_megakernel_sm100_task_impl(
       my_wbuf);
   ATTN_V1_TS(2); // post qkv_a GEMV (thread0/warp0 granularity — no block sync)
   attn_grid_barrier(barrier, ATTN_NUM_WORKERS); // qkv_a -> layernorm (KEPT)
-  ATTN_V1_TS(3); // post B1
+  ATTN_V1_TS(3);                                // post B1
   // tap S2: qkv_a_out [2176] = [q_a(1536) | c_latent(512) | k_pe(64) | pad(64)]
   ATTN_DBG_TAP("qkv_a_out", out, sc.g_qkva, K_QKVAN, step, worker_idx);
   // DECISIVE: tap the RAW per-slice GEMV outputs BEFORE any norm — q_a slice
@@ -2320,7 +2320,7 @@ __device__ __noinline__ void attn_block_megakernel_sm100_task_impl(
                     ATTN_NUM_WORKERS); // q_b->MLA: publishes g_qpe, kv_cache,
                                        // AND the zeroed flags (the barrier's
                                        // __threadfence does the cross-CTA pub)
-  ATTN_V1_TS(6); // post B2
+  ATTN_V1_TS(6);                       // post B2
   // tap S4/S6: q_nope_pe post-rope [16*576] (the MLA query). Print head-0's
   // nope-start (first 4) + a checksum over all 16 heads.
   ATTN_DBG_TAP(
@@ -2392,7 +2392,7 @@ __device__ __noinline__ void attn_block_megakernel_sm100_task_impl(
                   r1,
                   sm,
                   step); // ends with __syncthreads (publishes acc into tid0)
-      ATTN_V1_TS(7); // post mla_partial (block-converged)
+      ATTN_V1_TS(7);     // post mla_partial (block-converged)
       if (threadIdx.x == 0) {
         __threadfence(); // device release (publish g_mla_acc)
         int old = atomicAdd(&sc.g_head_done[h], 1);
@@ -2442,7 +2442,7 @@ __device__ __noinline__ void attn_block_megakernel_sm100_task_impl(
   ATTN_V1_TS(9); // post W_UV incl. head spin-wait (thread0/warp0 granularity)
   attn_grid_barrier(barrier, ATTN_NUM_WORKERS); // W_UV -> * (KEPT: publishes
                                                 // g_red from all warps)
-  ATTN_V1_TS(10); // post B3
+  ATTN_V1_TS(10);                               // post B3
   // tap S9/S10/S11 RELOCATED here: the W_UV->* barrier above guarantees every
   // head's merge completed (W_UV consumed g_attn_deq), so g_attn is fully
   // visible cross-CTA now.

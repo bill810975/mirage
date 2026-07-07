@@ -731,8 +731,89 @@ __device__ __forceinline__ void
                             int instruction_index,
                             int iter_num);
 
+// ── Debug-only per-worker task breadcrumb (MPK_V2_BREADCRUMB builds only) ────
+// Localizes a context-poisoning cudaErrorIllegalAddress that only reproduces
+// in the full multi-rank megakernel (memcheck can't attribute it under
+// -rdc=true + NVSHMEM cooperative). Writes a STARTED word to host-mapped
+// PINNED memory BEFORE execute_task and mirrors it to a COMPLETED word AFTER.
+// A (worker, role) with STARTED != COMPLETED post-crash was IN FLIGHT when the
+// fault hit — a candidate set, not a proven-unique faulter: an illegal address
+// poisons the whole context, so other concurrently-running tasks also show up.
+// The crash is deterministic, so the CUDA error + a re-run narrow the set.
+// FALSE-NEGATIVE window: the consumer role is 4 warps but only threadIdx.x==0
+// writes the crumb; a fault confined to consumer warps 1-3 AFTER the body's
+// final 128-thread internal barrier reads clean. We deliberately do NOT add a
+// cross-warp barrier in this macro — the single-warp roles (loader/launcher/
+// storer) would deadlock on a 128-thread bar.sync (only 32 threads present),
+// and the consumer bodies already 128-thread-sync internally
+// (SEM_CONSUMER_DONE) so the window is a handful of trailing instructions.
+// Default build (flag unset): all of this compiles to nothing =>
+// byte-identical.
+//
+// Role ids MUST match the readback helper
+// (demo/deepseek_v3/v2_breadcrumb_readback.py) and MPK_V2_BREADCRUMB_ROLES in
+// persistent_kernel_v2.cuh.
+#define MPK_V2_BC_ROLE_CONSUMER 0
+#define MPK_V2_BC_ROLE_LOADER 1
+#define MPK_V2_BC_ROLE_LAUNCHER 2
+#define MPK_V2_BC_ROLE_STORER 3
+#define MPK_V2_BC_ROLE_CONTROLLER 4
+#ifndef MPK_V2_BREADCRUMB_ROLES
+#define MPK_V2_BREADCRUMB_ROLES 5
+#endif
+
+// MPK_MEASURE_ROLE (a separate register-measurement diagnostic) routes ALL
+// warps through ONE role loop; that breaks the single-writer guarantee for the
+// single-warp roles (every warp's lane_id==0 would write the same slot). The
+// two diagnostics are mutually exclusive, so breadcrumbs are inert under it.
+#if defined(MPK_V2_BREADCRUMB) && !defined(MPK_MEASURE_ROLE)
+// STARTED word: [63:40]=iter_num [39:24]=sequence_in_iter [23:8]=task_type
+//               [7:0]=role_id. Written by the single-writer thread selected by
+// writer_pred (the role loop's profiler predicate) with a system-scope fence so
+// the host sees it after the launch errors. writer_pred is passed in — it is
+// the OUTER role-loop macro's parameter, not an identifier in scope here.
+#define MPK_V2_BC_STARTED(role_id, writer_pred)                                \
+  do {                                                                         \
+    if ((writer_pred) && config.breadcrumb_device != nullptr &&                \
+        worker_id < config.breadcrumb_num_slots) {                             \
+      unsigned long long *_bc =                                                \
+          static_cast<unsigned long long *>(config.breadcrumb_device);         \
+      size_t const _idx =                                                      \
+          (static_cast<size_t>(worker_id) * MPK_V2_BREADCRUMB_ROLES +          \
+           (role_id)) *                                                        \
+          2ull;                                                                \
+      unsigned long long const _w =                                            \
+          ((unsigned long long)(iter_num & 0xFFFFFF) << 40) |                  \
+          ((unsigned long long)(sequence_in_iter & 0xFFFF) << 24) |            \
+          ((unsigned long long)(task->task_type & 0xFFFF) << 8) |              \
+          ((unsigned long long)((role_id)&0xFF));                              \
+      _bc[_idx + 0] = _w;                                                      \
+      __threadfence_system();                                                  \
+    }                                                                          \
+  } while (0)
+// COMPLETED word: mirror STARTED so STARTED == COMPLETED means "this task
+// finished". A mid-flight fault leaves COMPLETED holding the PRIOR task's word.
+#define MPK_V2_BC_COMPLETED(role_id, writer_pred)                              \
+  do {                                                                         \
+    if ((writer_pred) && config.breadcrumb_device != nullptr &&                \
+        worker_id < config.breadcrumb_num_slots) {                             \
+      unsigned long long *_bc =                                                \
+          static_cast<unsigned long long *>(config.breadcrumb_device);         \
+      size_t const _idx =                                                      \
+          (static_cast<size_t>(worker_id) * MPK_V2_BREADCRUMB_ROLES +          \
+           (role_id)) *                                                        \
+          2ull;                                                                \
+      _bc[_idx + 1] = _bc[_idx + 0];                                           \
+      __threadfence_system();                                                  \
+    }                                                                          \
+  } while (0)
+#else
+#define MPK_V2_BC_STARTED(role_id, writer_pred)
+#define MPK_V2_BC_COMPLETED(role_id, writer_pred)
+#endif
+
 #define MIRAGE_V2_DEFINE_ROLE_WARP_LOOP(                                       \
-    loop_name, execute_task, prof_group, prof_pred)                            \
+    loop_name, execute_task, prof_group, prof_pred, role_id)                   \
   __device__ __noinline__ void loop_name(                                      \
       RuntimeSMEM *rt, RuntimeConfig const &config, int lane_id) {             \
     int const worker_id = blockIdx.x;                                          \
@@ -744,7 +825,8 @@ __device__ __forceinline__ void
     int sequence_in_iter = 0;                                                  \
     /* profiling: one track per role. The consumer loop runs on 4 warps,  */   \
     /* so its predicate must select warp 0 lane 0 (threadIdx.x == 0);     */   \
-    /* single-warp roles use lane_id == 0.                                */   \
+    /* single-warp roles use lane_id == 0. The breadcrumb reuses the SAME */   \
+    /* prof_pred as its single-writer guard (exactly one thread/worker).  */   \
     MPK_V2_PROF_DECL(prof_group, prof_pred)                                    \
     while (true) {                                                             \
       int const slot = ring_slot(sequence);                                    \
@@ -759,9 +841,11 @@ __device__ __forceinline__ void
         return;                                                                \
       }                                                                        \
       if (task->task_type != TASK_BEGIN_TASK_GRAPH) {                          \
+        MPK_V2_BC_STARTED(role_id, prof_pred);                                 \
         MPK_V2_PROF_START(task->task_type);                                    \
         execute_task(task, config, rt, sequence, iter_num);                    \
         MPK_V2_PROF_END(task->task_type);                                      \
+        MPK_V2_BC_COMPLETED(role_id, prof_pred);                               \
       }                                                                        \
       if (lane_id == 0) {                                                      \
         mbar_arrive(                                                           \
@@ -779,19 +863,23 @@ __device__ __forceinline__ void
 MIRAGE_V2_DEFINE_ROLE_WARP_LOOP(loader_warp_loop,
                                 _execute_loader_task_v2,
                                 V2_PROF_GROUP_LOADER,
-                                (lane_id == 0))
+                                (lane_id == 0),
+                                MPK_V2_BC_ROLE_LOADER)
 MIRAGE_V2_DEFINE_ROLE_WARP_LOOP(launcher_warp_loop,
                                 _execute_launcher_task_v2,
                                 V2_PROF_GROUP_LAUNCHER,
-                                (lane_id == 0))
+                                (lane_id == 0),
+                                MPK_V2_BC_ROLE_LAUNCHER)
 MIRAGE_V2_DEFINE_ROLE_WARP_LOOP(consumer_warp_loop,
                                 _execute_consumer_task_v2,
                                 V2_PROF_GROUP_CONSUMER,
-                                (threadIdx.x == 0))
+                                (threadIdx.x == 0),
+                                MPK_V2_BC_ROLE_CONSUMER)
 MIRAGE_V2_DEFINE_ROLE_WARP_LOOP(storer_warp_loop,
                                 _execute_storer_task_v2,
                                 V2_PROF_GROUP_STORER,
-                                (lane_id == 0))
+                                (lane_id == 0),
+                                MPK_V2_BC_ROLE_STORER)
 
 #undef MIRAGE_V2_DEFINE_ROLE_WARP_LOOP
 
@@ -962,6 +1050,27 @@ __device__ __noinline__ void controller_warp_loop(RuntimeSMEM *rt,
       }
 
       size_t const task_pos = config.v2_per_sm_task_positions[my_offset + i];
+#if defined(MPK_V2_BREADCRUMB) && !defined(MPK_MEASURE_ROLE)
+      // Controller breadcrumb (role 4). Fault sites here: an OOB task_pos
+      // faulting the TaskDesc copy below, or a codegen'd _execute_init_
+      // semaphores_v2. STARTED encodes task_pos (not task_type — not yet
+      // known) so an OOB index is directly visible. Single-writer: lane 0.
+      if (lane_id == 0 && config.breadcrumb_device != nullptr &&
+          worker_id < config.breadcrumb_num_slots) {
+        unsigned long long *_bc =
+            static_cast<unsigned long long *>(config.breadcrumb_device);
+        size_t const _idx =
+            (static_cast<size_t>(worker_id) * MPK_V2_BREADCRUMB_ROLES +
+             MPK_V2_BC_ROLE_CONTROLLER) *
+            2ull;
+        _bc[_idx + 0] =
+            ((unsigned long long)(iter_num & 0xFFFFFF) << 40) |
+            ((unsigned long long)(i & 0xFFFF) << 24) |
+            ((unsigned long long)(task_pos & 0xFFFF) << 8) |
+            ((unsigned long long)(MPK_V2_BC_ROLE_CONTROLLER & 0xFF));
+        __threadfence_system();
+      }
+#endif
       {
         // The controller warp cooperatively copies one TaskDesc from the
         // compiled global task table into the shared-memory ring slot. The
@@ -1035,6 +1144,21 @@ __device__ __noinline__ void controller_warp_loop(RuntimeSMEM *rt,
         mbar_arrive(&rt->instruction_mbarriers[MBAR_INSTRUCTION_ARRIVED][slot]);
       }
       __syncwarp();
+#if defined(MPK_V2_BREADCRUMB) && !defined(MPK_MEASURE_ROLE)
+      // Controller breadcrumb COMPLETED: the per-task fetch+publish (copy +
+      // init_semaphores + arrive) for this slot finished without faulting.
+      if (lane_id == 0 && config.breadcrumb_device != nullptr &&
+          worker_id < config.breadcrumb_num_slots) {
+        unsigned long long *_bc =
+            static_cast<unsigned long long *>(config.breadcrumb_device);
+        size_t const _idx =
+            (static_cast<size_t>(worker_id) * MPK_V2_BREADCRUMB_ROLES +
+             MPK_V2_BC_ROLE_CONTROLLER) *
+            2ull;
+        _bc[_idx + 1] = _bc[_idx + 0];
+        __threadfence_system();
+      }
+#endif
       sequence++;
     }
 

@@ -311,7 +311,53 @@ enum TaskType {
   // num_tasks MUST equal num_workers (same co-residency contract).
   // TASK_SM100_TASK_END shifted 349 -> 350 (placeholder only).
   TASK_DSV3_FFN_MEGA_FG_V2 = 349,
-  TASK_SM100_TASK_END = 350, // SM100 end placeholder, not a real task
+  // v2 (role-split runtime) port of the multi-rank NVSHMEM tile all-reduce
+  // (Step-1 of the DSv3-decode-on-v2 effort). Consumer-only 128-thread body
+  // (blackwell_v2/nvshmem_allreduce_v2.cuh). task_offset = nvshmem team CTA
+  // index (baked in runtime.cc, mirrors the v1 AR). Deliberately OUTSIDE the
+  // TMA range 231..256. TASK_SM100_TASK_END shifted 350 -> 352 (placeholder).
+  TASK_NVSHMEM_TILE_ALLREDUCE_V2 = 350,
+  TASK_NVSHMEM_TILE_ALLREDUCE_WITH_RESIDUAL_V2 = 351,
+  // v2 (role-split runtime) port of the scratch zero-fill (T-A of the
+  // DSv3-decode-on-v2 effort). Consumer-only 128-thread body
+  // (blackwell_v2/tensor_init_v2.cuh); no smem, no cross-warp sync, no
+  // task_offset (a plain per-tile memset, like the v1 tensor_init).
+  // TASK_SM100_TASK_END shifted 352 -> 353 (placeholder only).
+  TASK_TENSOR_INIT_V2 = 352,
+  // v2 (role-split runtime) port of the FUSED decode-attention megakernel
+  // (T-E of the DSv3-decode-on-v2 effort). Megakernel-shape Form-2 task:
+  // num_tasks MUST equal num_workers (== 136; in-op GMEM count-barriers, one
+  // task per worker). Consumer-only 128 physical threads (4 warps) that
+  // A/B-emulate v1's 256-thread block collectives for BIT-EXACT parity, and
+  // call v1's __syncwarp-only GEMV/BMM device functions verbatim. task_offset
+  // = the logical CTA index (baked in runtime.cc, mirrors the v1 mega but via
+  // the v2 task_offset union member, NOT merge_task_offset). Body in
+  // blackwell_v2/attn_block_megakernel_v2.cuh.
+  // TASK_SM100_TASK_END shifted 353 -> 354 (placeholder only).
+  TASK_ATTN_BLOCK_MEGAKERNEL_V2 = 353,
+  // v2 (role-split runtime) port of the FUSED DENSE-MLP decode megakernel (M5
+  // of the DSv3-decode-on-v2 effort). Megakernel-shape Form-2 task: num_tasks
+  // MUST equal num_workers (== 136; ONE in-op GMEM monotonic count-barrier
+  // between W13 and W2, one task per worker). Consumer-only 128 physical
+  // threads (4 warps) — approach (b): the GEMV phases grid-stride over the
+  // physical grid warps (gwarps = num_tasks*128/32) and call the v1 dense
+  // kernel's __syncwarp-only dgemv_cpa16 / dgemv_cpa device functions verbatim
+  // (per-row values bit-identical to v1; the block-local rmsnorm reduces over 4
+  // warps -> high-cosine >=0.999 vs the PyTorch ref, consistent across blocks).
+  // task_offset = the logical CTA index (baked in runtime.cc via the v2
+  // task_offset union member, NOT merge_task_offset). Uses the FREE 354 slot so
+  // TASK_SM100_TASK_END need not shift. Body in
+  // blackwell_v2/dsv3_dense_mlp_fused_v2.cuh.
+  TASK_DSV3_DENSE_MLP_FUSED_V2 = 354,
+  // v2 (role-split runtime) tail lm_head GEMV (M3 decode-blocker fix): a plain
+  // scalar/cp.async bf16 GEMV that replaces the fragile TMA+tcgen05
+  // linear_sm100_v3 lm_head (deep async illegal-address fault). Consumer-only
+  // 128-thread body (blackwell_v2/dsv3_lmhead_gemv_v2.cuh); N-tiled over a
+  // normal grid, task_offset = the N-tile index (baked in runtime.cc, same as
+  // linear_v3 / the FFN v2 chain — NOT merge_task_offset).
+  // TASK_SM100_TASK_END shifted 354 -> 356 (placeholder only).
+  TASK_DSV3_LMHEAD_GEMV_V2 = 355,
+  TASK_SM100_TASK_END = 356, // SM100 end placeholder, not a real task
   TASK_SCHD_TASKS = 200,
   TASK_SCHD_EVENTS = 201,
   TASK_GET_EVENT = 202,
@@ -322,7 +368,7 @@ enum TaskType {
   TASK_NVSHMEM_ALLGATHER_STRIDED_PUT = 301,
   TASK_NVSHMEM_TILE_ALLREDUCE = 302,
   TASK_NVSHMEM_GLOBAL_ARGMAX = 303,
-  TASK_MULTIGPU_TASK_END = 350, // end placeholder, not a real task
+  TASK_MULTIGPU_TASK_END = 356, // end placeholder, not a real task
 };
 
 enum EventType {
@@ -572,6 +618,33 @@ struct RuntimeConfig {
   unsigned long long *v2_iter_go_counter;   // device memory, init 0
   int v2_max_iters; // cap on decode steps (= max_seq_length)
   bool v2_enabled;  // true when launched by launch_persistent_kernel_v2
+  // Debug-only per-worker task breadcrumb (MPK_V2_BREADCRUMB builds only).
+  // Host-mapped PINNED memory (cudaHostAlloc + cudaHostAllocMapped): the
+  // DEVICE pointer stored here is written from worker_v2_kernel with
+  // __threadfence_system() so the crumbs are still readable from the HOST
+  // after the launch returns cudaErrorIllegalAddress (a plain device
+  // cudaMalloc buffer is NOT host-readable post-crash). Layout: two u64 per
+  // (worker,role) — index (w*ROLES+role)*2: [+0] = STARTED word (set BEFORE
+  // execute_task), [+1] = COMPLETED word (mirrors STARTED AFTER execute_task
+  // returns). All 5 roles run concurrently in one block so each needs a private
+  // slot pair. A (worker,role) with STARTED != COMPLETED was IN FLIGHT at crash
+  // — the true faulter is in this candidate set (an illegal address poisons
+  // the whole context, so other concurrently-running tasks also show as
+  // in-flight; the crash is deterministic, so re-running narrows it). Caveat:
+  // the consumer role runs on 4 warps but only threadIdx.x==0 writes the
+  // crumb, so a fault confined to consumer warps 1-3 in the few instructions
+  // after the body's final 128-thread internal barrier can read clean (small
+  // false-negative window). Indexed (w*ROLES+role)*2 + {0,1}. STARTED word
+  // packs, MSB->LSB:
+  //   [63:40] iter_num  [39:24] sequence_in_iter  [23:8] task_type  [7:0] role.
+  // The field is UNCONDITIONAL (like profiler_buffer) so the RuntimeConfig
+  // ABI is identical between the library build and the JIT'd test.cu whether
+  // or not MPK_V2_BREADCRUMB is defined; it is nullptr unless breadcrumbs are
+  // enabled, and all device writes compile out when MPK_V2_BREADCRUMB is unset
+  // => default build byte-identical.
+  void *breadcrumb_device;  // device-visible ptr into the pinned mapping
+  void *breadcrumb_host;    // host ptr for readback + free (host-only)
+  int breadcrumb_num_slots; // == num_workers (0 when disabled)
 };
 
 } // namespace runtime

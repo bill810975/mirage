@@ -178,6 +178,8 @@ public:
                                            std::vector<int> const &params);
   int register_dsv3_ffn_w2_gemv_v2_task(threadblock::Graph const &bgraph,
                                         std::vector<int> const &params);
+  int register_dsv3_lmhead_gemv_v2_task(threadblock::Graph const &bgraph,
+                                        std::vector<int> const &params);
   // Folded 3-op variant (router_quant_rms -> w13_topk -> w2_silu).
   int register_dsv3_ffn_router_quant_rms_v2_task(
       threadblock::Graph const &bgraph, std::vector<int> const &params);
@@ -200,7 +202,7 @@ public:
   int register_dsv3_attn_qb_rope_kv_v2_task(threadblock::Graph const &bgraph,
                                             std::vector<int> const &params);
   int register_dsv3_attn_mla_fused_v2_task(threadblock::Graph const &bgraph,
-                                            std::vector<int> const &params);
+                                           std::vector<int> const &params);
   int register_dsv3_attn_mla_partial_v2_task(threadblock::Graph const &bgraph,
                                              std::vector<int> const &params);
   int register_dsv3_attn_mla_merge_v2_task(threadblock::Graph const &bgraph,
@@ -219,6 +221,8 @@ public:
                                    std::vector<int> const &params);
   int register_tensor_init_task(threadblock::Graph const &bgraph,
                                 std::vector<int> const &params);
+  int register_tensor_init_v2_task(threadblock::Graph const &bgraph,
+                                   std::vector<int> const &params);
   int register_elementwise_add_sm100_task(threadblock::Graph const &bgraph,
                                           std::vector<int> const &params);
   int register_softmax_gather_sm100_task(threadblock::Graph const &bgraph,
@@ -336,6 +340,10 @@ public:
                                                std::vector<int> const &params);
   int register_attn_block_megakernel_sm100_task(
       threadblock::Graph const &bgraph, std::vector<int> const &params);
+  int register_attn_block_megakernel_v2_task(threadblock::Graph const &bgraph,
+                                             std::vector<int> const &params);
+  int register_dsv3_dense_mlp_fused_v2_task(threadblock::Graph const &bgraph,
+                                            std::vector<int> const &params);
   int register_moe_permute_sm100_task(threadblock::Graph const &bgraph,
                                       std::vector<int> const &params);
   int register_moe_unpermute_sm100_task(threadblock::Graph const &bgraph,
@@ -387,6 +395,9 @@ public:
       threadblock::Graph const &bgraph, std::vector<int> const &params);
   int register_nvshmem_tile_allreduce_task(threadblock::Graph const &bgraph,
                                            std::vector<int> const &params);
+  int register_nvshmem_tile_allreduce_v2_task(threadblock::Graph const &bgraph,
+                                              std::vector<int> const &params,
+                                              bool with_residual);
   int register_nvshmem_global_argmax_task(threadblock::Graph const &bgraph,
                                           std::vector<int> const &params);
   // Multi-GPU tasks end

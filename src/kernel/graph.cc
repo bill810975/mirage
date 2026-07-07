@@ -662,6 +662,11 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
         customized->bgraph, params);
     task_config[op] =
         std::make_tuple(9, 1, TASK_DSV3_FFN_W2_GEMV_V2, variant_id);
+  } else if (name == "dsv3_lmhead_gemv_v2") {
+    int variant_id = task_register->register_dsv3_lmhead_gemv_v2_task(
+        customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(2, 1, TASK_DSV3_LMHEAD_GEMV_V2, variant_id);
   } else if (name == "dsv3_attn_p0_qkva_v2") {
     int variant_id = task_register->register_dsv3_attn_p0_qkva_v2_task(
         customized->bgraph, params);
@@ -692,17 +697,15 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
   } else if (name == "dsv3_attn_wuv_v2") {
     int variant_id = task_register->register_dsv3_attn_wuv_v2_task(
         customized->bgraph, params);
-    task_config[op] =
-        std::make_tuple(4, 1, TASK_DSV3_ATTN_WUV_V2, variant_id);
+    task_config[op] = std::make_tuple(4, 1, TASK_DSV3_ATTN_WUV_V2, variant_id);
   } else if (name == "dsv3_attn_oproj_v2") {
     int variant_id = task_register->register_dsv3_attn_oproj_v2_task(
         customized->bgraph, params);
     task_config[op] =
         std::make_tuple(4, 1, TASK_DSV3_ATTN_OPROJ_V2, variant_id);
   } else if (name == "dsv3_ffn_router_quant_rms_v2") {
-    int variant_id =
-        task_register->register_dsv3_ffn_router_quant_rms_v2_task(
-            customized->bgraph, params);
+    int variant_id = task_register->register_dsv3_ffn_router_quant_rms_v2_task(
+        customized->bgraph, params);
     task_config[op] =
         std::make_tuple(6, 1, TASK_DSV3_FFN_ROUTER_QUANT_RMS_V2, variant_id);
   } else if (name == "dsv3_ffn_w13_topk_v2") {
@@ -723,13 +726,19 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
   } else if (name == "dsv3_ffn_mega_v2") {
     int variant_id = task_register->register_dsv3_ffn_mega_v2_task(
         customized->bgraph, params);
-    task_config[op] =
-        std::make_tuple(12, 1, TASK_DSV3_FFN_MEGA_V2, variant_id);
+    task_config[op] = std::make_tuple(12, 1, TASK_DSV3_FFN_MEGA_V2, variant_id);
   } else if (name == "dsv3_ffn_mega_fg_v2") {
     int variant_id = task_register->register_dsv3_ffn_mega_fg_v2_task(
         customized->bgraph, params);
     task_config[op] =
         std::make_tuple(12, 1, TASK_DSV3_FFN_MEGA_FG_V2, variant_id);
+  } else if (name == "dsv3_dense_mlp_fused_v2") {
+    int variant_id = task_register->register_dsv3_dense_mlp_fused_v2_task(
+        customized->bgraph, params);
+    // 7-in/1-out, same ABI as the v1 dense mega (slot [6] now holds the
+    // monotonic u64[2] barrier at the top instead of v1's 8-byte self-reset).
+    task_config[op] =
+        std::make_tuple(7, 1, TASK_DSV3_DENSE_MLP_FUSED_V2, variant_id);
   } else if (name == "splitk_linear_sm100") {
     int variant_id = task_register->register_splitk_linear_sm100_task(
         customized->bgraph, params, false /*with_residual*/);
@@ -762,6 +771,10 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
     int variant_id =
         task_register->register_tensor_init_task(customized->bgraph, params);
     task_config[op] = std::make_tuple(1, 2, TASK_TENSOR_INIT, variant_id);
+  } else if (name == "tensor_init_v2") {
+    int variant_id =
+        task_register->register_tensor_init_v2_task(customized->bgraph, params);
+    task_config[op] = std::make_tuple(1, 2, TASK_TENSOR_INIT_V2, variant_id);
   } else if (name == "moe_topk_softmax_sm100") {
     int variant_id = task_register->register_moe_topk_softmax_sm100_task(
         customized->bgraph, params);
@@ -1130,6 +1143,19 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
     //            address; the write persists across decode steps).
     task_config[op] =
         std::make_tuple(14, 1, TASK_ATTN_BLOCK_MEGAKERNEL_SM100, variant_id);
+  } else if (name == "attn_block_megakernel_v2") {
+    int variant_id = task_register->register_attn_block_megakernel_v2_task(
+        customized->bgraph, params);
+    // v2 (role-split runtime) FUSED attn megakernel — SAME 14-input/1-output
+    // ABI as the v1 attn_block_megakernel_sm100 above; the difference is the
+    // v2 consumer/role dispatch, task_offset (not merge_task_offset), and the
+    // GMEM count-barrier taking a `bar` i64 slot inside `scratch` (input 13).
+    //   inputs:  [0] hidden [1] qkv_a_w [2] qkv_a_s [3] ln_weights [4] q_b_w
+    //            [5] q_b_s [6] cos_sin [7] kv_cache [8] kvbv_w [9] kvbv_s
+    //            [10] oproj_w [11] oproj_s [12] residual [13] scratch.
+    //   output:  [0] out (attn_proj_out).
+    task_config[op] =
+        std::make_tuple(14, 1, TASK_ATTN_BLOCK_MEGAKERNEL_V2, variant_id);
   } else if (name == "moe_permute_sm100") {
     // 4 inputs (input_fp8, input_scale, topk_weights, routing_indices)
     // + 3 outputs (permuted_fp8, permuted_scale, meta-packed-buffer).
@@ -1288,6 +1314,16 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
         customized->bgraph, params);
     task_config[op] =
         std::make_tuple(3, 1, TASK_NVSHMEM_TILE_ALLREDUCE, variant_id);
+  } else if (name == "nvshmem_tile_allreduce_v2") {
+    int variant_id = task_register->register_nvshmem_tile_allreduce_v2_task(
+        customized->bgraph, params, /*with_residual=*/false);
+    task_config[op] =
+        std::make_tuple(1, 1, TASK_NVSHMEM_TILE_ALLREDUCE_V2, variant_id);
+  } else if (name == "nvshmem_tile_allreduce_v2_with_residual") {
+    int variant_id = task_register->register_nvshmem_tile_allreduce_v2_task(
+        customized->bgraph, params, /*with_residual=*/true);
+    task_config[op] = std::make_tuple(
+        2, 1, TASK_NVSHMEM_TILE_ALLREDUCE_WITH_RESIDUAL_V2, variant_id);
   } else if (name == "nvshmem_global_argmax") {
     int variant_id = task_register->register_nvshmem_global_argmax_task(
         customized->bgraph, params);

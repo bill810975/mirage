@@ -238,11 +238,19 @@ class AllReduceStrategy_NvshmemTile(AllReduceStrategy):
                          else "nvshmem_tile_allreduce_pertile")
         elif residual_tensor is None:
             mpk.kn_graph.customized([input_tensor, output_tensor], tb_graph)
-            task_name = "nvshmem_tile_allreduce"
+            task_name = (
+                "nvshmem_tile_allreduce_v2"
+                if getattr(mpk, "use_v2_runtime", False)
+                else "nvshmem_tile_allreduce"
+            )
         else:
             mpk.kn_graph.customized(
                 [input_tensor, residual_tensor, output_tensor], tb_graph)
-            task_name = "nvshmem_tile_allreduce_with_residual"
+            task_name = (
+                "nvshmem_tile_allreduce_v2_with_residual"
+                if getattr(mpk, "use_v2_runtime", False)
+                else "nvshmem_tile_allreduce_with_residual"
+            )
         mpk.kn_graph.register_task(tb_graph, task_name, params)
 
         # We should set NVSHMEM_MAX_TEAMS environment variable
@@ -265,17 +273,38 @@ class AllReduceStrategy_NvshmemTile(AllReduceStrategy):
 def auto_select_allreduce_implementation(
     num_gpus: int,
     device_id: int = 0,
+    use_v2_runtime: bool = False,
 ) -> AllReduceStrategy:
     """
     Automatically select the best AllReduce implementation.
-    
+
     Args:
         num_gpus: Number of GPUs involved in the collective
         device_id: GPU device ID to query capabilities
-        
+        use_v2_runtime: When True (Runtime-V2 megakernel), force the
+            NvshmemTile strategy regardless of the capability probe.
+
     Returns:
         An AllReduceStrategy instance ready to register tasks
     """
+    # Runtime-V2 override: force NvshmemTile. Reasons:
+    #  (1) It is the ONLY AllReduce strategy with a v2 role variant
+    #      (nvshmem_tile_allreduce_v2 / _with_residual_v2). The AllgatherReduce
+    #      path (TASK_NVSHMEM_ALLGATHER_STRIDED_PUT + TASK_REDUCE) has no v2
+    #      body, so under v2 it trips the build-time deadlock guard in
+    #      runtime.cc (its per-slot SEM_DEP_READY is never arrived -> wedge).
+    #  (2) NvshmemTile is residual-correct: it FUSES the post-reduce residual
+    #      add (needed for DSv3 o_proj residual-AllReduce), whereas
+    #      AllgatherReduce silently DROPS the residual tensor.
+    #  (3) The B200 (SM100) target is NVLS/multicast-capable in the real
+    #      mpirun launch; the memoized build-time capability probe can report
+    #      multicast=False (a separate, pre-existing probe inconsistency, NOT
+    #      fixed here), which would otherwise mis-select AllgatherReduce.
+    # The v1 default path below is untouched (byte-identical when use_v2_runtime
+    # is False).
+    if use_v2_runtime:
+        return AllReduceStrategy_NvshmemTile()
+
     capabilities = get_collective_capabilities(num_gpus, device_id)
 
     # For SM >= 90, prefer tile-based allreduce if available

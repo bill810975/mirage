@@ -1949,6 +1949,15 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
 }
 
 extern "C" void finalize_persistent_kernel() {
+#ifdef MPK_V2_BREADCRUMB
+  // Free the host-mapped pinned breadcrumb buffer (allocated in build_v2_plan).
+  if (global_runtime_config.breadcrumb_host != nullptr) {
+    cudaFreeHost(global_runtime_config.breadcrumb_host);
+    global_runtime_config.breadcrumb_host = nullptr;
+    global_runtime_config.breadcrumb_device = nullptr;
+    global_runtime_config.breadcrumb_num_slots = 0;
+  }
+#endif
   gpu_free(global_runtime_config.worker_queue_last_ready_task_id);
   gpu_free(global_runtime_config.sched_queue_last_ready_event_id);
   gpu_free(global_runtime_config.sched_queue_next_free_event_id);

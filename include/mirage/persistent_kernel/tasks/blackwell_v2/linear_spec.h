@@ -94,8 +94,15 @@ inline constexpr int total_smem_bytes() {
   return NUM_STAGES * (W_SIZE + A_SIZE) + SCRATCH_BYTES;
 }
 inline constexpr int PLANNER_CAPACITY_BYTES = 225 * 1024 - 6 * 1024; // 224256
-static_assert(total_smem_bytes() <= PLANNER_CAPACITY_BYTES,
-              "linear SMEM footprint exceeds planner CAPACITY_BYTES");
+// The linear_sm100_v3 loader/launcher round the dynamic SMEM base UP to 1024 so
+// 128B-swizzle W/A TMA destinations land on the swizzle tile (the extern base
+// is only 128-aligned after worker_v2_kernel's static RuntimeSMEM). That
+// rounding consumes up to 1023 bytes of headroom ABOVE this footprint, so the
+// footprint must leave >= 1023 bytes of slack under the planner capacity, not
+// just fit.
+static_assert(total_smem_bytes() + 1023 <= PLANNER_CAPACITY_BYTES,
+              "linear SMEM footprint (+1KB swizzle-alignment slack) exceeds "
+              "planner CAPACITY_BYTES");
 
 // ── Planner feed (host). Region push order defines the REGION_* ordinals. ───
 inline ::mirage::runtime::TaskSmemInfo make_smem_info() {

@@ -64,7 +64,7 @@ template <typename T>
 __device__ __forceinline__ void block_reduce_max_idx_sm100(
     T &val, long long &idx, mirage::runtime::TaskDesc const *task_desc) {
   // Buffer layout: 128-byte aligned idx scratch + tightly-packed val scratch.
-  extern __shared__ char smem[];
+  extern __shared__ __align__(1024) char smem[];
   ArgmaxBuffers<T> bufs(smem, task_desc);
   long long *smem_idxs = bufs.idxs.template ptr<long long>();
   T *smem_vals = bufs.vals.template ptr<T>();

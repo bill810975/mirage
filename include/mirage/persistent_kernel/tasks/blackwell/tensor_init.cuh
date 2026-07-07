@@ -62,8 +62,8 @@ __device__ __forceinline__ void
                 "poison offset must be 16B aligned");
   static_assert(TOTAL_BYTES % 16 == 0, "poison total must be 16B aligned");
   uint8_t *base = static_cast<uint8_t *>(target_ptr);
-  int4 const poison = {(int)0xffffffff, (int)0xffffffff, (int)0xffffffff,
-                       (int)0xffffffff};
+  int4 const poison = {
+      (int)0xffffffff, (int)0xffffffff, (int)0xffffffff, (int)0xffffffff};
   constexpr int VEC0 = POISON_OFFSET_BYTES / 16;
   constexpr int VEC_TOTAL = TOTAL_BYTES / 16;
   int4 *vp = reinterpret_cast<int4 *>(base);

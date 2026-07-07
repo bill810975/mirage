@@ -499,6 +499,35 @@ def attn_block_megakernel_layer(
     # output. kv_cache is read+written IN PLACE through its input slot (a root
     # cuda_tensor's input/output descriptors resolve to the same physical
     # address, so the in-place KV write persists across decode steps).
+    if pk.use_v2_runtime:
+        # v2 (role-split runtime) path: register the Form-2 megakernel-shape
+        # analog `attn_block_megakernel_v2` (=TASK 353). Identical 14-in/1-out
+        # ABI + tensor order; the wrapper hard-codes num_tasks == num_workers
+        # (=136) for the in-op GMEM grid-barrier co-residency contract. The v1
+        # grid_dim/block_dim args are ignored (the v2 grid is (num_tasks,1,1)
+        # / logical consumer width (128,1,1)). `scratch` MUST be sized
+        # ATTN_BLOCK_MEGAKERNEL_SCRATCH_BYTES + 16 (the v2 barrier is 3×u64=24B
+        # at the scratch top vs v1's 8B) — the DSv3 builder handles that under
+        # use_v2_runtime (see _build_mla_attention_megakernel).
+        pk.dsv3_attn_mega_layer(
+            hidden=hidden,
+            qkv_a_w=qkv_a_w,
+            qkv_a_s=qkv_a_s,
+            ln_weights=ln_weights,
+            q_b_w=q_b_w,
+            q_b_s=q_b_s,
+            cos_sin=cos_sin,
+            kv_cache=kv_cache,
+            kvbv_w=kvbv_w,
+            kvbv_s=kvbv_s,
+            oproj_w=oproj_w,
+            oproj_s=oproj_s,
+            residual=residual,
+            out=out,
+            scratch=scratch,
+            num_tasks=pk.num_workers,
+        )
+        return
     tensors = [
         hidden,
         qkv_a_w,

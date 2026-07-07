@@ -229,7 +229,7 @@ __device__ __forceinline__ void multitoken_paged_attention_sm100_task_impl(
     static_assert(AttentionBuffers::TOTAL_BYTES <=
                   mirage::runtime::MAX_DYNAMIC_SHARED_MEMORY_SIZE);
 
-    extern __shared__ char smem[];
+    extern __shared__ __align__(1024) char smem[];
     AttentionBuffers bufs(smem);
 
     T *zero_buf = bufs.zero.template ptr<T>();

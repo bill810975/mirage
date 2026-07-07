@@ -11,15 +11,22 @@
 // blackwell_v2 task implementations, bundled so the v2 megakernel's
 // codegen-emitted role dispatch calls resolve. Each task uses its own
 // namespace to avoid collision with the v1 (kernel::) versions.
-#include "argmax_sm100.cuh"    // kernel::v2
-#include "attention_sm100.cuh" // kernel::v2
-#include "dsv3_ffn_v2.cuh"     // kernel::dsv3_ffn_v2
-#include "dsv3_attn_v2.cuh"    // kernel::dsv3_attn_v2
-#include "embedding_v2.cuh"    // kernel::v2
-#include "linear_sm100_v2.cuh" // kernel::linear_v2
-#include "linear_sm100_v3.cuh" // kernel::linear_v3
+#include "argmax_sm100.cuh"             // kernel::v2
+#include "attention_sm100.cuh"          // kernel::v2
+#include "attn_block_megakernel_v2.cuh" // kernel::attn_block_megakernel_v2
+#include "dsv3_attn_v2.cuh"             // kernel::dsv3_attn_v2
+#include "dsv3_dense_mlp_fused_v2.cuh"  // kernel::dsv3_dense_mlp_v2
+#include "dsv3_ffn_v2.cuh"              // kernel::dsv3_ffn_v2
+#include "dsv3_lmhead_gemv_v2.cuh"      // kernel::dsv3_lmhead_gemv_v2
+#include "embedding_v2.cuh"             // kernel::v2
+#include "linear_sm100_v2.cuh"          // kernel::linear_v2
+#include "linear_sm100_v3.cuh"          // kernel::linear_v3
 #include "mirage/persistent_kernel/runtime_header.h"
+#ifdef USE_NVSHMEM
+#include "nvshmem_allreduce_v2.cuh" // kernel::nvshmem_allreduce_v2
+#endif
 #include "norm_sm100.cuh"          // kernel::v2
 #include "rmsnorm_v2.cuh"          // kernel::rmsnorm_v2
 #include "rotary_embedding_v2.cuh" // kernel::v2
 #include "silu_mul_v2.cuh"         // kernel::v2
+#include "tensor_init_v2.cuh"      // kernel::v2

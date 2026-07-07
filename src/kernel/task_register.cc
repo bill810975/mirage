@@ -17,11 +17,15 @@
 #include "mirage/transpiler/utils.h"
 
 #include "mirage/persistent_kernel/tasks/blackwell_v2/argmax_v2_spec.h"
-#include "mirage/persistent_kernel/tasks/blackwell_v2/dsv3_ffn_v2_spec.h"
+#include "mirage/persistent_kernel/tasks/blackwell_v2/attn_block_megakernel_v2_spec.h"
 #include "mirage/persistent_kernel/tasks/blackwell_v2/dsv3_attn_v2_spec.h"
+#include "mirage/persistent_kernel/tasks/blackwell_v2/dsv3_dense_mlp_fused_v2_spec.h"
+#include "mirage/persistent_kernel/tasks/blackwell_v2/dsv3_ffn_v2_spec.h"
+#include "mirage/persistent_kernel/tasks/blackwell_v2/dsv3_lmhead_gemv_v2_spec.h"
 #include "mirage/persistent_kernel/tasks/blackwell_v2/embedding_v2_spec.h"
 #include "mirage/persistent_kernel/tasks/blackwell_v2/linear_sm100_v2_spec.h"
 #include "mirage/persistent_kernel/tasks/blackwell_v2/linear_spec.h"
+#include "mirage/persistent_kernel/tasks/blackwell_v2/nvshmem_allreduce_v2_spec.h"
 // linear_sm100_v3 reuses linear_sm100_v2's SMEM layout + SEM ordinals
 // verbatim (see HARD CONSTRAINT comment at the top of linear_sm100_v3.cuh).
 // No separate v3 spec is needed — pulling v2's spec for both is the single
@@ -29,6 +33,7 @@
 #include "mirage/persistent_kernel/tasks/blackwell_v2/paged_attention_sm100_v2_spec.h"
 #include "mirage/persistent_kernel/tasks/blackwell_v2/rmsnorm_v2_spec.h"
 #include "mirage/persistent_kernel/tasks/blackwell_v2/silu_mul_v2_spec.h"
+#include "mirage/persistent_kernel/tasks/blackwell_v2/tensor_init_v2_spec.h"
 
 #include <cstdlib>
 #include <stdexcept>
@@ -2231,7 +2236,29 @@ int TaskRegister::register_linear_sm100_v3_task(
         "op_sem_base_addr(runtime_smem, instruction_index));");
   };
 
+  // DIAGNOSTIC (default-OFF => not emitted into the default binary): compute
+  // this worker's seq_in_iter (= instruction_index % my_count) so the
+  // env-gated linear_v3 diagnostics (MPK_V2_LINV3_PROBE / MPK_V2_LINV3_SKIP36 /
+  // MPK_V2_LINV3_SKIPALL, see linear_sm100_v3.cuh) can gate on
+  // blockIdx.x==36 && seq_in_iter==4 (PROBE/SKIP36) or on every linear_v3 task
+  // (SKIPALL, which ignores seq_in_iter). The
+  // local + the trailing role-fn args are wrapped in a preprocessor guard so
+  // the DEFAULT build is byte-identical (the role fns don't even declare the
+  // extra params unless a gate macro is defined). runtime_config,
+  // instruction_index, blockIdx are all in scope in the role dispatcher.
+  auto emit_linv3_seq_local = [&](mirage::transpiler::CodeKeeper &c) {
+    c.e("#if defined(MPK_V2_LINV3_PROBE) || defined(MPK_V2_LINV3_SKIP36) || "
+        "defined(MPK_V2_LINV3_SKIPALL)");
+    c.e("int const _linv3_my_count = static_cast<int>("
+        "runtime_config.v2_per_sm_task_offsets[blockIdx.x + 1] - "
+        "runtime_config.v2_per_sm_task_offsets[blockIdx.x]);");
+    c.e("int const _linv3_seq_in_iter = (_linv3_my_count > 0) ? "
+        "(instruction_index % _linv3_my_count) : -1;");
+    c.e("#endif");
+  };
+
   auto emit_v3_loader = [&](mirage::transpiler::CodeKeeper &c) {
+    emit_linv3_seq_local(c);
     c.e("::kernel::linear_v3::linear_loader_task<$, 0, $>(",
         split_k,
         tiles_per_task);
@@ -2247,10 +2274,16 @@ int TaskRegister::register_linear_sm100_v3_task(
         tiles_per_task);
     c.e("    instruction_index,");
     c.e("    iter_num,");
-    c.e("    op_sem_base_addr(runtime_smem, instruction_index));");
+    c.e("    op_sem_base_addr(runtime_smem, instruction_index)");
+    c.e("#if defined(MPK_V2_LINV3_PROBE) || defined(MPK_V2_LINV3_SKIP36) || "
+        "defined(MPK_V2_LINV3_SKIPALL)");
+    c.e("    , _linv3_seq_in_iter");
+    c.e("#endif");
+    c.e("    );");
   };
 
   auto emit_v3_launcher = [&](mirage::transpiler::CodeKeeper &c) {
+    emit_linv3_seq_local(c);
     c.e("::kernel::linear_v3::linear_launcher_task<$, $>(",
         split_k,
         tiles_per_task);
@@ -2259,10 +2292,16 @@ int TaskRegister::register_linear_sm100_v3_task(
     c.e("    $, $,", N_real, K);
     c.e("    static_cast<int>(task_desc->task_metadata.task_offset) * $,",
         tiles_per_task);
-    c.e("    op_sem_base_addr(runtime_smem, instruction_index));");
+    c.e("    op_sem_base_addr(runtime_smem, instruction_index)");
+    c.e("#if defined(MPK_V2_LINV3_PROBE) || defined(MPK_V2_LINV3_SKIP36) || "
+        "defined(MPK_V2_LINV3_SKIPALL)");
+    c.e("    , _linv3_seq_in_iter, iter_num, runtime_config");
+    c.e("#endif");
+    c.e("    );");
   };
 
   auto emit_v3_consumer = [&](mirage::transpiler::CodeKeeper &c) {
+    emit_linv3_seq_local(c);
     c.e("::kernel::linear_v3::linear_consumer_task<$, $, $, $>(",
         true_or_false,
         m_real,
@@ -2275,7 +2314,12 @@ int TaskRegister::register_linear_sm100_v3_task(
     c.e("    static_cast<int>(task_desc->task_metadata.task_offset) * $,",
         tiles_per_task);
     c.e("    $,", split_k_arg);
-    c.e("    op_sem_base_addr(runtime_smem, instruction_index));");
+    c.e("    op_sem_base_addr(runtime_smem, instruction_index)");
+    c.e("#if defined(MPK_V2_LINV3_PROBE) || defined(MPK_V2_LINV3_SKIP36) || "
+        "defined(MPK_V2_LINV3_SKIPALL)");
+    c.e("    , _linv3_seq_in_iter, iter_num, runtime_config");
+    c.e("#endif");
+    c.e("    );");
   };
 
   // Variant key = consumer body (residual / non-residual / dim distinct).
@@ -2727,6 +2771,132 @@ int TaskRegister::register_tensor_init_task(threadblock::Graph const &bgraph,
     code.e("}"); // close the `if (step==0)` step-0 zero guard.
   }
   return register_task_variant(TASK_TENSOR_INIT, code.to_string());
+}
+
+int TaskRegister::register_tensor_init_v2_task(threadblock::Graph const &bgraph,
+                                               std::vector<int> const &params) {
+  // v2 (role-split runtime) port of register_tensor_init_task.
+  //
+  // params: empty (default, unguarded — the historical always-zero form) OR
+  //   [1] => skip_after_step0: wrap ONLY the zero-fill body in a runtime
+  //   `if (runtime_config.step[0] == 0)` guard, so the buffer is fully zeroed
+  //   on decode step 0 (cudaMalloc garbage) and the zero-fill is a NO-OP on
+  //   every step>=1. The cross-SM dep-wait prefix (consumer_dep_prefix ->
+  //   SEM_DEP_READY arrive) and the role-loop's INSTRUCTION_FINISHED arrive +
+  //   the controller's event trigger are ALL kept UNGUARDED (the task still
+  //   fully participates in the v2 protocol every step — only the memset body
+  //   is skipped), so no ring slot wedges and no downstream event under-counts.
+  //
+  //   REQUIRED (not just a perf lever) for the v2 attn-block megakernel scratch
+  //   (builder.py ~L1803): that scratch's top 24 bytes hold the attn mega's
+  //   MONOTONIC GMEM grid-barrier counters (attn_v2_grid_barrier: need =
+  //   num_tasks*(iter+1), NEVER self-reset — attn_block_megakernel_v2.cuh:127).
+  //   Those counters MUST PERSIST/accumulate across decode steps. The v1 attn
+  //   barrier self-reset (count/gen sense) so re-zeroing was harmless and the
+  //   skip was pure perf; the v2 port rebuilt it monotonic, so re-zeroing the
+  //   counter on step>=1 resets it to 0 while the wait target keeps growing
+  //   (num_tasks*(iter+1)) -> the iter-1 barrier reaches only num_tasks
+  //   arrivals < 2*num_tasks -> EVERY worker spins forever at the first grid
+  //   barrier (iter-0-fine, iter-1-hang). Honoring the skip here is the
+  //   correctness fix.
+  //
+  //   The guarded form is a DISTINCT code string => a distinct deduped variant,
+  //   so the default (empty-params) callers stay byte-identical.
+  //
+  // NOTE (poison lever): params[0]==2 (v1's poison-after-step0 correctness
+  // gate)
+  //   is intentionally NOT ported to v2 — it is a v1-only diagnostic harness.
+  //
+  // Arity mirrors v1 tensor_init exactly (1 input, 2 outputs):
+  //   input_ops[0]  = dummy dep (not read)
+  //   output_ops[0] = the buffer this task zeroes
+  //   output_ops[1] = dummy dep edge (not written)
+  assert(params.size() == 0 || (params.size() == 1 && params[0] == 1));
+  bool skip_after_step0 = (params.size() == 1 && params[0] == 1);
+  std::vector<tb::TBInputOp *> input_ops;
+  std::vector<tb::TBInputOp *> output_ops;
+  int num_inputs = 1;
+  int num_outputs = 2;
+  assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops.size() < (size_t)num_inputs) {
+      input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+  // The buffer to zero is output_ops[0] (the same as v1). Row stride from
+  // dtensor.stride[0] (P1/P2 invariant), not dim[1].
+  assert(output_ops[0]->dtensor.num_dims == 2);
+  int batch_size = output_ops[0]->output_tensors[0].dim[0];
+  int output_size = output_ops[0]->output_tensors[0].dim[1];
+  int output_stride = output_ops[0]->dtensor.stride[0];
+  // BYTE-EXACT, DTYPE-AGNOSTIC: dim/stride are element counts in the TARGET's
+  // OWN dtype. The v2 body is byte-typed, so scale by the dtype size — this
+  // makes the int64[2] FFN-mega barrier (`_ffn_bar`: dim[1]=2 int64 = 16 bytes)
+  // zero the full 16 bytes instead of the 4 bytes the old bf16-typed body
+  // (OUTPUT_SIZE=2) would have addressed, and is identical to the bf16 path
+  // (dtype_size==2) for the attn/ffn scratch.
+  size_t dtype_size =
+      mirage::type::get_datatype_size(output_ops[0]->dtensor.data_type);
+  assert(dtype_size > 0);
+  int row_bytes = output_size * static_cast<int>(dtype_size);
+  int row_stride_bytes = output_stride * static_cast<int>(dtype_size);
+
+  // Emits the zero-fill. When skip_after_step0 is set, the memset is wrapped in
+  // a runtime `if (runtime_config.step[0] == 0)` guard (uniform across all
+  // participating CTAs — step is per-launch, not per-CTA — so the whole memset
+  // is a no-op on steps>=1, never a divergent skip). This guards ONLY the
+  // memset; the caller emits the dep-wait prefix (and the role loop arrives
+  // FINISHED + the controller triggers the event) UNGUARDED, so the task still
+  // fully participates in the v2 protocol every step.
+  auto emit_body = [&](mirage::transpiler::CodeKeeper &c) {
+    if (skip_after_step0) {
+      c.e("if (runtime_config.step[0] == 0) {");
+    }
+    c.e("kernel::v2::tensor_init_zero_v2_task_impl<$, $, $>(",
+        /*BATCH_SIZE=*/batch_size,
+        /*ROW_BYTES=*/row_bytes,
+        /*ROW_STRIDE_BYTES=*/row_stride_bytes);
+    c.e("    task_desc->output_ptrs[0]);");
+    if (skip_after_step0) {
+      c.e("}");
+    }
+  };
+
+  // Plain-shape variant (v1-dispatch string; unused in a v2 build because the
+  // v2 role dispatch takes over, but kept for symmetry with every other v2
+  // task).
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  emit_body(code);
+  int const variant =
+      register_task_variant(TASK_TENSOR_INIT_V2, code.to_string());
+
+  // Consumer role body: dep-wait prefix (cross-SM dep + per-slot SEM_DEP_READY
+  // arrival — the §1.1 no-fallback invariant: EVERY v2 task type MUST run this
+  // prefix or the next task reusing the ring slot deadlocks) then the
+  // 128-thread zero-fill. The prefix is UNGUARDED so the SEM_DEP_READY arrival
+  // (and the role loop's INSTRUCTION_FINISHED arrive + the controller's event
+  // trigger) happen every step even when skip_after_step0 no-ops the memset. No
+  // loader/launcher/storer/init bodies — tensor_init is consumer-only, so those
+  // roles no-op and go on to the next task.
+  mirage::transpiler::CodeKeeper consumer_code;
+  consumer_code.inc_indent();
+  emit_dep_wait_consumer_prefix(consumer_code);
+  emit_body(consumer_code);
+  register_v2_task_role_variant(
+      TASK_TENSOR_INIT_V2,
+      variant,
+      TaskRoleVariantCode{/*init_semaphores=*/"",
+                          /*loader=*/"",
+                          /*launcher=*/"",
+                          /*consumer=*/consumer_code.to_string(),
+                          /*storer=*/""});
+  register_variant_smem_info(
+      TASK_TENSOR_INIT_V2, variant, ::kernel::tensor_init_v2::make_smem_info());
+  return variant;
 }
 
 int TaskRegister::register_elementwise_add_sm100_task(
@@ -5285,6 +5455,103 @@ int TaskRegister::register_nvshmem_tile_allreduce_task(
   return register_task_variant(TASK_NVSHMEM_TILE_ALLREDUCE, c.to_string());
 }
 
+// v2 (role-split runtime) port of the tile all-reduce. Registered as a
+// CONSUMER-ONLY v2 task (128-thread body,
+// blackwell_v2/nvshmem_allreduce_v2.cuh) — the consumer role runs on exactly
+// W0-3 (threadIdx.x 0..127), which is what the 128-thread-safe body assumes.
+// The runtime bakes task_offset per-CTA (runtime.cc), so each of the hidden/128
+// single-CTA instances carries its own nvshmem team index; the round-robin
+// scheduler spreads them across workers. GMEM-only (no SMEM regions).
+int TaskRegister::register_nvshmem_tile_allreduce_v2_task(
+    threadblock::Graph const &bgraph,
+    std::vector<int> const &params,
+    bool with_residual) {
+  // params[0]: num_gpus, params[1]: my_gpu_id (unused here; the team mapping
+  // travels via task_offset + runtime_config.nvshmem_teams, like the v1 AR).
+  assert(params.size() == 2);
+  std::vector<tb::TBInputOp *> input_ops;
+  std::vector<tb::TBInputOp *> output_ops;
+  int const num_outputs = 1;
+  int const num_inputs =
+      static_cast<int>(bgraph.operators.size()) - num_outputs;
+  int const reduce_inputs = with_residual ? 2 : 1;
+  assert(num_inputs == reduce_inputs);
+  assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops.size() < (size_t)num_inputs) {
+      input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+  assert(input_ops[0]->input_map.x == 1 && input_ops[0]->input_map.y == -1 &&
+         input_ops[0]->input_map.z == -1);
+  if (with_residual) {
+    assert(input_ops[1]->input_map.x == 1 && input_ops[1]->input_map.y == -1 &&
+           input_ops[1]->input_map.z == -1);
+  }
+  assert(input_ops[0]->output_tensors[0].num_dims == 2);
+  int const batch_size = input_ops[0]->output_tensors[0].dim[0];
+  int const output_size = input_ops[0]->output_tensors[0].dim[1];
+  int const input_stride = static_cast<int>(input_ops[0]->dtensor.stride[0]);
+  int const output_stride = input_stride;
+
+  runtime::TaskType const tt =
+      with_residual ? TASK_NVSHMEM_TILE_ALLREDUCE_WITH_RESIDUAL_V2
+                    : TASK_NVSHMEM_TILE_ALLREDUCE_V2;
+
+  auto emit_body = [&](mirage::transpiler::CodeKeeper &c) {
+    if (with_residual) {
+      c.e("kernel::nvshmem_allreduce_v2::"
+          "nvshmem_tile_allreduce_v2_with_residual<__nv_bfloat16, $, $, $>(",
+          batch_size,
+          output_size,
+          output_stride);
+      c.e("  task_desc->input_ptrs[0],");
+      c.e("  task_desc->input_ptrs[1],");
+    } else {
+      c.e("kernel::nvshmem_allreduce_v2::"
+          "nvshmem_tile_allreduce_v2<__nv_bfloat16, $, $, $>(",
+          batch_size,
+          output_size,
+          output_stride);
+      c.e("  task_desc->input_ptrs[0],");
+    }
+    c.e("  task_desc->output_ptrs[0],");
+    c.e("  runtime_config.nvshmem_teams,");
+    c.e("  task_desc->task_metadata.task_offset,");
+    c.e("  runtime_config.qo_indptr_buffer[MPK_MAX_NUM_BATCHED_REQUESTS]);");
+  };
+
+  // Plain-shape variant (v1-dispatch fallback string; unused in a v2 build
+  // because the v2 role dispatch takes over, but kept for symmetry with every
+  // other v2 task).
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  emit_body(code);
+  int const variant = register_task_variant(tt, code.to_string());
+
+  // Consumer role body: dep-wait prefix (cross-SM dep + per-slot SEM_DEP_READY)
+  // then the 128-thread AR impl. No loader/launcher/storer/init bodies — the AR
+  // is consumer-only, so those roles no-op (they go on to the next task).
+  mirage::transpiler::CodeKeeper consumer_code;
+  consumer_code.inc_indent();
+  emit_dep_wait_consumer_prefix(consumer_code);
+  emit_body(consumer_code);
+  register_v2_task_role_variant(
+      tt,
+      variant,
+      TaskRoleVariantCode{/*init_semaphores=*/"",
+                          /*loader=*/"",
+                          /*launcher=*/"",
+                          /*consumer=*/consumer_code.to_string(),
+                          /*storer=*/""});
+  register_variant_smem_info(
+      tt, variant, ::kernel::nvshmem_allreduce_v2::make_smem_info());
+  return variant;
+}
+
 int TaskRegister::register_nvshmem_global_argmax_task(
     threadblock::Graph const &bgraph, std::vector<int> const &params) {
   // params[0]: num_gpus
@@ -7201,6 +7468,116 @@ int TaskRegister::register_attn_block_megakernel_sm100_task(
                                code.to_string());
 }
 
+// v2 (role-split runtime) FUSED attn megakernel (Form-2). params = [] (the
+// EP/TP shape is implicit in the ABI; step from runtime_config). Consumer-only
+// 128-thread body — NO multi_role fan-out (the correctness-first bit-exact
+// first cut; the 7-warp path is a perf follow-on). num_tasks == num_workers is
+// enforced host-side by the persistent_kernel.py wrapper (co-residency contract
+// for the in-op GMEM grid barriers). The body reads task_offset (the logical
+// CTA id, baked in runtime.cc's task_offset=bid.x block for this type), the
+// task's num_tasks (== grid.x), iter_num (the monotonic decode-step counter for
+// the GMEM barrier target), and runtime_config (step[0]).
+int TaskRegister::register_attn_block_megakernel_v2_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  assert(params.size() == 0);
+  int const num_tasks = (int)bgraph.grid_dim.x;
+
+  auto emit_body = [&](mirage::transpiler::CodeKeeper &c) {
+    c.e("kernel::attn_block_megakernel_v2::"
+        "attn_block_megakernel_v2_task_impl(");
+    c.e("    task_desc,");
+    c.e("    static_cast<int>(task_desc->task_metadata.task_offset),");
+    c.e("    $,", num_tasks);
+    c.e("    iter_num,");
+    c.e("    runtime_config);");
+  };
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  emit_body(code);
+  int variant =
+      register_task_variant(TASK_ATTN_BLOCK_MEGAKERNEL_V2, code.to_string());
+
+  // §1.1 LETHAL INVARIANT: the consumer body MUST begin with the cross-SM
+  // dep-wait prefix (a bodyless/prefixless consumer wedges the ring slot ->
+  // silent deadlock). Consumer-only: no loader/launcher/storer role bodies.
+  mirage::transpiler::CodeKeeper consumer_code;
+  consumer_code.inc_indent();
+  emit_dep_wait_consumer_prefix(consumer_code);
+  emit_body(consumer_code);
+
+  TaskRoleVariantCode role_code{/*init_semaphores=*/"",
+                                /*loader=*/"",
+                                /*launcher=*/"",
+                                /*consumer=*/consumer_code.to_string(),
+                                /*storer=*/""};
+  register_v2_task_role_variant(
+      TASK_ATTN_BLOCK_MEGAKERNEL_V2, variant, role_code);
+  register_variant_smem_info(
+      TASK_ATTN_BLOCK_MEGAKERNEL_V2,
+      variant,
+      ::kernel::attn_block_megakernel_v2::make_smem_info());
+  return variant;
+}
+
+// v2 (role-split runtime) port of the FUSED DENSE-MLP decode megakernel (M5).
+// Consumer-only (nwarps==4) megakernel-shape task: ONE task per worker
+// (num_tasks==num_workers==136), ONE monotonic in-op GMEM grid barrier between
+// the W13 and W2 phases. params: [nwarps]. Body in
+// blackwell_v2/dsv3_dense_mlp_fused_v2.cuh (calls the v1 dense kernel's device
+// GEMV/quant helpers verbatim; the ONLY change is the self-reset->monotonic
+// barrier + the 256->128 consumer remap via approach (b) grid-stride).
+int TaskRegister::register_dsv3_dense_mlp_fused_v2_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  assert(params.size() == 1);
+  int const nwarps = params[0];
+  // Consumer-only: the dense MLP has no cross-role flag protocol (redundant-
+  // per-block rmsnorm keeps s_norm block-local; the only shared state is bar[0]
+  // + the global y13 which is fully-written-before-read). Only nwarps==4 is
+  // supported.
+  assert(nwarps == 4);
+  int const num_tasks = (int)bgraph.grid_dim.x;
+
+  auto emit_body = [&](mirage::transpiler::CodeKeeper &c) {
+    c.e("kernel::dsv3_dense_mlp_v2::dense_mlp_v2_task_impl(");
+    c.e("    task_desc,");
+    c.e("    static_cast<int>(task_desc->task_metadata.task_offset),");
+    c.e("    $, $,", num_tasks, nwarps);
+    // sync_tag is a consumer-only no-op (no helpers); pass a salted per-
+    // instruction value for signature parity with the ffn/attn megas.
+    c.e("    ((unsigned long long)instruction_index + 1ull) * "
+        "0x9E3779B97F4A7C15ull,");
+    c.e("    iter_num);");
+  };
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  emit_body(code);
+  int variant =
+      register_task_variant(TASK_DSV3_DENSE_MLP_FUSED_V2, code.to_string());
+
+  // §1.1 LETHAL INVARIANT: the consumer body MUST begin with the cross-SM
+  // dep-wait prefix (a bodyless/prefixless consumer wedges the ring slot ->
+  // silent deadlock). Consumer-only: no loader/launcher/storer role bodies.
+  mirage::transpiler::CodeKeeper consumer_code;
+  consumer_code.inc_indent();
+  emit_dep_wait_consumer_prefix(consumer_code);
+  emit_body(consumer_code);
+
+  TaskRoleVariantCode role_code{/*init_semaphores=*/"",
+                                /*loader=*/"",
+                                /*launcher=*/"",
+                                /*consumer=*/consumer_code.to_string(),
+                                /*storer=*/""};
+  register_v2_task_role_variant(
+      TASK_DSV3_DENSE_MLP_FUSED_V2, variant, role_code);
+  register_variant_smem_info(
+      TASK_DSV3_DENSE_MLP_FUSED_V2,
+      variant,
+      ::kernel::dsv3_dense_mlp_v2::make_dense_mlp_v2_smem_info(nwarps));
+  return variant;
+}
+
 // moe_permute_sm100 — see moe_permute_sm100.cuh for the contract.
 // Params (compile-time): [K, K_PACKED, MBT, TOPK, E_LOCAL, BM_PADDING]
 // Inputs (4): input_fp8 (mbt, K) u8,
@@ -8959,10 +9336,9 @@ int TaskRegister::register_dsv3_ffn_w13_gemv_v2_task(
     role_code.storer = helper_code.to_string();
   }
   register_v2_task_role_variant(TASK_DSV3_FFN_W13_GEMV_V2, variant, role_code);
-  register_variant_smem_info(
-      TASK_DSV3_FFN_W13_GEMV_V2,
-      variant,
-      ::kernel::dsv3_ffn_v2::make_w13_smem_info(nwarps));
+  register_variant_smem_info(TASK_DSV3_FFN_W13_GEMV_V2,
+                             variant,
+                             ::kernel::dsv3_ffn_v2::make_w13_smem_info(nwarps));
   return variant;
 }
 
@@ -9056,10 +9432,106 @@ int TaskRegister::register_dsv3_ffn_w2_gemv_v2_task(
     role_code.storer = helper_code.to_string();
   }
   register_v2_task_role_variant(TASK_DSV3_FFN_W2_GEMV_V2, variant, role_code);
-  register_variant_smem_info(
-      TASK_DSV3_FFN_W2_GEMV_V2,
+  register_variant_smem_info(TASK_DSV3_FFN_W2_GEMV_V2,
+                             variant,
+                             ::kernel::dsv3_ffn_v2::make_w2_smem_info(nwarps));
+  return variant;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DSv3 tail lm_head GEMV (M3 decode-blocker fix): a plain scalar/cp.async bf16
+// GEMV replacing the fragile TMA+tcgen05 linear_sm100_v3 lm_head. CONSUMER-ONLY
+// (a normal N-tiled GEMV — no loader/launcher/producer roles, no cross-task
+// in-op barrier), so it mirrors tensor_init_v2 / nvshmem_tile_allreduce_v2's
+// registration shape exactly.
+//   inputs : [0] rmsnorm_out bf16[1, K]         (final-norm output)
+//            [1] w_lm_head   bf16[N, K] row-major
+//   outputs: [0] logits      bf16[1, N] row-major
+//   params : [BLOCK_N, NWARPS, RBX]  (N-tile rows / consumer warps / rows-per-
+//            warp-chunk; BLOCK_N must divide N and be a multiple of NWARPS*RBX)
+//   grid.x = N / BLOCK_N; task_offset (= blockIdx.x) selects the N-tile.
+// ─────────────────────────────────────────────────────────────────────────────
+int TaskRegister::register_dsv3_lmhead_gemv_v2_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  assert(params.size() == 3);
+  int const block_n = params[0];
+  int const nwarps = params[1];
+  int const rbx = params[2];
+  assert(nwarps == 4);
+  assert(rbx > 0 && block_n > 0);
+  assert(block_n % (nwarps * rbx) == 0 &&
+         "BLOCK_N must be a multiple of NWARPS*RBX (no dropped rows)");
+
+  std::vector<tb::TBInputOp *> input_ops, output_ops;
+  int const num_inputs = 2;
+  int const num_outputs = 1;
+  assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops.size() < (size_t)num_inputs) {
+      input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+  // K = reduction dim = activation columns = weight columns.
+  assert(input_ops[0]->dtensor.num_dims == 2);
+  assert(input_ops[1]->dtensor.num_dims == 2);
+  assert(output_ops[0]->dtensor.num_dims == 2);
+  int const K = input_ops[0]->dtensor.dim[1];
+  int const N = output_ops[0]->dtensor.dim[1];
+  assert(input_ops[1]->dtensor.dim[1] == K &&
+         "weight K mismatch vs activation");
+  assert(input_ops[1]->dtensor.dim[0] == N && "weight N mismatch vs output");
+  assert(K % 256 == 0 &&
+         "lm_head GEMV requires K divisible by 256 (uint4=8 bf16, 32-lane "
+         "K-stride)");
+  assert(N % block_n == 0 && "N must be divisible by BLOCK_N (no tail tile)");
+  int const num_tasks = N / block_n;
+  assert((int)bgraph.grid_dim.x == num_tasks &&
+         "grid_dim.x must equal N / BLOCK_N");
+
+  auto emit_body = [&](mirage::transpiler::CodeKeeper &c) {
+    c.e("kernel::dsv3_lmhead_gemv_v2::lmhead_gemv_task_impl<$, $, $, $, $>(",
+        K,
+        N,
+        block_n,
+        nwarps,
+        rbx);
+    c.e("    task_desc,");
+    c.e("    static_cast<int>(task_desc->task_metadata.task_offset));");
+  };
+
+  // Plain-shape variant (v1-dispatch fallback string; unused in a v2 build
+  // because the v2 role dispatch takes over, but kept for symmetry with every
+  // other v2 task).
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  emit_body(code);
+  int const variant =
+      register_task_variant(TASK_DSV3_LMHEAD_GEMV_V2, code.to_string());
+
+  // Consumer role body: dep-wait prefix (cross-SM dep + per-slot SEM_DEP_READY
+  // arrival — the §1.1 no-fallback invariant: EVERY v2 task type MUST run this
+  // prefix or the next task reusing the ring slot deadlocks) then the GEMV. No
+  // loader/launcher/storer/init bodies — the lm_head GEMV is consumer-only, so
+  // those roles no-op (they go on to the next task).
+  mirage::transpiler::CodeKeeper consumer_code;
+  consumer_code.inc_indent();
+  emit_dep_wait_consumer_prefix(consumer_code);
+  emit_body(consumer_code);
+  register_v2_task_role_variant(
+      TASK_DSV3_LMHEAD_GEMV_V2,
       variant,
-      ::kernel::dsv3_ffn_v2::make_w2_smem_info(nwarps));
+      TaskRoleVariantCode{/*init_semaphores=*/"",
+                          /*loader=*/"",
+                          /*launcher=*/"",
+                          /*consumer=*/consumer_code.to_string(),
+                          /*storer=*/""});
+  register_variant_smem_info(
+      TASK_DSV3_LMHEAD_GEMV_V2,
+      variant,
+      ::kernel::dsv3_lmhead_gemv_v2::make_smem_info(K, nwarps, rbx));
   return variant;
 }
 
@@ -9433,7 +9905,8 @@ int TaskRegister::register_dsv3_ffn_mega_fg_v2_task(
   bool const multi_role = nwarps > 4;
 
   auto emit_body = [&](mirage::transpiler::CodeKeeper &c) {
-    c.e("kernel::dsv3_ffn_v2::ffn_mega_fg_task_impl<$, $>(", rblk,
+    c.e("kernel::dsv3_ffn_v2::ffn_mega_fg_task_impl<$, $>(",
+        rblk,
         stream ? "true" : "false");
     c.e("    task_desc,");
     c.e("    static_cast<int>(task_desc->task_metadata.task_offset),");

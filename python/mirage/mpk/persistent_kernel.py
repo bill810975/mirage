@@ -369,6 +369,57 @@ def get_compile_command(
     # overhead of the v2 per-op execution model.
     if os.environ.get("MPK_DSV3_ATTN_V2_NULLBODY") == "1":
         flags = flags + ["-DMPK_DSV3_ATTN_V2_NULLBODY"]
+    # DEBUG (default-OFF => default build byte-identical): per-worker task
+    # breadcrumb in the Runtime-V2 role loops (runtime_v2.cuh). Writes a STARTED
+    # word to HOST-MAPPED PINNED memory before each execute_task and a COMPLETED
+    # word after; the (worker, role) with STARTED != COMPLETED after a
+    # cudaErrorIllegalAddress is the faulting task. Localizes a full-megakernel
+    # crash that memcheck can't attribute under -rdc=true + NVSHMEM. Read back
+    # with scratch/v2_breadcrumb_readback.py. Codegen-gated env var: an mpirun
+    # launcher MUST forward it explicitly with -x MPK_V2_BREADCRUMB (the generic
+    # -x list omits it, so the crumb silently stays OFF otherwise — see
+    # feedback_mpirun_x_env_gap).
+    if os.environ.get("MPK_V2_BREADCRUMB") == "1":
+        flags = flags + ["-DMPK_V2_BREADCRUMB"]
+    # HANG WATCHDOG (default-OFF): MPK_V2_HANG_WATCHDOG_S=<N seconds> arms a
+    # host std::thread inside launch_persistent_kernel_v2 (persistent_kernel_v2.
+    # cuh) that dumps the breadcrumb + _Exit()s if the kernel launch does not
+    # return within N seconds — closing the gap where a PURE HANG (device
+    # spin-wait, no CUDA error) blocks the host in cudaStreamSynchronize forever
+    # and the breadcrumb (dumped only on a launch ERROR) never prints. It is
+    # read at RUNTIME via getenv (NO -D needed / NO recompile to change N), but
+    # the code path is compiled only under -DMPK_V2_BREADCRUMB (it reuses that
+    # pinned buffer) — so require MPK_V2_BREADCRUMB=1 too. An mpirun launcher
+    # MUST forward BOTH explicitly: -x MPK_V2_BREADCRUMB -x MPK_V2_HANG_WATCHDOG_S
+    # (the generic -x list omits them; see feedback_mpirun_x_env_gap). The timer
+    # starts at KERNEL-LAUNCH (post-JIT), so N is N seconds into the real run.
+    # DEBUG (default-OFF => default build byte-identical): linear_v3 (lm_head)
+    # M3-debug diagnostics for the deterministic cudaErrorIllegalAddress
+    # breadcrumbed to worker=36 / TASK_LINEAR_SM100_V3 / seq_in_iter=4. Both are
+    # codegen-gated env vars an mpirun launcher MUST forward EXPLICITLY with -x
+    # (the generic -x list omits them; see feedback_mpirun_x_env_gap):
+    #   * MPK_V2_LINV3_PROBE  — dump worker36's copied TaskDesc metadata + per-
+    #     role PHASE markers into the pinned breadcrumb buffer (REQUIRES
+    #     MPK_V2_BREADCRUMB=1 for the buffer; a #error enforces the coupling).
+    #     Read back with the C++ dump_linv3_probe output (auto-printed on crash
+    #     AND on clean exit) + demo/deepseek_v3/v2_breadcrumb_readback.py --linv3.
+    #   * MPK_V2_LINV3_SKIP36 — no-op worker36's target-tile body (data movement
+    #     + compute + tcgen05.alloc/dealloc) while preserving ALL sync + page
+    #     parity. Crash VANISHES/MOVES => real body/tile/metadata bug; PERSISTS
+    #     => concurrent poisoner / false attribution.
+    #   * MPK_V2_LINV3_SKIPALL — sibling of SKIP36: the SAME no-op skip stub
+    #     applied to EVERY TASK_LINEAR_SM100_V3 task (drops the worker36/seq==4
+    #     condition), preserving the identical op-private + page sync skeleton.
+    #     Clean causal ablation for "is linear_v3 the faulter?": crash VANISHES
+    #     (run completes, garbage lm_head logits) => linear_v3 IS the faulter;
+    #     PERSISTS (same illegal-address) => faulter is elsewhere. Needs NO
+    #     breadcrumb buffer. Forward EXPLICITLY with -x MPK_V2_LINV3_SKIPALL.
+    if os.environ.get("MPK_V2_LINV3_PROBE") == "1":
+        flags = flags + ["-DMPK_V2_LINV3_PROBE"]
+    if os.environ.get("MPK_V2_LINV3_SKIP36") == "1":
+        flags = flags + ["-DMPK_V2_LINV3_SKIP36"]
+    if os.environ.get("MPK_V2_LINV3_SKIPALL") == "1":
+        flags = flags + ["-DMPK_V2_LINV3_SKIPALL"]
     # DSv3 decode FAST megakernels: the box-validated attention + FFN-full wins
     # (ATTN_FAST barrier-removal + Phase-0 RMSNorm deep-fusion + W0-tail-lighten +
     # GEMV scalar-ILP consumer; FFN_FAST packed-half2 GEMV + FFN_FAST_ROUTING
@@ -2238,7 +2289,21 @@ class PersistentKernel:
             params = [1]
         else:
             params = None
-        self.kn_graph.register_task(tb_graph, "tensor_init", params)
+        if self.use_v2_runtime:
+            # v2 (role-split runtime) port. skip_after_step0 IS honored on v2
+            # (params[0]==1): it is a CORRECTNESS REQUIREMENT for the v2
+            # attn-block megakernel scratch, whose top holds a MONOTONIC grid
+            # barrier (need=num_tasks*(iter+1), never self-reset). Re-zeroing that
+            # counter every step (the old always-zero v2 path) reset it at iter 1
+            # while the wait target kept growing -> every worker hung at the first
+            # grid barrier (iter-0-fine, iter-1-hang). Guarding the zero body on
+            # step==0 (dep-wait/finish/trigger stay unguarded) lets the counter
+            # persist across steps. The poison lever (params[0]==2) stays v1-only
+            # (a diagnostic harness); pass it through as no-skip on v2.
+            v2_params = [1] if skip_after_step0 else None
+            self.kn_graph.register_task(tb_graph, "tensor_init_v2", v2_params)
+        else:
+            self.kn_graph.register_task(tb_graph, "tensor_init", params)
     
     def moe_topk_softmax_routing_layer(
         self,
@@ -2847,6 +2912,72 @@ class PersistentKernel:
         self.kn_graph.register_task(
             tb_graph, "attn_block_megakernel_sm100", [])
 
+    def dsv3_attn_mega_layer(
+        self,
+        hidden,
+        qkv_a_w,
+        qkv_a_s,
+        ln_weights,
+        q_b_w,
+        q_b_s,
+        cos_sin,
+        kv_cache,
+        kvbv_w,
+        kvbv_s,
+        oproj_w,
+        oproj_s,
+        residual,
+        out,
+        scratch,
+        num_tasks: int,
+    ):
+        # v2 (role-split runtime) FUSED decode-attention megakernel — the
+        # Form-2 megakernel-shape analog of dsv3_ffn_mega_layer. Same 14-input/
+        # 1-output ABI as attn_block_megakernel_layer (v1): ln_weights =
+        # [input_ln(7168)|q_a_ln(1536)|kv_a_ln(512)], cos_sin = [cos|sin]/row.
+        # `out` is the single tracked output; kv_cache is read+written in place
+        # through its input slot (root cuda_tensor input/output resolve to one
+        # physical address). `residual` MUST be a ZERO buffer at TP8 (the
+        # downstream AllReduce sums across ranks + adds the real residual once;
+        # the o_proj GEMV adds `residual`, so the zero binding keeps the write
+        # residual-free). `scratch` MUST be sized ATTN_SCRATCH_BYTES + 16 (the
+        # extra 16 makes room for the 3-slot u64 GMEM grid barrier at the top,
+        # ALL zeroed at alloc). NOTE: the DSv3 builder is NOT wired to call this
+        # yet — that is the M3 plumb; this wrapper exists so the task is
+        # registerable + testable in isolation.
+        assert self.use_v2_runtime, "dsv3_attn_mega_layer is v2-only"
+        # CO-RESIDENCY HARD GATE: the in-op GMEM grid barriers are deadlock-safe
+        # only if every task of this op runs on its own worker (num_tasks ==
+        # num_workers gives exactly one task per worker via the v2 round-robin).
+        assert num_tasks == self.num_workers, (
+            f"dsv3_attn_mega requires num_tasks == num_workers "
+            f"({num_tasks} != {self.num_workers}): 2 same-op tasks on one "
+            f"worker would deadlock the in-op grid barrier")
+        # Consumer-only body: 128 physical threads. The v2 runtime launches the
+        # full 256-thread worker regardless; block_dim here is the logical
+        # consumer width (mirrors dsv3_ffn_mega_layer's (128,1,1)).
+        tb_graph = TBGraph(CyTBGraph((num_tasks, 1, 1), (128, 1, 1), 1, 64))
+        tensors = [
+            hidden,
+            qkv_a_w,
+            qkv_a_s,
+            ln_weights,
+            q_b_w,
+            q_b_s,
+            cos_sin,
+            kv_cache,
+            kvbv_w,
+            kvbv_s,
+            oproj_w,
+            oproj_s,
+            residual,
+            scratch,
+        ]
+        for tensor in tensors:
+            tb_graph.new_input(tensor, (-1, -1, -1), -1, True)
+        tb_graph.new_input(out, (-1, -1, -1), -1, True)
+        self.kn_graph.customized(tensors + [out], tb_graph)
+        self.kn_graph.register_task(tb_graph, "attn_block_megakernel_v2", [])
 
     def fp8_group_gemm_smallm_layer(
         self, a_fp8, b_fp8, sfa_packed, sfb_packed, m_indices, output,
@@ -4275,6 +4406,51 @@ class PersistentKernel:
             [nwarps, local_expert_start, num_local_experts, rsf_bits, rblk,
              stream])
 
+    def dsv3_dense_mlp_mega_v2_layer(
+        self,
+        hidden: DTensor,       # PRE-rmsnorm residual stream bf16 (1,7168)
+        w13: DTensor,          # fp8 (4608, 7168) gate_up_proj
+        w13_scale: DTensor,    # f32 (36, 56) RAW block scale [N/128, K/128]
+        w2: DTensor,           # fp8 (7168, 2304) down_proj
+        w2_scale: DTensor,     # f32 (56, 18) RAW block scale
+        rmsnorm_weight: DTensor,  # bf16 (7168,) post_attention_layernorm.weight
+        bar: DTensor,          # u8 scratch: [bar u64[2] @0 | y13 f32[4608] @64];
+                               # bar[0] persists (skip_after_step0), y13 fully
+                               # written-before-read every step
+        output: DTensor,       # bf16 (1, 7168) PRE-AllReduce W2 result
+        num_tasks: int,
+        nwarps: int = 4,
+    ):
+        """FUSED DENSE-MLP mega-task (DSv3 dense layers 0-2) on the v2 runtime.
+
+        One task = post-attn RMSNorm + W13(gate_up) GEMV + silu(gate)*up
+        (384-chunk interleave) + W2(down) GEMV -> bf16. Unlike dsv3_ffn_mega
+        there is NO router / topk / EP filter / shared-expert (7 input slots,
+        the same ABI as the v1 dense mega). Consumer-only (nwarps==4); the ONE
+        in-op GMEM barrier (W13 -> W2) is MONOTONIC (need=num_tasks*(iter+1)),
+        so `bar` MUST be zeroed ONLY at step 0 (the builder registers its
+        tensor_init with skip_after_step0=True). The RowParallel down_proj
+        AllReduce + residual stay OUTSIDE this task.
+        """
+        assert self.use_v2_runtime, "dsv3_dense_mlp_* layers are v2-only"
+        assert nwarps == 4, "dense MLP v2 is consumer-only (nwarps==4)"
+        # CO-RESIDENCY HARD GATE: the in-op GMEM barrier is deadlock-safe only
+        # if every task of this op runs on its own worker (num_tasks ==
+        # num_workers => exactly one task per worker). Same contract as
+        # dsv3_ffn_mega_layer.
+        assert num_tasks == self.num_workers, (
+            f"dense_mlp_mega_v2 requires num_tasks == num_workers "
+            f"({num_tasks} != {self.num_workers}): 2 same-op tasks on one "
+            f"worker would deadlock the in-op barrier")
+        tb_graph = TBGraph(CyTBGraph((num_tasks, 1, 1), (128, 1, 1), 1, 64))
+        tensors = [hidden, w13, w13_scale, w2, w2_scale, rmsnorm_weight, bar,
+                   output]
+        for t in tensors:
+            tb_graph.new_input(t, (-1, -1, -1), -1, True)
+        self.kn_graph.customized(tensors, tb_graph)
+        self.kn_graph.register_task(
+            tb_graph, "dsv3_dense_mlp_fused_v2", [nwarps])
+
     # ------------------------------------------------------------------
     # DSv3 fused-ATTN block as a v2 task CHAIN (Step 3b of the V2 migration).
     # v2-runtime only. The chain is:
@@ -4560,6 +4736,59 @@ class PersistentKernel:
         self.kn_graph.register_task(tb_graph, "linear_with_residual_sm100_v3",
                                      [-1, 1, tiles_per_task])
 
+    def dsv3_lmhead_gemv_layer(
+        self,
+        input: DTensor,   # rmsnorm_out bf16 [M, K]   (M=1 at bs=1 decode)
+        weight: DTensor,  # w_lm_head   bf16 [N, K] row-major
+        output: DTensor,  # logits      bf16 [M, N] row-major
+        block_n: int = 128,
+        nwarps: int = 4,
+        rbx: int = 8,
+    ):
+        """v2 tail lm_head GEMV (M3 decode-blocker fix): a plain scalar/cp.async
+        bf16 GEMV that replaces the fragile TMA+tcgen05 linear_layer_v3 lm_head.
+
+        Same shape contract as linear_layer_v3 (input [M,K], weight [N,K] ->
+        output [M,N]) but a NORMAL N-tiled task: grid = (N // block_n, 1, 1),
+        each task owns block_n contiguous output rows, round-robined onto the
+        workers by the v2 scheduler (no grid barrier). M=1 (bs=1) — the GEMV is
+        memory-bound (read the weight once), so scalar-MAC costs no meaningful
+        perf and removes the TMA fault surface."""
+        assert self.use_v2_runtime, "dsv3_lmhead_gemv_layer is v2-only"
+        assert input.num_dims == 2
+        assert weight.num_dims == 2
+        assert output.num_dims == 2
+        assert input.dim(0) == output.dim(0), "batch mismatch input vs output"
+        assert input.dim(1) == weight.dim(1), "K mismatch input vs weight"
+        assert output.dim(1) == weight.dim(0), "N mismatch output vs weight"
+        assert nwarps == 4, "lm_head GEMV consumer body is 4 warps (128 threads)"
+        K = input.dim(1)
+        N = weight.dim(0)
+        assert K % 256 == 0, (
+            f"lm_head GEMV requires K divisible by 256 (uint4=8 bf16, 32-lane "
+            f"K-stride); got K={K}"
+        )
+        assert block_n % (nwarps * rbx) == 0, (
+            f"block_n ({block_n}) must be a multiple of nwarps*rbx "
+            f"({nwarps * rbx}) so no output rows are dropped"
+        )
+        assert N % block_n == 0, (
+            f"N ({N}) must be divisible by block_n ({block_n}) so no vocab "
+            f"tail is dropped; pick a block_n that divides N"
+        )
+        num_tasks = N // block_n
+        grid_dim = (num_tasks, 1, 1)
+        # Whole-tensor-per-task partition (like the FFN v2 GEMV): the task's
+        # N-tile is selected by task_offset inside the kernel, not by the
+        # TBGraph partition map.
+        tb_graph = TBGraph(CyTBGraph(grid_dim, (128, 1, 1), 1, 64))
+        tb_graph.new_input(input,  (-1, -1, -1), -1, True)
+        tb_graph.new_input(weight, (-1, -1, -1), -1, True)
+        tb_graph.new_input(output, (-1, -1, -1), -1, True)
+        self.kn_graph.customized([input, weight, output], tb_graph)
+        self.kn_graph.register_task(tb_graph, "dsv3_lmhead_gemv_v2",
+                                     [block_n, nwarps, rbx])
+
     def linear_with_residual_layer_v2(
         self,
         input: DTensor,
@@ -4655,7 +4884,11 @@ class PersistentKernel:
             assert residual.dim(1) == output.dim(1)
         # params[0]: num_gpus
         # params[1]: my_gpu_id
-        best_implementation = auto_select_allreduce_implementation(self.world_size, self.mpi_rank)
+        best_implementation = auto_select_allreduce_implementation(
+            self.world_size,
+            self.mpi_rank,
+            use_v2_runtime=getattr(self, "use_v2_runtime", False),
+        )
         tensors = {
             "input": input,
             "buffer": buffer,
@@ -5385,6 +5618,23 @@ class PersistentKernel:
         task_graph_json = results["json_file"]
         if self.use_v2_runtime:
             task_graph = json.loads(task_graph_json)
+            # V2 deadlock guard: a task type with a v1-only body and no v2 role
+            # variant would hit the consumer dispatcher's `default: break`, so
+            # its per-slot SEM_DEP_READY is never arrived -> the next ring-slot
+            # reuse deadlocks the box (D-state zombies). The C++ codegen
+            # publishes any such GRAPH-USED task type here; fail loud at build
+            # time rather than wedging the box at runtime.
+            _v2_unsafe = task_graph.get("v2_unsafe_task_types", [])
+            if _v2_unsafe:
+                raise RuntimeError(
+                    "V2 runtime graph contains task type(s) with a v1-only body "
+                    "and no v2 role variant: " + ", ".join(sorted(_v2_unsafe))
+                    + ". Under the v2 runtime these hit the consumer role "
+                    "dispatcher's `default: break`, so their per-slot "
+                    "SEM_DEP_READY is never arrived -> the next task reusing "
+                    "that ring slot deadlocks (box wedge). Fix: add a v2 role "
+                    "variant for the task, or skip emitting it in the builder "
+                    "under use_v2_runtime.")
             task_graph["v2_worker_task_queues"] = build_v2_worker_task_queues(
                 task_graph, self.num_workers)
             task_graph_json = add_v2_region_smem_plan(json.dumps(task_graph))

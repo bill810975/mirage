@@ -66,8 +66,8 @@ inline constexpr int align_up_16(int n) {
 //           dgemv_cpa16_h2<4,2> (sharedGU)-> 4x32x2 uint4            =  4 KB
 //   w2:     dgemv_cpa16_h2<16,2> / <8,2>  -> 16x32x2 uint4           = 16 KB
 //           dgemv_cpa<4,3> (sharedDN)     -> 4x32x3 uint32           = 1.5 KB
-inline constexpr int RQ_RING_BYTES_PER_WARP = 4 * 32 * 16;   // 2048
-inline constexpr int GEMV_RING_BYTES_PER_WARP = 16 * 1024;   // 16384
+inline constexpr int RQ_RING_BYTES_PER_WARP = 4 * 32 * 16; // 2048
+inline constexpr int GEMV_RING_BYTES_PER_WARP = 16 * 1024; // 16384
 
 // ---- T1 router_quant regions ----------------------------------------------
 // [0] NORM: staged rmsnorm_out (bf16[HIDDEN] = 14336 B)   -> 1 page
@@ -81,11 +81,19 @@ inline ::mirage::runtime::TaskSmemInfo make_router_quant_smem_info(int nwarps) {
   ::mirage::runtime::TaskSmemInfo info{norm_bytes + ring_bytes,
                                        /*alignment=*/1024,
                                        {}};
-  info.regions.push_back({"rq_norm", norm_bytes, 1024, /*page_count=*/1,
-                          /*can_pack=*/false, /*release_step=*/2,
+  info.regions.push_back({"rq_norm",
+                          norm_bytes,
+                          1024,
+                          /*page_count=*/1,
+                          /*can_pack=*/false,
+                          /*release_step=*/2,
                           /*contiguous=*/true});
-  info.regions.push_back({"rq_ring", ring_bytes, 1024, /*page_count=*/1,
-                          /*can_pack=*/true, /*release_step=*/2,
+  info.regions.push_back({"rq_ring",
+                          ring_bytes,
+                          1024,
+                          /*page_count=*/1,
+                          /*can_pack=*/true,
+                          /*release_step=*/2,
                           /*contiguous=*/true});
   return info;
 }
@@ -112,8 +120,12 @@ inline constexpr int TK_WORK_BYTES = TK_OFF_FLAGS + 4 * 8;
 
 inline ::mirage::runtime::TaskSmemInfo make_topk_smem_info() {
   ::mirage::runtime::TaskSmemInfo info{TK_WORK_BYTES, /*alignment=*/1024, {}};
-  info.regions.push_back({"tk_work", TK_WORK_BYTES, 1024, /*page_count=*/1,
-                          /*can_pack=*/true, /*release_step=*/2,
+  info.regions.push_back({"tk_work",
+                          TK_WORK_BYTES,
+                          1024,
+                          /*page_count=*/1,
+                          /*can_pack=*/true,
+                          /*release_step=*/2,
                           /*contiguous=*/true});
   return info;
 }
@@ -131,12 +143,20 @@ inline ::mirage::runtime::TaskSmemInfo make_w13_smem_info(int nwarps) {
   ::mirage::runtime::TaskSmemInfo info{act_bytes + ring_bytes,
                                        /*alignment=*/1024,
                                        {}};
-  info.regions.push_back({"w13_act", act_bytes, 1024, /*page_count=*/1,
-                          /*can_pack=*/false, /*release_step=*/2,
+  info.regions.push_back({"w13_act",
+                          act_bytes,
+                          1024,
+                          /*page_count=*/1,
+                          /*can_pack=*/false,
+                          /*release_step=*/2,
                           /*contiguous=*/true});
-  info.regions.push_back({"w13_ring", ring_bytes, 1024,
-                          /*page_count=*/nwarps, /*can_pack=*/false,
-                          /*release_step=*/2, /*contiguous=*/true});
+  info.regions.push_back({"w13_ring",
+                          ring_bytes,
+                          1024,
+                          /*page_count=*/nwarps,
+                          /*can_pack=*/false,
+                          /*release_step=*/2,
+                          /*contiguous=*/true});
   return info;
 }
 
@@ -163,17 +183,26 @@ inline ::mirage::runtime::TaskSmemInfo
   ::mirage::runtime::TaskSmemInfo info{RQR_NORM_BYTES + ring_bytes,
                                        /*alignment=*/1024,
                                        {}};
-  info.regions.push_back({"rqr_norm", RQR_NORM_BYTES, 1024, /*page_count=*/1,
-                          /*can_pack=*/false, /*release_step=*/2,
+  info.regions.push_back({"rqr_norm",
+                          RQR_NORM_BYTES,
+                          1024,
+                          /*page_count=*/1,
+                          /*can_pack=*/false,
+                          /*release_step=*/2,
                           /*contiguous=*/true});
-  info.regions.push_back({"rqr_ring", ring_bytes, 1024, /*page_count=*/1,
-                          /*can_pack=*/true, /*release_step=*/2,
+  info.regions.push_back({"rqr_ring",
+                          ring_bytes,
+                          1024,
+                          /*page_count=*/1,
+                          /*can_pack=*/true,
+                          /*release_step=*/2,
                           /*contiguous=*/true});
   return info;
 }
 
-// ---- T2' w13_topk regions ----------------------------------------------------
-// [0] ACT (same as w13)  [1] RING (nwarps pages)  [2] TK work (packed)
+// ---- T2' w13_topk regions
+// ---------------------------------------------------- [0] ACT (same as w13)
+// [1] RING (nwarps pages)  [2] TK work (packed)
 inline constexpr int W13TK_REGION_ACT = 0;
 inline constexpr int W13TK_REGION_RING = 1;
 inline constexpr int W13TK_REGION_TK = 2;
@@ -184,20 +213,33 @@ inline ::mirage::runtime::TaskSmemInfo make_w13_topk_smem_info(int nwarps) {
   ::mirage::runtime::TaskSmemInfo info{act_bytes + ring_bytes + TK_WORK_BYTES,
                                        /*alignment=*/1024,
                                        {}};
-  info.regions.push_back({"w13tk_act", act_bytes, 1024, /*page_count=*/1,
-                          /*can_pack=*/false, /*release_step=*/2,
+  info.regions.push_back({"w13tk_act",
+                          act_bytes,
+                          1024,
+                          /*page_count=*/1,
+                          /*can_pack=*/false,
+                          /*release_step=*/2,
                           /*contiguous=*/true});
-  info.regions.push_back({"w13tk_ring", ring_bytes, 1024,
-                          /*page_count=*/nwarps, /*can_pack=*/false,
-                          /*release_step=*/2, /*contiguous=*/true});
-  info.regions.push_back({"w13tk_tk", TK_WORK_BYTES, 1024, /*page_count=*/1,
-                          /*can_pack=*/true, /*release_step=*/2,
+  info.regions.push_back({"w13tk_ring",
+                          ring_bytes,
+                          1024,
+                          /*page_count=*/nwarps,
+                          /*can_pack=*/false,
+                          /*release_step=*/2,
+                          /*contiguous=*/true});
+  info.regions.push_back({"w13tk_tk",
+                          TK_WORK_BYTES,
+                          1024,
+                          /*page_count=*/1,
+                          /*can_pack=*/true,
+                          /*release_step=*/2,
                           /*contiguous=*/true});
   return info;
 }
 
-// ---- T3' w2_silu regions -----------------------------------------------------
-// [0] ACT (same layout as w2: i_fp8|i_scale|si_fp8|si_scale, but COMPUTED by
+// ---- T3' w2_silu regions
+// ----------------------------------------------------- [0] ACT (same layout as
+// w2: i_fp8|i_scale|si_fp8|si_scale, but COMPUTED by
 //     the in-task silu instead of cp.async-staged)
 // [1] RING (nwarps pages). The first MAX_ACTIVE*W13_N*4 + SH_GU_N*4 bytes
 //     (34 KB <= 4*16 KB) double as the y13/sg staging area during the silu
@@ -209,32 +251,41 @@ inline constexpr int W2S_RING_SG_OFF = MAX_ACTIVE * W13_N * 4; // 32768
 static_assert(W2S_RING_SG_OFF + SH_GU_N * 4 <= 4 * GEMV_RING_BYTES_PER_WARP,
               "y13/sg staging must fit the 4 consumer ring slices");
 
-// ---- T5 w2_gemv regions ------------------------------------------------------
-// [0] ACT: i_fp8 u8[8*512] @0 | i_scale f32[8*4] @4096 | si_fp8 u8[256] @4224
+// ---- T5 w2_gemv regions
+// ------------------------------------------------------ [0] ACT: i_fp8
+// u8[8*512] @0 | i_scale f32[8*4] @4096 | si_fp8 u8[256] @4224
 //          | si_scale f32[2] @4480   (4488 B)
 // [1] RING: nwarps * 16 KB
 inline constexpr int W2_REGION_ACT = 0;
 inline constexpr int W2_REGION_RING = 1;
-inline constexpr int W2_ACT_ISCALE_OFF = MAX_ACTIVE * W2_K;             // 4096
+inline constexpr int W2_ACT_ISCALE_OFF = MAX_ACTIVE * W2_K; // 4096
 inline constexpr int W2_ACT_SIFP8_OFF =
-    W2_ACT_ISCALE_OFF + MAX_ACTIVE * KG2 * 4;                           // 4224
-inline constexpr int W2_ACT_SISCALE_OFF = W2_ACT_SIFP8_OFF + SH_DN_K;   // 4480
+    W2_ACT_ISCALE_OFF + MAX_ACTIVE * KG2 * 4;                         // 4224
+inline constexpr int W2_ACT_SISCALE_OFF = W2_ACT_SIFP8_OFF + SH_DN_K; // 4480
 // nwarps=7 cross-role tag-flags (u64[4]); 16B-aligned tail.
 inline constexpr int W2_ACT_FLAGS_OFF =
-    align_up_16(W2_ACT_SISCALE_OFF + KG_SHDN * 4);                      // 4496
-inline constexpr int W2_ACT_BYTES = W2_ACT_FLAGS_OFF + 4 * 8;           // 4528
+    align_up_16(W2_ACT_SISCALE_OFF + KG_SHDN * 4);            // 4496
+inline constexpr int W2_ACT_BYTES = W2_ACT_FLAGS_OFF + 4 * 8; // 4528
 
 inline ::mirage::runtime::TaskSmemInfo make_w2_smem_info(int nwarps) {
   int const ring_bytes = nwarps * GEMV_RING_BYTES_PER_WARP;
   ::mirage::runtime::TaskSmemInfo info{W2_ACT_BYTES + ring_bytes,
                                        /*alignment=*/1024,
                                        {}};
-  info.regions.push_back({"w2_act", W2_ACT_BYTES, 1024, /*page_count=*/1,
-                          /*can_pack=*/false, /*release_step=*/2,
+  info.regions.push_back({"w2_act",
+                          W2_ACT_BYTES,
+                          1024,
+                          /*page_count=*/1,
+                          /*can_pack=*/false,
+                          /*release_step=*/2,
                           /*contiguous=*/true});
-  info.regions.push_back({"w2_ring", ring_bytes, 1024,
-                          /*page_count=*/nwarps, /*can_pack=*/false,
-                          /*release_step=*/2, /*contiguous=*/true});
+  info.regions.push_back({"w2_ring",
+                          ring_bytes,
+                          1024,
+                          /*page_count=*/nwarps,
+                          /*can_pack=*/false,
+                          /*release_step=*/2,
+                          /*contiguous=*/true});
   return info;
 }
 
@@ -250,8 +301,8 @@ inline ::mirage::runtime::TaskSmemInfo make_w2_silu_smem_info(int nwarps) {
 // Extra shape constants needed host-side by the packs (device side
 // static_asserts these against the v1 kernel's constants).
 inline constexpr int E_LOCAL = 128;
-inline constexpr int NB1 = W13_N / GRP;   // 8
-inline constexpr int NB2 = W2_N / GRP;    // 56
+inline constexpr int NB1 = W13_N / GRP;       // 8
+inline constexpr int NB2 = W2_N / GRP;        // 56
 inline constexpr int KG_SHGU = HIDDEN / GRP;  // 56
 inline constexpr int NB_SHGU = SH_GU_N / GRP; // 4
 inline constexpr int NB_SHDN = W2_N / GRP;    // 56
@@ -277,28 +328,45 @@ inline constexpr int A_TK_BYTES = A_TK_OFF_FLAGS + 8 * 8;
 inline ::mirage::runtime::TaskSmemInfo make_w13_rqr_topk_smem_info(int nwarps) {
   int const act_bytes = HIDDEN + KG1 * 4;
   int const ring_bytes = nwarps * GEMV_RING_BYTES_PER_WARP;
-  ::mirage::runtime::TaskSmemInfo info{
-      RQR_NORM_BYTES + act_bytes + ring_bytes + A_TK_BYTES,
-      /*alignment=*/1024,
-      {}};
-  info.regions.push_back({"artk_norm", RQR_NORM_BYTES, 1024, /*page_count=*/1,
-                          /*can_pack=*/false, /*release_step=*/2,
+  ::mirage::runtime::TaskSmemInfo info{RQR_NORM_BYTES + act_bytes + ring_bytes +
+                                           A_TK_BYTES,
+                                       /*alignment=*/1024,
+                                       {}};
+  info.regions.push_back({"artk_norm",
+                          RQR_NORM_BYTES,
+                          1024,
+                          /*page_count=*/1,
+                          /*can_pack=*/false,
+                          /*release_step=*/2,
                           /*contiguous=*/true});
-  info.regions.push_back({"artk_act", act_bytes, 1024, /*page_count=*/1,
-                          /*can_pack=*/false, /*release_step=*/2,
+  info.regions.push_back({"artk_act",
+                          act_bytes,
+                          1024,
+                          /*page_count=*/1,
+                          /*can_pack=*/false,
+                          /*release_step=*/2,
                           /*contiguous=*/true});
-  info.regions.push_back({"artk_ring", ring_bytes, 1024,
-                          /*page_count=*/nwarps, /*can_pack=*/false,
-                          /*release_step=*/2, /*contiguous=*/true});
-  info.regions.push_back({"artk_tk", A_TK_BYTES, 1024, /*page_count=*/1,
-                          /*can_pack=*/true, /*release_step=*/2,
+  info.regions.push_back({"artk_ring",
+                          ring_bytes,
+                          1024,
+                          /*page_count=*/nwarps,
+                          /*can_pack=*/false,
+                          /*release_step=*/2,
+                          /*contiguous=*/true});
+  info.regions.push_back({"artk_tk",
+                          A_TK_BYTES,
+                          1024,
+                          /*page_count=*/1,
+                          /*can_pack=*/true,
+                          /*release_step=*/2,
                           /*contiguous=*/true});
   return info;
 }
 
-// ---- Rung B: ffn_mega regions ------------------------------------------------
-// [0] NORM (RQR layout, flag tail unused)  [1] ACT (w13 layout, quant-computed)
-// [2] RING (nwarps pages; W2-phase y13/sg staging borrows the first 34 KB =
+// ---- Rung B: ffn_mega regions
+// ------------------------------------------------ [0] NORM (RQR layout, flag
+// tail unused)  [1] ACT (w13 layout, quant-computed) [2] RING (nwarps pages;
+// W2-phase y13/sg staging borrows the first 34 KB =
 //     consumer slices, exactly like w2_silu)  [3] TK+flags  [4] W2ACT (w2
 //     layout: i_fp8|i_scale|si_fp8|si_scale, silu-computed; flag tail unused)
 // flags u64[16]: [0] NORM_READY  [1..3] PH1 (helper router done)  [4] GO1
@@ -316,24 +384,44 @@ inline constexpr int M_TK_BYTES = M_TK_OFF_FLAGS + 16 * 8;
 inline ::mirage::runtime::TaskSmemInfo make_ffn_mega_smem_info(int nwarps) {
   int const act_bytes = HIDDEN + KG1 * 4;
   int const ring_bytes = nwarps * GEMV_RING_BYTES_PER_WARP;
-  ::mirage::runtime::TaskSmemInfo info{
-      RQR_NORM_BYTES + act_bytes + ring_bytes + M_TK_BYTES + W2_ACT_BYTES,
-      /*alignment=*/1024,
-      {}};
-  info.regions.push_back({"mega_norm", RQR_NORM_BYTES, 1024, /*page_count=*/1,
-                          /*can_pack=*/false, /*release_step=*/2,
+  ::mirage::runtime::TaskSmemInfo info{RQR_NORM_BYTES + act_bytes + ring_bytes +
+                                           M_TK_BYTES + W2_ACT_BYTES,
+                                       /*alignment=*/1024,
+                                       {}};
+  info.regions.push_back({"mega_norm",
+                          RQR_NORM_BYTES,
+                          1024,
+                          /*page_count=*/1,
+                          /*can_pack=*/false,
+                          /*release_step=*/2,
                           /*contiguous=*/true});
-  info.regions.push_back({"mega_act", act_bytes, 1024, /*page_count=*/1,
-                          /*can_pack=*/false, /*release_step=*/2,
+  info.regions.push_back({"mega_act",
+                          act_bytes,
+                          1024,
+                          /*page_count=*/1,
+                          /*can_pack=*/false,
+                          /*release_step=*/2,
                           /*contiguous=*/true});
-  info.regions.push_back({"mega_ring", ring_bytes, 1024,
-                          /*page_count=*/nwarps, /*can_pack=*/false,
-                          /*release_step=*/2, /*contiguous=*/true});
-  info.regions.push_back({"mega_tk", M_TK_BYTES, 1024, /*page_count=*/1,
-                          /*can_pack=*/true, /*release_step=*/2,
+  info.regions.push_back({"mega_ring",
+                          ring_bytes,
+                          1024,
+                          /*page_count=*/nwarps,
+                          /*can_pack=*/false,
+                          /*release_step=*/2,
                           /*contiguous=*/true});
-  info.regions.push_back({"mega_w2act", W2_ACT_BYTES, 1024, /*page_count=*/1,
-                          /*can_pack=*/true, /*release_step=*/2,
+  info.regions.push_back({"mega_tk",
+                          M_TK_BYTES,
+                          1024,
+                          /*page_count=*/1,
+                          /*can_pack=*/true,
+                          /*release_step=*/2,
+                          /*contiguous=*/true});
+  info.regions.push_back({"mega_w2act",
+                          W2_ACT_BYTES,
+                          1024,
+                          /*page_count=*/1,
+                          /*can_pack=*/true,
+                          /*release_step=*/2,
                           /*contiguous=*/true});
   return info;
 }
@@ -342,10 +430,10 @@ inline ::mirage::runtime::TaskSmemInfo make_ffn_mega_smem_info(int nwarps) {
 // xfer pack (f32 element offsets): the two in-op all-to-alls. inter and y13
 // lifetimes overlap ACROSS tasks (a task can still read inter while another
 // writes y13) so they get disjoint storage.
-inline constexpr int MEGA_XFER_OFF_INTER_F = 0;                    // [1024]
-inline constexpr int MEGA_XFER_OFF_Y13_F = ROUTER_N * RKSPLIT;     // [8*1024]
+inline constexpr int MEGA_XFER_OFF_INTER_F = 0;                // [1024]
+inline constexpr int MEGA_XFER_OFF_Y13_F = ROUTER_N * RKSPLIT; // [8*1024]
 inline constexpr int MEGA_XFER_OFF_SG_F =
-    MEGA_XFER_OFF_Y13_F + MAX_ACTIVE * W13_N;                      // [512]
+    MEGA_XFER_OFF_Y13_F + MAX_ACTIVE * W13_N; // [512]
 inline constexpr int MEGA_XFER_FLOATS = MEGA_XFER_OFF_SG_F + SH_GU_N;
 
 // scales pack (f32 element offsets): w13_s | wgu_s | w2_s | wdn_s.
@@ -401,16 +489,16 @@ inline constexpr int MEGA_ART_BYTES =
 // The monotonic-target scheme (Codex 019f2fab) is robust to varying
 // active_count across iterations: no counter reset, no sense flip.
 // ============================================================================
-inline constexpr int FG_BLOCKS_PER_SLOT = W13_N / 8;  // 1024/8 = 128 W13 blocks
-inline constexpr int FG_SG_BLOCKS = SH_GU_N / 4;      // 512/4  = 128 sg blocks
+inline constexpr int FG_BLOCKS_PER_SLOT = W13_N / 8; // 1024/8 = 128 W13 blocks
+inline constexpr int FG_SG_BLOCKS = SH_GU_N / 4;     // 512/4  = 128 sg blocks
 
 inline constexpr int FGBAR_GB1 = 0;
-inline constexpr int FGBAR_Y_DONE = 2;                       // [MAX_ACTIVE]
+inline constexpr int FGBAR_Y_DONE = 2; // [MAX_ACTIVE]
 inline constexpr int FGBAR_SG_DONE = FGBAR_Y_DONE + MAX_ACTIVE;
-inline constexpr int FGBAR_Y_TARGET = FGBAR_SG_DONE + 1;     // [MAX_ACTIVE]
+inline constexpr int FGBAR_Y_TARGET = FGBAR_SG_DONE + 1; // [MAX_ACTIVE]
 inline constexpr int FGBAR_SG_TARGET = FGBAR_Y_TARGET + MAX_ACTIVE;
 inline constexpr int FGBAR_EPOCH = FGBAR_SG_TARGET + 1;
-inline constexpr int FGBAR_COUNT = FGBAR_EPOCH + 1;          // 21 u64 elements
+inline constexpr int FGBAR_COUNT = FGBAR_EPOCH + 1; // 21 u64 elements
 
 // FG flag layout (M_TK tail, u64[16] — same region as mega). The fg body uses
 // a DIFFERENT flag assignment than coarse mega past GO1:
@@ -421,13 +509,13 @@ inline constexpr int FGBAR_COUNT = FGBAR_EPOCH + 1;          // 21 u64 elements
 //   [7+MAX_ACTIVE ..] epilogue base (mac_task_epilogue -> +[1..3])
 // 7 + MAX_ACTIVE(8) + 3 = 18 > 16 -> enlarge M_TK flags to u64[24] for fg.
 inline constexpr int FG_FLAG_NORM = 0;
-inline constexpr int FG_FLAG_PH1 = 1;                    // [1..3]
+inline constexpr int FG_FLAG_PH1 = 1; // [1..3]
 inline constexpr int FG_FLAG_GO1 = 4;
 inline constexpr int FG_FLAG_META = 5;
-inline constexpr int FG_FLAG_SLOT_SILU = 6;              // [MAX_ACTIVE]
+inline constexpr int FG_FLAG_SLOT_SILU = 6; // [MAX_ACTIVE]
 inline constexpr int FG_FLAG_SG_SILU = FG_FLAG_SLOT_SILU + MAX_ACTIVE;
-inline constexpr int FG_FLAG_EPI = FG_FLAG_SG_SILU + 1;  // epilogue base (+1..3)
-inline constexpr int FG_FLAG_COUNT = FG_FLAG_EPI + 4;    // 19 -> round to 24
+inline constexpr int FG_FLAG_EPI = FG_FLAG_SG_SILU + 1; // epilogue base (+1..3)
+inline constexpr int FG_FLAG_COUNT = FG_FLAG_EPI + 4;   // 19 -> round to 24
 
 // The fg TK region enlarges the flag tail vs mega (M_TK_OFF_FLAGS + 24 u64).
 inline constexpr int FG_TK_OFF_WK = 0;
@@ -437,24 +525,44 @@ inline constexpr int FG_TK_BYTES = FG_TK_OFF_FLAGS + FG_FLAG_COUNT * 8;
 inline ::mirage::runtime::TaskSmemInfo make_ffn_mega_fg_smem_info(int nwarps) {
   int const act_bytes = HIDDEN + KG1 * 4;
   int const ring_bytes = nwarps * GEMV_RING_BYTES_PER_WARP;
-  ::mirage::runtime::TaskSmemInfo info{
-      RQR_NORM_BYTES + act_bytes + ring_bytes + FG_TK_BYTES + W2_ACT_BYTES,
-      /*alignment=*/1024,
-      {}};
-  info.regions.push_back({"megafg_norm", RQR_NORM_BYTES, 1024, /*page_count=*/1,
-                          /*can_pack=*/false, /*release_step=*/2,
+  ::mirage::runtime::TaskSmemInfo info{RQR_NORM_BYTES + act_bytes + ring_bytes +
+                                           FG_TK_BYTES + W2_ACT_BYTES,
+                                       /*alignment=*/1024,
+                                       {}};
+  info.regions.push_back({"megafg_norm",
+                          RQR_NORM_BYTES,
+                          1024,
+                          /*page_count=*/1,
+                          /*can_pack=*/false,
+                          /*release_step=*/2,
                           /*contiguous=*/true});
-  info.regions.push_back({"megafg_act", act_bytes, 1024, /*page_count=*/1,
-                          /*can_pack=*/false, /*release_step=*/2,
+  info.regions.push_back({"megafg_act",
+                          act_bytes,
+                          1024,
+                          /*page_count=*/1,
+                          /*can_pack=*/false,
+                          /*release_step=*/2,
                           /*contiguous=*/true});
-  info.regions.push_back({"megafg_ring", ring_bytes, 1024,
-                          /*page_count=*/nwarps, /*can_pack=*/false,
-                          /*release_step=*/2, /*contiguous=*/true});
-  info.regions.push_back({"megafg_tk", FG_TK_BYTES, 1024, /*page_count=*/1,
-                          /*can_pack=*/true, /*release_step=*/2,
+  info.regions.push_back({"megafg_ring",
+                          ring_bytes,
+                          1024,
+                          /*page_count=*/nwarps,
+                          /*can_pack=*/false,
+                          /*release_step=*/2,
                           /*contiguous=*/true});
-  info.regions.push_back({"megafg_w2act", W2_ACT_BYTES, 1024, /*page_count=*/1,
-                          /*can_pack=*/true, /*release_step=*/2,
+  info.regions.push_back({"megafg_tk",
+                          FG_TK_BYTES,
+                          1024,
+                          /*page_count=*/1,
+                          /*can_pack=*/true,
+                          /*release_step=*/2,
+                          /*contiguous=*/true});
+  info.regions.push_back({"megafg_w2act",
+                          W2_ACT_BYTES,
+                          1024,
+                          /*page_count=*/1,
+                          /*can_pack=*/true,
+                          /*release_step=*/2,
                           /*contiguous=*/true});
   return info;
 }

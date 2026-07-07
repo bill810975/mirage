@@ -85,9 +85,8 @@ namespace v1a = ::kernel::attn_block_megakernel_sm100;
 // error. (K_* / NTHREAD / NWARP / MLA_SPLITS are #defines from the v1 header.)
 static_assert(HIDDEN == K_HIDDEN && QLORA == K_QLORA && KVLORA == K_KVLORA &&
                   QKROPE == K_QKROPE && QKHEAD == K_QKHEAD &&
-                  VHEAD == K_VHEAD && QKVAN == K_QKVAN &&
-                  HLOCAL == K_HLOCAL && OIN == K_OIN && GRP == K_GRP &&
-                  SPLITS == MLA_SPLITS,
+                  VHEAD == K_VHEAD && QKVAN == K_QKVAN && HLOCAL == K_HLOCAL &&
+                  OIN == K_OIN && GRP == K_GRP && SPLITS == MLA_SPLITS,
               "dsv3_attn_v2_spec.h shapes drifted from the v1 kernel");
 static_assert(NTHREAD == 256 && NWARP == 8,
               "the 128-thread exact-tree emulation assumes v1 NTHREAD=256/"
@@ -129,10 +128,9 @@ __device__ __forceinline__ uint64_t attnv2_tag(unsigned long long sync_base,
   // compile out (a nonzero phase tag would make consumers poll flags no
   // helper ever writes). For sync_base >= 1 the packed value is >= 16, and
   // an odd multiplier never maps a nonzero value to 0 mod 2^64.
-  return sync_base == 0
-             ? 0ull
-             : ((sync_base << 4) | (unsigned long long)phase) *
-                   0x9E3779B97F4A7C15ull;
+  return sync_base == 0 ? 0ull
+                        : ((sync_base << 4) | (unsigned long long)phase) *
+                              0x9E3779B97F4A7C15ull;
 }
 __device__ __forceinline__ void attnv2_flag_store_release(uint64_t *f,
                                                           uint64_t v) {
@@ -166,8 +164,7 @@ __device__ __forceinline__ void attnv2_flag_wait(uint64_t *f, uint64_t tag) {
 
 // Consumer -> helper release (GO flag). Consumer-side only; call from
 // thread 0 after the data being published (e.g. the rms_rcp scalar slot).
-__device__ __forceinline__ void
-    attnv2_go(uint64_t *flags, uint64_t tag) {
+__device__ __forceinline__ void attnv2_go(uint64_t *flags, uint64_t tag) {
   if (tag != 0 && threadIdx.x == 0) {
     attnv2_flag_store_release(&flags[0], tag);
   }
@@ -235,10 +232,8 @@ __device__ __forceinline__ void
 // v2 thread t plays v1 threads t (A) and t+128 (B); red8[w]=A-warp-w,
 // red8[w+4]=B-warp-w reproduces v1's 8-slot layout exactly.
 // ============================================================================
-__device__ __forceinline__ float
-    rms_rcp_block_128emu(float const *__restrict__ src,
-                         int n,
-                         float *__restrict__ red8) {
+__device__ __forceinline__ float rms_rcp_block_128emu(
+    float const *__restrict__ src, int n, float *__restrict__ red8) {
   int tid = threadIdx.x, lane = tid & 31, warpl = tid >> 5;
   float psA = 0.f, psB = 0.f;
   for (int i = tid; i < n; i += NTHREAD) {
@@ -308,13 +303,13 @@ __device__ __noinline__ void
   float const *qkv_a_s = static_cast<float const *>(task_desc->input_ptrs[3]);
   float *g_qkva = static_cast<float *>(task_desc->output_ptrs[0]);
 
-  extern __shared__ char smem[];
+  extern __shared__ __align__(1024) char smem[];
   float *s_act = reinterpret_cast<float *>(
       smem + task_desc->smem_region_offset(P0_REGION_WORK));
-  float *red8 = reinterpret_cast<float *>(
-      reinterpret_cast<char *>(s_act) + P0_RED_OFF);
-  float *s_scalar = reinterpret_cast<float *>(
-      reinterpret_cast<char *>(s_act) + P0_SCALAR_OFF);
+  float *red8 =
+      reinterpret_cast<float *>(reinterpret_cast<char *>(s_act) + P0_RED_OFF);
+  float *s_scalar = reinterpret_cast<float *>(reinterpret_cast<char *>(s_act) +
+                                              P0_SCALAR_OFF);
   uint64_t *s_flags = reinterpret_cast<uint64_t *>(
       reinterpret_cast<char *>(s_act) + P0_FLAGS_OFF);
   uint4 *s_ring = reinterpret_cast<uint4 *>(
@@ -436,15 +431,16 @@ __device__ __noinline__ void
   // on (n, K) — the gwarp re-stride is value-exact.
   uint4 *my_ring = s_ring + (size_t)warpl * (P0_RING_BYTES_PER_WARP / 16);
   v1a::gemv_grid_cpa_t<P0_GEMV_RBT, P0_GEMV_STAGES>(s_act,
-                             qkv_a_w,
-                             qkv_a_s,
-                             g_qkva,
-                             K_QKVAN,
-                             K_HIDDEN,
-                             task_offset * nwarps + warpl,
-                             num_tasks * nwarps,
-                             lane,
-                             my_ring);
+                                                    qkv_a_w,
+                                                    qkv_a_s,
+                                                    g_qkva,
+                                                    K_QKVAN,
+                                                    K_HIDDEN,
+                                                    task_offset * nwarps +
+                                                        warpl,
+                                                    num_tasks * nwarps,
+                                                    lane,
+                                                    my_ring);
   attnv2_mac_epilogue(s_flags, attnv2_tag(sync_base, 2), is_consumer);
 }
 
@@ -494,11 +490,11 @@ __device__ __noinline__ void
       static_cast<__nv_bfloat16 *>(task_desc->input_ptrs[6]);
   float *g_qpe = static_cast<float *>(task_desc->output_ptrs[0]);
 
-  extern __shared__ char smem[];
+  extern __shared__ __align__(1024) char smem[];
   float *s_qbdeq = reinterpret_cast<float *>(
       smem + task_desc->smem_region_offset(QB_REGION_WORK));
-  float *red8 = reinterpret_cast<float *>(
-      reinterpret_cast<char *>(s_qbdeq) + QB_RED_OFF);
+  float *red8 =
+      reinterpret_cast<float *>(reinterpret_cast<char *>(s_qbdeq) + QB_RED_OFF);
   float *s_scalar = reinterpret_cast<float *>(
       reinterpret_cast<char *>(s_qbdeq) + QB_SCALAR_OFF);
   uint64_t *s_flags = reinterpret_cast<uint64_t *>(
@@ -593,18 +589,19 @@ __device__ __noinline__ void
 
   // q_b GEMV + fused YaRN rope (VERBATIM v1 template, SMEM activation).
   uint4 *my_ring = s_ring + (size_t)warpl * (QB_RING_BYTES_PER_WARP / 16);
-  v1a::gemv_grid_cpa_qb_rope_smem_t<QB_GEMV_RBT, QB_GEMV_STAGES>(s_qbdeq,
-                                          q_b_w,
-                                          q_b_s,
-                                          g_qpe,
-                                          K_HLOCAL * K_QKHEAD,
-                                          K_QLORA,
-                                          cos_sin,
-                                          pos,
-                                          task_offset * nwarps + warpl,
-                                          num_tasks * nwarps,
-                                          lane,
-                                          my_ring);
+  v1a::gemv_grid_cpa_qb_rope_smem_t<QB_GEMV_RBT, QB_GEMV_STAGES>(
+      s_qbdeq,
+      q_b_w,
+      q_b_s,
+      g_qpe,
+      K_HLOCAL * K_QKHEAD,
+      K_QLORA,
+      cos_sin,
+      pos,
+      task_offset * nwarps + warpl,
+      num_tasks * nwarps,
+      lane,
+      my_ring);
   attnv2_mac_epilogue(s_flags, attnv2_tag(sync_base, 2), is_consumer);
 }
 
@@ -685,10 +682,9 @@ __device__ __forceinline__ void
       bool const has1 = rr1 < nr; // group-uniform (rr0, ngroups uniform)
       uint4 const *kvr0 = reinterpret_cast<uint4 const *>(
           &kv_cache[(size_t)(r0 + rr0) * K_QKHEAD]);
-      uint4 const *kvr1 =
-          has1 ? reinterpret_cast<uint4 const *>(
-                     &kv_cache[(size_t)(r0 + rr1) * K_QKHEAD])
-               : kvr0;
+      uint4 const *kvr1 = has1 ? reinterpret_cast<uint4 const *>(
+                                     &kv_cache[(size_t)(r0 + rr1) * K_QKHEAD])
+                               : kvr0;
       float dot0 = 0.f, dot1 = 0.f;
       for (int c = sub; c < K_QKHEAD / 8; c += TPR) {
         float const *qc = &q[c * 8];
@@ -908,21 +904,33 @@ __device__ __noinline__ void
   float *g_mla_l = static_cast<float *>(task_desc->input_ptrs[3]);
   float *g_mla_acc = static_cast<float *>(task_desc->output_ptrs[0]);
 
-  extern __shared__ char smem[];
+  extern __shared__ __align__(1024) char smem[];
   float *s_score = reinterpret_cast<float *>(
       smem + task_desc->smem_region_offset(MP_REGION_WORK));
-  float *red8 = reinterpret_cast<float *>(
-      reinterpret_cast<char *>(s_score) + MP_RED_OFF);
+  float *red8 =
+      reinterpret_cast<float *>(reinterpret_cast<char *>(s_score) + MP_RED_OFF);
   uint64_t *s_flags = reinterpret_cast<uint64_t *>(
       reinterpret_cast<char *>(s_score) + MP_FLAGS_OFF);
 
   MlaGeom const g = mla_geom(task_offset, iter_num + kv_offset + 1);
-  mla_partial_core(g_qpe, kv_cache, g_mla_m, g_mla_l, g_mla_acc, s_score,
-                   red8, s_flags, nwarps, sync_base, g.h, g.sp, g.nsp, g.r0,
-                   g.nr, g.active);
+  mla_partial_core(g_qpe,
+                   kv_cache,
+                   g_mla_m,
+                   g_mla_l,
+                   g_mla_acc,
+                   s_score,
+                   red8,
+                   s_flags,
+                   nwarps,
+                   sync_base,
+                   g.h,
+                   g.sp,
+                   g.nsp,
+                   g.r0,
+                   g.nr,
+                   g.active);
   // UNCONDITIONAL multi-role epilogue (also on the sp>=nsp no-op path).
-  attnv2_mac_epilogue(s_flags, attnv2_tag(sync_base, 2),
-                      threadIdx.x < 128);
+  attnv2_mac_epilogue(s_flags, attnv2_tag(sync_base, 2), threadIdx.x < 128);
 }
 
 // ============================================================================
@@ -965,24 +973,37 @@ __device__ __noinline__ void
   float *g_attn = static_cast<float *>(task_desc->input_ptrs[6]);
   float *g_attn_deq = static_cast<float *>(task_desc->output_ptrs[0]);
 
-  extern __shared__ char smem[];
+  extern __shared__ __align__(1024) char smem[];
   float *s_score = reinterpret_cast<float *>(
       smem + task_desc->smem_region_offset(MP_REGION_WORK));
-  float *red8 = reinterpret_cast<float *>(
-      reinterpret_cast<char *>(s_score) + MP_RED_OFF);
+  float *red8 =
+      reinterpret_cast<float *>(reinterpret_cast<char *>(s_score) + MP_RED_OFF);
   uint64_t *s_flags = reinterpret_cast<uint64_t *>(
       reinterpret_cast<char *>(s_score) + MP_FLAGS_OFF);
-  int *s_last = reinterpret_cast<int *>(
-      reinterpret_cast<char *>(s_score) + MP_LAST_OFF);
+  int *s_last =
+      reinterpret_cast<int *>(reinterpret_cast<char *>(s_score) + MP_LAST_OFF);
 
   int const tid = threadIdx.x;
   int const lane = tid & 31, warpl = tid >> 5;
   bool const is_consumer = tid < 128;
   MlaGeom const g = mla_geom(task_offset, iter_num + kv_offset + 1);
 
-  mla_partial_core(g_qpe, kv_cache, g_mla_m, g_mla_l, g_mla_acc, s_score,
-                   red8, s_flags, nwarps, sync_base, g.h, g.sp, g.nsp, g.r0,
-                   g.nr, g.active);
+  mla_partial_core(g_qpe,
+                   kv_cache,
+                   g_mla_m,
+                   g_mla_l,
+                   g_mla_acc,
+                   s_score,
+                   red8,
+                   s_flags,
+                   nwarps,
+                   sync_base,
+                   g.h,
+                   g.sp,
+                   g.nsp,
+                   g.r0,
+                   g.nr,
+                   g.active);
 
   if (is_consumer) {
     attn_consumer_sync(); // consumers' V stores folded (v1's __syncthreads)
@@ -1104,14 +1125,13 @@ __device__ __noinline__ void
 #ifdef MPK_DSV3_ATTN_V2_NULLBODY
   return;
 #endif
-  float const *g_mla_acc =
-      static_cast<float const *>(task_desc->input_ptrs[0]);
+  float const *g_mla_acc = static_cast<float const *>(task_desc->input_ptrs[0]);
   float const *g_mla_m = static_cast<float const *>(task_desc->input_ptrs[1]);
   float const *g_mla_l = static_cast<float const *>(task_desc->input_ptrs[2]);
   float *g_attn = static_cast<float *>(task_desc->input_ptrs[3]);
   float *g_attn_deq = static_cast<float *>(task_desc->output_ptrs[0]);
 
-  extern __shared__ char smem[];
+  extern __shared__ __align__(1024) char smem[];
   float *s_attn = reinterpret_cast<float *>(
       smem + task_desc->smem_region_offset(MM_REGION_WORK));
 
@@ -1157,7 +1177,7 @@ __device__ __noinline__ void
     s_attn[d] = v;
     g_attn[h * K_KVLORA + d] = v;
   }
-  attn_consumer_sync(); // v1's __syncthreads before the quant phase
+  attn_consumer_sync();             // v1's __syncthreads before the quant phase
   int const KGv = K_KVLORA / K_GRP; // 4
   if (warpl < KGv) {                // v2 warps 0-3 == v1's active subset
     float const *ar = &s_attn[warpl * K_GRP];
@@ -1248,7 +1268,7 @@ __device__ __noinline__ void
       static_cast<__nv_bfloat16 const *>(task_desc->input_ptrs[3]);
   __nv_bfloat16 *out = static_cast<__nv_bfloat16 *>(task_desc->output_ptrs[0]);
 
-  extern __shared__ char smem[];
+  extern __shared__ __align__(1024) char smem[];
   float *s_odeq = reinterpret_cast<float *>(
       smem + task_desc->smem_region_offset(OP_REGION_WORK));
   uint64_t *s_flags = reinterpret_cast<uint64_t *>(
@@ -1298,17 +1318,18 @@ __device__ __noinline__ void
   attnv2_xrole_barrier(s_flags, attnv2_tag(sync_base, 1), is_consumer);
 
   uint4 *my_ring = s_ring + (size_t)warpl * (OP_RING_BYTES_PER_WARP / 16);
-  v1a::gemv_grid_cpa_oproj_smem_t<OP_GEMV_RBT, OP_GEMV_STAGES>(s_odeq,
-                                        oproj_w,
-                                        oproj_s,
-                                        residual,
-                                        out,
-                                        K_HIDDEN,
-                                        K_OIN,
-                                        task_offset * nwarps + warpl,
-                                        num_tasks * nwarps,
-                                        lane,
-                                        my_ring);
+  v1a::gemv_grid_cpa_oproj_smem_t<OP_GEMV_RBT, OP_GEMV_STAGES>(
+      s_odeq,
+      oproj_w,
+      oproj_s,
+      residual,
+      out,
+      K_HIDDEN,
+      K_OIN,
+      task_offset * nwarps + warpl,
+      num_tasks * nwarps,
+      lane,
+      my_ring);
   attnv2_mac_epilogue(s_flags, attnv2_tag(sync_base, 2), is_consumer);
 }
 

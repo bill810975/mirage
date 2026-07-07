@@ -168,6 +168,23 @@ def build_op(pk, runtime: str, spec: dict, torch_tensors: dict):
             pk.linear_layer_v3(input=x_dt, weight=w_dt, output=out_dt, tiles_per_task=1)
         return {"output": out, "ref": lambda: ref_linear(x, w)}
 
+    if op == "dsv3_lmhead_gemv":
+        # v2 tail lm_head GEMV (M3 fix). Same math as `linear` (out = x @ w.T,
+        # weight [N,K] row-major) but the dedicated non-TMA scalar/cp.async
+        # bf16 GEMV. M is fixed at 1 (bs=1) — the layer computes all M rows the
+        # output has, and at M=1 the reference matches exactly.
+        N, K = spec["N"], spec["K"]
+        block_n = spec.get("block_n", 128)
+        x = torch_tensors.setdefault(f"{name}_x", gen_tensor(f"{name}_x", (M, K), "act"))
+        w = torch_tensors.setdefault(f"{name}_w", gen_tensor(f"{name}_w", (N, K), "w_linear"))
+        out = torch_tensors.setdefault(f"{name}_out", gen_tensor(f"{name}_out", (M, N), "zeros"))
+        x_dt, w_dt, out_dt = attach(x, "x"), attach(w, "w"), attach(out, "out")
+        assert runtime == "v2", "dsv3_lmhead_gemv is a v2-only op"
+        pk.dsv3_lmhead_gemv_layer(
+            input=x_dt, weight=w_dt, output=out_dt, block_n=block_n
+        )
+        return {"output": out, "ref": lambda: ref_linear(x, w)}
+
     if op in ("linear_residual", "linear_residual_v3"):
         N, K = spec["N"], spec["K"]
         x = torch_tensors.setdefault(f"{name}_x", gen_tensor(f"{name}_x", (M, K), "act"))

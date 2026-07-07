@@ -73,10 +73,9 @@ namespace v1k = ::kernel::ffn_full_megakernel_sm100;
 static_assert(HIDDEN == v1k::HIDDEN && W13_N == v1k::W13_N &&
                   W2_K == v1k::W2_K && W2_N == v1k::W2_N && GRP == v1k::GRP &&
                   KG1 == v1k::KG1 && KG2 == v1k::KG2 &&
-                  MAX_ACTIVE == v1k::MAX_ACTIVE &&
-                  ROUTER_N == v1k::ROUTER_N && RKSPLIT == v1k::RKSPLIT &&
-                  SH_GU_N == v1k::SH_GU_N && SH_DN_K == v1k::SH_DN_K &&
-                  KG_SHDN == v1k::KG_SHDN,
+                  MAX_ACTIVE == v1k::MAX_ACTIVE && ROUTER_N == v1k::ROUTER_N &&
+                  RKSPLIT == v1k::RKSPLIT && SH_GU_N == v1k::SH_GU_N &&
+                  SH_DN_K == v1k::SH_DN_K && KG_SHDN == v1k::KG_SHDN,
               "dsv3_ffn_v2_spec.h shapes drifted from the v1 kernel");
 
 // Consumer-warp named barrier (threads 0-127; consumer role only). Barrier 0
@@ -156,8 +155,8 @@ __device__ __forceinline__ void ffnv2_flag_wait(uint64_t *f, uint64_t tag) {
 // LEGACY multi-role epilogue for the UNFOLDED chain's mbar protocol
 // (op_sem_addr < 0 => stage-1: plain consumer barrier only). The folded
 // tasks use the tag-flag epilogue below instead.
-__device__ __forceinline__ void
-    mac_task_epilogue(bool is_consumer, int op_sem_addr) {
+__device__ __forceinline__ void mac_task_epilogue(bool is_consumer,
+                                                  int op_sem_addr) {
   v1k::cpasync_wait<0>();
   __syncwarp();
   if (is_consumer) {
@@ -227,7 +226,7 @@ __device__ __noinline__ void
   float *a_scale = static_cast<float *>(task_desc->input_ptrs[3]);
   float *inter = static_cast<float *>(task_desc->output_ptrs[0]);
 
-  extern __shared__ char smem[];
+  extern __shared__ __align__(1024) char smem[];
   __nv_bfloat16 *s_norm = reinterpret_cast<__nv_bfloat16 *>(
       smem + task_desc->smem_region_offset(RQ_REGION_NORM));
   uint4 *s_ring = reinterpret_cast<uint4 *>(
@@ -240,8 +239,7 @@ __device__ __noinline__ void
 
   // Stage the activation into SMEM (consumers), or wait for it (helpers).
   if (is_consumer) {
-    uint32_t const sb =
-        static_cast<uint32_t>(__cvta_generic_to_shared(s_norm));
+    uint32_t const sb = static_cast<uint32_t>(__cvta_generic_to_shared(s_norm));
     uint4 const *g4 = reinterpret_cast<uint4 const *>(x);
     constexpr int NU4 = HIDDEN * 2 / 16; // 896
     for (int u = threadIdx.x; u < NU4; u += 128) {
@@ -293,11 +291,11 @@ __device__ __noinline__ void
 // op only on task_offset 0). Ends with a consumer_sync (s_meta visible).
 // ============================================================================
 __device__ __forceinline__ void
-    topk_compute(char *wk,                    // TK work region base
-                 float const *inter,          // f32[ROUTER_N*RKSPLIT]
-                 float const *bias,           // f32[ROUTER_N]
-                 __nv_bfloat16 *logits_out,   // bf16[ROUTER_N] or nullptr
-                 int *meta_gmem,              // i32[META_INTS] or nullptr
+    topk_compute(char *wk,                  // TK work region base
+                 float const *inter,        // f32[ROUTER_N*RKSPLIT]
+                 float const *bias,         // f32[ROUTER_N]
+                 __nv_bfloat16 *logits_out, // bf16[ROUTER_N] or nullptr
+                 int *meta_gmem,            // i32[META_INTS] or nullptr
                  int local_expert_start,
                  int num_local_experts,
                  float routed_scaling_factor) {
@@ -532,10 +530,16 @@ __device__ __noinline__ void
   __nv_bfloat16 *logits_out =
       static_cast<__nv_bfloat16 *>(task_desc->input_ptrs[2]);
   int *meta = static_cast<int *>(task_desc->output_ptrs[0]);
-  extern __shared__ char smem[];
+  extern __shared__ __align__(1024) char smem[];
   char *wk = smem + task_desc->smem_region_offset(TK_REGION_WORK);
-  topk_compute(wk, inter, bias, logits_out, meta, local_expert_start,
-               num_local_experts, routed_scaling_factor);
+  topk_compute(wk,
+               inter,
+               bias,
+               logits_out,
+               meta,
+               local_expert_start,
+               num_local_experts,
+               routed_scaling_factor);
 }
 
 // Small helper: load the routing meta into registers (uniform loads).
@@ -578,14 +582,13 @@ __device__ __noinline__ void
       static_cast<uint8_t const *>(task_desc->input_ptrs[1]);
   float const *a_scale_g = static_cast<float const *>(task_desc->input_ptrs[2]);
   uint8_t const *w13 = static_cast<uint8_t const *>(task_desc->input_ptrs[3]);
-  float const *w13_scale =
-      static_cast<float const *>(task_desc->input_ptrs[4]);
+  float const *w13_scale = static_cast<float const *>(task_desc->input_ptrs[4]);
   uint8_t const *wgu = static_cast<uint8_t const *>(task_desc->input_ptrs[5]);
   float const *wgu_s = static_cast<float const *>(task_desc->input_ptrs[6]);
   float *y13 = static_cast<float *>(task_desc->output_ptrs[0]);
   float *sg = static_cast<float *>(task_desc->output_ptrs[1]);
 
-  extern __shared__ char smem[];
+  extern __shared__ __align__(1024) char smem[];
   uint8_t *s_a = reinterpret_cast<uint8_t *>(
       smem + task_desc->smem_region_offset(W13_REGION_ACT));
   float *s_as = reinterpret_cast<float *>(s_a + W13_ACT_SCALE_OFF);
@@ -605,8 +608,7 @@ __device__ __noinline__ void
     }
     uint4 const *gs = reinterpret_cast<uint4 const *>(a_scale_g);
     constexpr int NU4_S = KG1 * 4 / 16; // 14
-    uint32_t const sbs =
-        static_cast<uint32_t>(__cvta_generic_to_shared(s_as));
+    uint32_t const sbs = static_cast<uint32_t>(__cvta_generic_to_shared(s_as));
     for (int u = threadIdx.x; u < NU4_S; u += 128) {
       v1k::cpasync16(sbs + (uint32_t)u * 16, &gs[u]);
     }
@@ -638,8 +640,8 @@ __device__ __noinline__ void
       int const n0 = (idx % (W13_N / RBX_W13)) * RBX_W13;
       int const e = m.experts[slot];
       uint8_t const *wb = w13 + (size_t)e * W13_N * HIDDEN;
-      float const *wsc = w13_scale + (size_t)e * v1k::NB1 * KG1 +
-                         (size_t)(n0 / GRP) * KG1;
+      float const *wsc =
+          w13_scale + (size_t)e * v1k::NB1 * KG1 + (size_t)(n0 / GRP) * KG1;
       float yb[RBX_W13];
       v1k::dgemv_cpa16_h2<RBX_W13, ST_W13>(
           s_a, s_as, wb, wsc, HIDDEN, KG1, n0, lane, my_ring, yb);
@@ -653,9 +655,16 @@ __device__ __noinline__ void
       int const n0 = (idx - n13) * RBX_SH;
       float const *wsc = wgu_s + (size_t)(n0 / GRP) * v1k::KG_SHGU;
       float yb[RBX_SH];
-      v1k::dgemv_cpa16_h2<RBX_SH, ST_SH13>(
-          s_a, s_as, wgu, wsc, v1k::SH_GU_K, v1k::KG_SHGU, n0, lane, my_ring,
-          yb);
+      v1k::dgemv_cpa16_h2<RBX_SH, ST_SH13>(s_a,
+                                           s_as,
+                                           wgu,
+                                           wsc,
+                                           v1k::SH_GU_K,
+                                           v1k::KG_SHGU,
+                                           n0,
+                                           lane,
+                                           my_ring,
+                                           yb);
       if (lane == 0) {
 #pragma unroll
         for (int r = 0; r < RBX_SH; r++) {
@@ -790,7 +799,7 @@ __device__ __noinline__ void
   float const *wdns = static_cast<float const *>(task_desc->input_ptrs[8]);
   __nv_bfloat16 *out = static_cast<__nv_bfloat16 *>(task_desc->output_ptrs[0]);
 
-  extern __shared__ char smem[];
+  extern __shared__ __align__(1024) char smem[];
   uint8_t *s_act = reinterpret_cast<uint8_t *>(
       smem + task_desc->smem_region_offset(W2_REGION_ACT));
   uint8_t *s_ifp8 = s_act;
@@ -805,8 +814,7 @@ __device__ __noinline__ void
   bool const is_consumer = threadIdx.x < 128;
 
   if (is_consumer) {
-    uint32_t const sb =
-        static_cast<uint32_t>(__cvta_generic_to_shared(s_act));
+    uint32_t const sb = static_cast<uint32_t>(__cvta_generic_to_shared(s_act));
     uint4 const *g4 = reinterpret_cast<uint4 const *>(i_fp8_g);
     constexpr int NU4_I = MAX_ACTIVE * W2_K / 16; // 256
     for (int u = threadIdx.x; u < NU4_I; u += 128) {
@@ -856,12 +864,17 @@ __device__ __noinline__ void
       int const e = m.experts[slot];
       float const ew = m.weights[slot];
       float yb[RBLK];
-      v1k::dgemv_cpa16_h2<RBLK, ST_W2>(
-          s_ifp8 + (size_t)slot * W2_K,
-          s_iscale + slot * KG2,
-          w2 + (size_t)e * W2_N * W2_K,
-          w2s + (size_t)e * v1k::NB2 * KG2 + (size_t)(n0 / GRP) * KG2,
-          W2_K, KG2, n0, lane, my_ring, yb);
+      v1k::dgemv_cpa16_h2<RBLK, ST_W2>(s_ifp8 + (size_t)slot * W2_K,
+                                       s_iscale + slot * KG2,
+                                       w2 + (size_t)e * W2_N * W2_K,
+                                       w2s + (size_t)e * v1k::NB2 * KG2 +
+                                           (size_t)(n0 / GRP) * KG2,
+                                       W2_K,
+                                       KG2,
+                                       n0,
+                                       lane,
+                                       my_ring,
+                                       yb);
       if (lane == 0) {
 #pragma unroll
         for (int r = 0; r < RBLK; r++) {
@@ -875,11 +888,16 @@ __device__ __noinline__ void
     for (int sb4 = 0; sb4 < RBLK / RBX_SH; sb4++) {
       int const mm0 = n0 + sb4 * RBX_SH;
       float yb4[RBX_SH];
-      v1k::dgemv_cpa<RBX_SH, ST_SH2>(
-          s_sifp8, s_siscale, wdn,
-          wdns + (size_t)(mm0 / GRP) * KG_SHDN,
-          SH_DN_K, KG_SHDN, mm0, lane,
-          reinterpret_cast<uint32_t *>(my_ring), yb4);
+      v1k::dgemv_cpa<RBX_SH, ST_SH2>(s_sifp8,
+                                     s_siscale,
+                                     wdn,
+                                     wdns + (size_t)(mm0 / GRP) * KG_SHDN,
+                                     SH_DN_K,
+                                     KG_SHDN,
+                                     mm0,
+                                     lane,
+                                     reinterpret_cast<uint32_t *>(my_ring),
+                                     yb4);
       if (lane == 0) {
 #pragma unroll
         for (int r = 0; r < RBX_SH; r++) {
@@ -935,7 +953,7 @@ __device__ __noinline__ void
       static_cast<__nv_bfloat16 *>(task_desc->input_ptrs[5]);
   float *inter = static_cast<float *>(task_desc->output_ptrs[0]);
 
-  extern __shared__ char smem[];
+  extern __shared__ __align__(1024) char smem[];
   char *nb = smem + task_desc->smem_region_offset(RQ_REGION_NORM);
   __nv_bfloat16 *s_norm = reinterpret_cast<__nv_bfloat16 *>(nb);
   float *s_red = reinterpret_cast<float *>(nb + RQR_OFF_RED);
@@ -954,8 +972,7 @@ __device__ __noinline__ void
     // attempt); the same 28KB of reads + 7K FMAs is ~3-4us vectorized.
     // Identical thread mapping + fixed 4-partial sum order per task =>
     // every task still produces identical normed bytes.
-    uint32_t const sb =
-        static_cast<uint32_t>(__cvta_generic_to_shared(s_norm));
+    uint32_t const sb = static_cast<uint32_t>(__cvta_generic_to_shared(s_norm));
     uint4 const *g4 = reinterpret_cast<uint4 const *>(x);
     constexpr int NU4 = HIDDEN * 2 / 16; // 896
     for (int u = threadIdx.x; u < NU4; u += 128) {
@@ -1002,8 +1019,8 @@ __device__ __noinline__ void
       for (int j = 0; j < 4; j++) {
         float2 const fx = __bfloat1622float2(x2[j]);
         float2 const fw = __bfloat1622float2(w2[j]);
-        o2[j] = __floats2bfloat162_rn(fx.x * rms_rcp * fw.x,
-                                      fx.y * rms_rcp * fw.y);
+        o2[j] =
+            __floats2bfloat162_rn(fx.x * rms_rcp * fw.x, fx.y * rms_rcp * fw.y);
       }
       s_norm4[u] = qo;
     }
@@ -1072,8 +1089,7 @@ __device__ __noinline__ void
       static_cast<uint8_t const *>(task_desc->input_ptrs[2]);
   float const *a_scale_g = static_cast<float const *>(task_desc->input_ptrs[3]);
   uint8_t const *w13 = static_cast<uint8_t const *>(task_desc->input_ptrs[4]);
-  float const *w13_scale =
-      static_cast<float const *>(task_desc->input_ptrs[5]);
+  float const *w13_scale = static_cast<float const *>(task_desc->input_ptrs[5]);
   uint8_t const *wgu = static_cast<uint8_t const *>(task_desc->input_ptrs[6]);
   float const *wgu_s = static_cast<float const *>(task_desc->input_ptrs[7]);
   int *meta_gmem = static_cast<int *>(task_desc->input_ptrs[8]);
@@ -1082,7 +1098,7 @@ __device__ __noinline__ void
   float *y13 = static_cast<float *>(task_desc->output_ptrs[0]);
   float *sg = static_cast<float *>(task_desc->output_ptrs[1]);
 
-  extern __shared__ char smem[];
+  extern __shared__ __align__(1024) char smem[];
   uint8_t *s_a = reinterpret_cast<uint8_t *>(
       smem + task_desc->smem_region_offset(W13TK_REGION_ACT));
   float *s_as = reinterpret_cast<float *>(s_a + W13_ACT_SCALE_OFF);
@@ -1106,17 +1122,19 @@ __device__ __noinline__ void
     }
     uint4 const *gs = reinterpret_cast<uint4 const *>(a_scale_g);
     constexpr int NU4_S = KG1 * 4 / 16; // 14
-    uint32_t const sbs =
-        static_cast<uint32_t>(__cvta_generic_to_shared(s_as));
+    uint32_t const sbs = static_cast<uint32_t>(__cvta_generic_to_shared(s_as));
     for (int u = threadIdx.x; u < NU4_S; u += 128) {
       v1k::cpasync16(sbs + (uint32_t)u * 16, &gs[u]);
     }
     v1k::cpasync_commit();
     // (2) redundant per-task topk (task 0 also publishes the GMEM artifacts).
-    topk_compute(tk, inter, bias,
+    topk_compute(tk,
+                 inter,
+                 bias,
                  task_offset == 0 ? logits_out : nullptr,
                  task_offset == 0 ? meta_gmem : nullptr,
-                 local_expert_start, num_local_experts,
+                 local_expert_start,
+                 num_local_experts,
                  routed_scaling_factor);
     // (3) activation staged + s_meta published -> release the helpers.
     v1k::cpasync_wait<0>();
@@ -1147,8 +1165,8 @@ __device__ __noinline__ void
       int const n0 = (idx % (W13_N / RBX_W13)) * RBX_W13;
       int const e = m.experts[slot];
       uint8_t const *wb = w13 + (size_t)e * W13_N * HIDDEN;
-      float const *wsc = w13_scale + (size_t)e * v1k::NB1 * KG1 +
-                         (size_t)(n0 / GRP) * KG1;
+      float const *wsc =
+          w13_scale + (size_t)e * v1k::NB1 * KG1 + (size_t)(n0 / GRP) * KG1;
       float yb[RBX_W13];
       v1k::dgemv_cpa16_h2<RBX_W13, ST_W13>(
           s_a, s_as, wb, wsc, HIDDEN, KG1, n0, lane, my_ring, yb);
@@ -1162,9 +1180,16 @@ __device__ __noinline__ void
       int const n0 = (idx - n13) * RBX_SH;
       float const *wsc = wgu_s + (size_t)(n0 / GRP) * v1k::KG_SHGU;
       float yb[RBX_SH];
-      v1k::dgemv_cpa16_h2<RBX_SH, ST_SH13>(
-          s_a, s_as, wgu, wsc, v1k::SH_GU_K, v1k::KG_SHGU, n0, lane, my_ring,
-          yb);
+      v1k::dgemv_cpa16_h2<RBX_SH, ST_SH13>(s_a,
+                                           s_as,
+                                           wgu,
+                                           wsc,
+                                           v1k::SH_GU_K,
+                                           v1k::KG_SHGU,
+                                           n0,
+                                           lane,
+                                           my_ring,
+                                           yb);
       if (lane == 0) {
 #pragma unroll
         for (int r = 0; r < RBX_SH; r++) {
@@ -1211,7 +1236,7 @@ __device__ __noinline__ void
   float const *wdns = static_cast<float const *>(task_desc->input_ptrs[10]);
   __nv_bfloat16 *out = static_cast<__nv_bfloat16 *>(task_desc->output_ptrs[0]);
 
-  extern __shared__ char smem[];
+  extern __shared__ __align__(1024) char smem[];
   uint8_t *s_act = reinterpret_cast<uint8_t *>(
       smem + task_desc->smem_region_offset(W2_REGION_ACT));
   uint8_t *s_ifp8 = s_act;
@@ -1221,10 +1246,10 @@ __device__ __noinline__ void
   uint4 *s_ring = reinterpret_cast<uint4 *>(
       smem + task_desc->smem_region_offset(W2_REGION_RING));
   // y13/sg staging views over the ring (silu phase only).
-  float *s_y13 = reinterpret_cast<float *>(
-      reinterpret_cast<char *>(s_ring) + W2S_RING_Y13_OFF);
-  float *s_sg = reinterpret_cast<float *>(
-      reinterpret_cast<char *>(s_ring) + W2S_RING_SG_OFF);
+  float *s_y13 = reinterpret_cast<float *>(reinterpret_cast<char *>(s_ring) +
+                                           W2S_RING_Y13_OFF);
+  float *s_sg = reinterpret_cast<float *>(reinterpret_cast<char *>(s_ring) +
+                                          W2S_RING_SG_OFF);
   uint64_t *s_flags = reinterpret_cast<uint64_t *>(s_act + W2_ACT_FLAGS_OFF);
 
   int const lane = threadIdx.x & 31;
@@ -1243,15 +1268,13 @@ __device__ __noinline__ void
   if (is_consumer) {
     // (1) stage y13[0..active*W13_N) + sg into the ring (v1 Phase-2 fast
     // path: one coalesced cp.async run + one wait).
-    uint32_t const sb =
-        static_cast<uint32_t>(__cvta_generic_to_shared(s_y13));
+    uint32_t const sb = static_cast<uint32_t>(__cvta_generic_to_shared(s_y13));
     uint4 const *y4 = reinterpret_cast<uint4 const *>(y13_g);
     int const nu4_y = (m.active_count * W13_N) >> 2; // uint4 count
     for (int u = threadIdx.x; u < nu4_y; u += 128) {
       v1k::cpasync16(sb + (uint32_t)u * 16, &y4[u]);
     }
-    uint32_t const sbs =
-        static_cast<uint32_t>(__cvta_generic_to_shared(s_sg));
+    uint32_t const sbs = static_cast<uint32_t>(__cvta_generic_to_shared(s_sg));
     uint4 const *g4 = reinterpret_cast<uint4 const *>(sg_g);
     constexpr int NU4_SG = SH_GU_N / 4; // 128
     for (int u = threadIdx.x; u < NU4_SG; u += 128) {
@@ -1362,12 +1385,17 @@ __device__ __noinline__ void
       int const e = m.experts[slot];
       float const ew = m.weights[slot];
       float yb[RBLK];
-      v1k::dgemv_cpa16_h2<RBLK, ST_W2>(
-          s_ifp8 + (size_t)slot * W2_K,
-          s_iscale + slot * KG2,
-          w2 + (size_t)e * W2_N * W2_K,
-          w2s + (size_t)e * v1k::NB2 * KG2 + (size_t)(n0 / GRP) * KG2,
-          W2_K, KG2, n0, lane, my_ring, yb);
+      v1k::dgemv_cpa16_h2<RBLK, ST_W2>(s_ifp8 + (size_t)slot * W2_K,
+                                       s_iscale + slot * KG2,
+                                       w2 + (size_t)e * W2_N * W2_K,
+                                       w2s + (size_t)e * v1k::NB2 * KG2 +
+                                           (size_t)(n0 / GRP) * KG2,
+                                       W2_K,
+                                       KG2,
+                                       n0,
+                                       lane,
+                                       my_ring,
+                                       yb);
       if (lane == 0) {
 #pragma unroll
         for (int r = 0; r < RBLK; r++) {
@@ -1379,11 +1407,16 @@ __device__ __noinline__ void
     for (int sb4 = 0; sb4 < RBLK / RBX_SH; sb4++) {
       int const mm0 = n0 + sb4 * RBX_SH;
       float yb4[RBX_SH];
-      v1k::dgemv_cpa<RBX_SH, ST_SH2>(
-          s_sifp8, s_siscale, wdn,
-          wdns + (size_t)(mm0 / GRP) * KG_SHDN,
-          SH_DN_K, KG_SHDN, mm0, lane,
-          reinterpret_cast<uint32_t *>(my_ring), yb4);
+      v1k::dgemv_cpa<RBX_SH, ST_SH2>(s_sifp8,
+                                     s_siscale,
+                                     wdn,
+                                     wdns + (size_t)(mm0 / GRP) * KG_SHDN,
+                                     SH_DN_K,
+                                     KG_SHDN,
+                                     mm0,
+                                     lane,
+                                     reinterpret_cast<uint32_t *>(my_ring),
+                                     yb4);
       if (lane == 0) {
 #pragma unroll
         for (int r = 0; r < RBX_SH; r++) {
@@ -1471,8 +1504,8 @@ __device__ __forceinline__ void
     for (int j = 0; j < 4; j++) {
       float2 const fx = __bfloat1622float2(x2[j]);
       float2 const fw = __bfloat1622float2(w2[j]);
-      o2[j] = __floats2bfloat162_rn(fx.x * rms_rcp * fw.x,
-                                    fx.y * rms_rcp * fw.y);
+      o2[j] =
+          __floats2bfloat162_rn(fx.x * rms_rcp * fw.x, fx.y * rms_rcp * fw.y);
     }
     s_norm4[u] = qo;
   }
@@ -1480,8 +1513,8 @@ __device__ __forceinline__ void
 }
 
 // Consumer-cooperative bf16[HIDDEN] SMEM -> GMEM publish (task-0 artifact).
-__device__ __forceinline__ void
-    ffnv2_publish_norm(__nv_bfloat16 const *s_norm, __nv_bfloat16 *dst) {
+__device__ __forceinline__ void ffnv2_publish_norm(__nv_bfloat16 const *s_norm,
+                                                   __nv_bfloat16 *dst) {
   uint4 const *s4 = reinterpret_cast<uint4 const *>(s_norm);
   uint4 *d4 = reinterpret_cast<uint4 *>(dst);
   constexpr int NU4 = HIDDEN * 2 / 16;
@@ -1542,7 +1575,7 @@ __device__ __noinline__ void
   float *y13 = static_cast<float *>(task_desc->output_ptrs[0]);
   float *sg = static_cast<float *>(task_desc->output_ptrs[1]);
 
-  extern __shared__ char smem[];
+  extern __shared__ __align__(1024) char smem[];
   char *nb = smem + task_desc->smem_region_offset(A_REGION_NORM);
   __nv_bfloat16 *s_norm = reinterpret_cast<__nv_bfloat16 *>(nb);
   float *s_red = reinterpret_cast<float *>(nb + RQR_OFF_RED);
@@ -1623,10 +1656,13 @@ __device__ __noinline__ void
       }
     }
     // redundant per-task topk on the task's own SMEM logits partials.
-    topk_compute(wk, s_inter, bias,
+    topk_compute(wk,
+                 s_inter,
+                 bias,
                  task_offset == 0 ? logits_out : nullptr,
                  task_offset == 0 ? meta_gmem : nullptr,
-                 local_expert_start, num_local_experts,
+                 local_expert_start,
+                 num_local_experts,
                  routed_scaling_factor);
     if (sync_tag != 0 && threadIdx.x == 0) {
       ffnv2_flag_store_release(&s_flags[4], sync_tag); // META_READY
@@ -1658,8 +1694,8 @@ __device__ __noinline__ void
       int const n0 = (idx % (W13_N / RBX_W13)) * RBX_W13;
       int const e = m.experts[slot];
       uint8_t const *wb = w13 + (size_t)e * W13_N * HIDDEN;
-      float const *wsc = w13_scale + (size_t)e * v1k::NB1 * KG1 +
-                         (size_t)(n0 / GRP) * KG1;
+      float const *wsc =
+          w13_scale + (size_t)e * v1k::NB1 * KG1 + (size_t)(n0 / GRP) * KG1;
       float yb[RBX_W13];
       v1k::dgemv_cpa16_h2<RBX_W13, ST_W13>(
           s_a, s_as, wb, wsc, HIDDEN, KG1, n0, lane, my_ring, yb);
@@ -1673,9 +1709,16 @@ __device__ __noinline__ void
       int const n0 = (idx - n13) * RBX_SH;
       float const *wsc = wgu_s + (size_t)(n0 / GRP) * v1k::KG_SHGU;
       float yb[RBX_SH];
-      v1k::dgemv_cpa16_h2<RBX_SH, ST_SH13>(
-          s_a, s_as, wgu, wsc, v1k::SH_GU_K, v1k::KG_SHGU, n0, lane, my_ring,
-          yb);
+      v1k::dgemv_cpa16_h2<RBX_SH, ST_SH13>(s_a,
+                                           s_as,
+                                           wgu,
+                                           wsc,
+                                           v1k::SH_GU_K,
+                                           v1k::KG_SHGU,
+                                           n0,
+                                           lane,
+                                           my_ring,
+                                           yb);
       if (lane == 0) {
 #pragma unroll
         for (int r = 0; r < RBX_SH; r++) {
@@ -1742,7 +1785,7 @@ __device__ __noinline__ void
   uint8_t *art = static_cast<uint8_t *>(task_desc->input_ptrs[11]);
   __nv_bfloat16 *out = static_cast<__nv_bfloat16 *>(task_desc->output_ptrs[0]);
 
-  extern __shared__ char smem[];
+  extern __shared__ __align__(1024) char smem[];
   char *nb = smem + task_desc->smem_region_offset(M_REGION_NORM);
   __nv_bfloat16 *s_norm = reinterpret_cast<__nv_bfloat16 *>(nb);
   float *s_red = reinterpret_cast<float *>(nb + RQR_OFF_RED);
@@ -1762,10 +1805,10 @@ __device__ __noinline__ void
   uint8_t *s_sifp8 = s_act + W2_ACT_SIFP8_OFF;
   float *s_siscale = reinterpret_cast<float *>(s_act + W2_ACT_SISCALE_OFF);
   // y13/sg staging views over the ring (silu phase only; consumer slices).
-  float *s_y13 = reinterpret_cast<float *>(
-      reinterpret_cast<char *>(s_ring) + W2S_RING_Y13_OFF);
-  float *s_sg = reinterpret_cast<float *>(
-      reinterpret_cast<char *>(s_ring) + W2S_RING_SG_OFF);
+  float *s_y13 = reinterpret_cast<float *>(reinterpret_cast<char *>(s_ring) +
+                                           W2S_RING_Y13_OFF);
+  float *s_sg = reinterpret_cast<float *>(reinterpret_cast<char *>(s_ring) +
+                                          W2S_RING_SG_OFF);
 
   int const lane = threadIdx.x & 31;
   int const ws = threadIdx.x >> 5;
@@ -1851,13 +1894,17 @@ __device__ __noinline__ void
       }
     }
     topk_compute(
-        wk, g_inter, bias,
+        wk,
+        g_inter,
+        bias,
         task_offset == 0
             ? reinterpret_cast<__nv_bfloat16 *>(art + MEGA_ART_OFF_LOGITS)
             : nullptr,
         task_offset == 0 ? reinterpret_cast<int *>(art + MEGA_ART_OFF_META)
                          : nullptr,
-        local_expert_start, num_local_experts, routed_scaling_factor);
+        local_expert_start,
+        num_local_experts,
+        routed_scaling_factor);
     if (has_helpers && threadIdx.x == 0) {
       ffnv2_flag_store_release(&s_flags[5], sync_tag); // META_READY
     }
@@ -1883,8 +1930,8 @@ __device__ __noinline__ void
         int const n0 = (idx % (W13_N / RBX_W13)) * RBX_W13;
         int const e = m.experts[slot];
         uint8_t const *wb = w13 + (size_t)e * W13_N * HIDDEN;
-        float const *wsc = w13_scale + (size_t)e * v1k::NB1 * KG1 +
-                           (size_t)(n0 / GRP) * KG1;
+        float const *wsc =
+            w13_scale + (size_t)e * v1k::NB1 * KG1 + (size_t)(n0 / GRP) * KG1;
         float yb[RBX_W13];
         v1k::dgemv_cpa16_h2<RBX_W13, ST_W13>(
             s_a, s_as, wb, wsc, HIDDEN, KG1, n0, lane, my_ring, yb);
@@ -1898,9 +1945,16 @@ __device__ __noinline__ void
         int const n0 = (idx - n13) * RBX_SH;
         float const *wsc = wgu_s + (size_t)(n0 / GRP) * v1k::KG_SHGU;
         float yb[RBX_SH];
-        v1k::dgemv_cpa16_h2<RBX_SH, ST_SH13>(
-            s_a, s_as, wgu, wsc, v1k::SH_GU_K, v1k::KG_SHGU, n0, lane,
-            my_ring, yb);
+        v1k::dgemv_cpa16_h2<RBX_SH, ST_SH13>(s_a,
+                                             s_as,
+                                             wgu,
+                                             wsc,
+                                             v1k::SH_GU_K,
+                                             v1k::KG_SHGU,
+                                             n0,
+                                             lane,
+                                             my_ring,
+                                             yb);
         if (lane == 0) {
 #pragma unroll
           for (int r = 0; r < RBX_SH; r++) {
@@ -1943,15 +1997,13 @@ __device__ __noinline__ void
 
   // ---- P3: redundant silu+requant (consumers, verbatim w2_silu) -----------
   if (is_consumer) {
-    uint32_t const sb =
-        static_cast<uint32_t>(__cvta_generic_to_shared(s_y13));
+    uint32_t const sb = static_cast<uint32_t>(__cvta_generic_to_shared(s_y13));
     uint4 const *y4 = reinterpret_cast<uint4 const *>(g_y13);
     int const nu4_y = (m.active_count * W13_N) >> 2;
     for (int u = threadIdx.x; u < nu4_y; u += 128) {
       v1k::cpasync16(sb + (uint32_t)u * 16, &y4[u]);
     }
-    uint32_t const sbs =
-        static_cast<uint32_t>(__cvta_generic_to_shared(s_sg));
+    uint32_t const sbs = static_cast<uint32_t>(__cvta_generic_to_shared(s_sg));
     uint4 const *g4 = reinterpret_cast<uint4 const *>(g_sg);
     constexpr int NU4_SG = SH_GU_N / 4;
     for (int u = threadIdx.x; u < NU4_SG; u += 128) {
@@ -2064,12 +2116,17 @@ __device__ __noinline__ void
         int const e = m.experts[slot];
         float const ew = m.weights[slot];
         float yb[RBLK];
-        v1k::dgemv_cpa16_h2<RBLK, ST_W2>(
-            s_ifp8 + (size_t)slot * W2_K,
-            s_iscale + slot * KG2,
-            w2 + (size_t)e * W2_N * W2_K,
-            w2s + (size_t)e * v1k::NB2 * KG2 + (size_t)(n0 / GRP) * KG2,
-            W2_K, KG2, n0, lane, my_ring, yb);
+        v1k::dgemv_cpa16_h2<RBLK, ST_W2>(s_ifp8 + (size_t)slot * W2_K,
+                                         s_iscale + slot * KG2,
+                                         w2 + (size_t)e * W2_N * W2_K,
+                                         w2s + (size_t)e * v1k::NB2 * KG2 +
+                                             (size_t)(n0 / GRP) * KG2,
+                                         W2_K,
+                                         KG2,
+                                         n0,
+                                         lane,
+                                         my_ring,
+                                         yb);
         if (lane == 0) {
 #pragma unroll
           for (int r = 0; r < RBLK; r++) {
@@ -2081,11 +2138,16 @@ __device__ __noinline__ void
       for (int sb4 = 0; sb4 < RBLK / RBX_SH; sb4++) {
         int const mm0 = n0 + sb4 * RBX_SH;
         float yb4[RBX_SH];
-        v1k::dgemv_cpa<RBX_SH, ST_SH2>(
-            s_sifp8, s_siscale, wdn,
-            wdns + (size_t)(mm0 / GRP) * KG_SHDN,
-            SH_DN_K, KG_SHDN, mm0, lane,
-            reinterpret_cast<uint32_t *>(my_ring), yb4);
+        v1k::dgemv_cpa<RBX_SH, ST_SH2>(s_sifp8,
+                                       s_siscale,
+                                       wdn,
+                                       wdns + (size_t)(mm0 / GRP) * KG_SHDN,
+                                       SH_DN_K,
+                                       KG_SHDN,
+                                       mm0,
+                                       lane,
+                                       reinterpret_cast<uint32_t *>(my_ring),
+                                       yb4);
         if (lane == 0) {
 #pragma unroll
           for (int r = 0; r < RBX_SH; r++) {
@@ -2102,7 +2164,8 @@ __device__ __noinline__ void
     }
   }
 
-  mac_task_epilogue(is_consumer, &s_flags[11],
+  mac_task_epilogue(is_consumer,
+                    &s_flags[11],
                     has_helpers ? sync_tag : 0ull); // uses [12..14]
 }
 
@@ -2184,7 +2247,7 @@ __device__ __noinline__ void
   unsigned long long *sg_target = bar + FGBAR_SG_TARGET;
   unsigned long long *epoch = bar + FGBAR_EPOCH;
 
-  extern __shared__ char smem[];
+  extern __shared__ __align__(1024) char smem[];
   char *nb = smem + task_desc->smem_region_offset(M_REGION_NORM);
   __nv_bfloat16 *s_norm = reinterpret_cast<__nv_bfloat16 *>(nb);
   float *s_red = reinterpret_cast<float *>(nb + RQR_OFF_RED);
@@ -2205,10 +2268,10 @@ __device__ __noinline__ void
   float *s_siscale = reinterpret_cast<float *>(s_act + W2_ACT_SISCALE_OFF);
   // per-slot y13 staging overlay into the ring (one slot at a time in stream
   // mode; the whole active y13 in control mode).
-  float *s_y13 = reinterpret_cast<float *>(
-      reinterpret_cast<char *>(s_ring) + W2S_RING_Y13_OFF);
-  float *s_sg = reinterpret_cast<float *>(
-      reinterpret_cast<char *>(s_ring) + W2S_RING_SG_OFF);
+  float *s_y13 = reinterpret_cast<float *>(reinterpret_cast<char *>(s_ring) +
+                                           W2S_RING_Y13_OFF);
+  float *s_sg = reinterpret_cast<float *>(reinterpret_cast<char *>(s_ring) +
+                                          W2S_RING_SG_OFF);
 
   int const lane = threadIdx.x & 31;
   int const ws = threadIdx.x >> 5;
@@ -2295,13 +2358,17 @@ __device__ __noinline__ void
       }
     }
     topk_compute(
-        wk, g_inter, bias,
+        wk,
+        g_inter,
+        bias,
         task_offset == 0
             ? reinterpret_cast<__nv_bfloat16 *>(art + MEGA_ART_OFF_LOGITS)
             : nullptr,
         task_offset == 0 ? reinterpret_cast<int *>(art + MEGA_ART_OFF_META)
                          : nullptr,
-        local_expert_start, num_local_experts, routed_scaling_factor);
+        local_expert_start,
+        num_local_experts,
+        routed_scaling_factor);
     if (has_helpers && threadIdx.x == 0) {
       ffnv2_flag_store_release(&s_flags[FG_FLAG_META], sync_tag);
     }
@@ -2366,8 +2433,8 @@ __device__ __noinline__ void
         int const n0 = (idx % (W13_N / RBX_W13)) * RBX_W13;
         int const e = m.experts[slot];
         uint8_t const *wb = w13 + (size_t)e * W13_N * HIDDEN;
-        float const *wsc = w13_scale + (size_t)e * v1k::NB1 * KG1 +
-                           (size_t)(n0 / GRP) * KG1;
+        float const *wsc =
+            w13_scale + (size_t)e * v1k::NB1 * KG1 + (size_t)(n0 / GRP) * KG1;
         float yb[RBX_W13];
         v1k::dgemv_cpa16_h2<RBX_W13, ST_W13>(
             s_a, s_as, wb, wsc, HIDDEN, KG1, n0, lane, my_ring, yb);
@@ -2382,9 +2449,16 @@ __device__ __noinline__ void
         int const n0 = (idx - n13) * RBX_SH;
         float const *wsc = wgu_s + (size_t)(n0 / GRP) * v1k::KG_SHGU;
         float yb[RBX_SH];
-        v1k::dgemv_cpa16_h2<RBX_SH, ST_SH13>(
-            s_a, s_as, wgu, wsc, v1k::SH_GU_K, v1k::KG_SHGU, n0, lane,
-            my_ring, yb);
+        v1k::dgemv_cpa16_h2<RBX_SH, ST_SH13>(s_a,
+                                             s_as,
+                                             wgu,
+                                             wsc,
+                                             v1k::SH_GU_K,
+                                             v1k::KG_SHGU,
+                                             n0,
+                                             lane,
+                                             my_ring,
+                                             yb);
         if (lane == 0) {
 #pragma unroll
           for (int r = 0; r < RBX_SH; r++) {
@@ -2507,12 +2581,17 @@ __device__ __noinline__ void
         int const e = m.experts[slot];
         float const ew = m.weights[slot];
         float yb[RBLK];
-        v1k::dgemv_cpa16_h2<RBLK, ST_W2>(
-            s_ifp8 + (size_t)slot * W2_K,
-            s_iscale + slot * KG2,
-            w2 + (size_t)e * W2_N * W2_K,
-            w2s + (size_t)e * v1k::NB2 * KG2 + (size_t)(n0 / GRP) * KG2,
-            W2_K, KG2, n0, lane, my_ring, yb);
+        v1k::dgemv_cpa16_h2<RBLK, ST_W2>(s_ifp8 + (size_t)slot * W2_K,
+                                         s_iscale + slot * KG2,
+                                         w2 + (size_t)e * W2_N * W2_K,
+                                         w2s + (size_t)e * v1k::NB2 * KG2 +
+                                             (size_t)(n0 / GRP) * KG2,
+                                         W2_K,
+                                         KG2,
+                                         n0,
+                                         lane,
+                                         my_ring,
+                                         yb);
         if (lane == 0) {
 #pragma unroll
           for (int r = 0; r < RBLK; r++) {
@@ -2600,11 +2679,16 @@ __device__ __noinline__ void
       for (int sb4 = 0; sb4 < RBLK / RBX_SH; sb4++) {
         int const mm0 = n0 + sb4 * RBX_SH;
         float yb4[RBX_SH];
-        v1k::dgemv_cpa<RBX_SH, ST_SH2>(
-            s_sifp8, s_siscale, wdn,
-            wdns + (size_t)(mm0 / GRP) * KG_SHDN,
-            SH_DN_K, KG_SHDN, mm0, lane,
-            reinterpret_cast<uint32_t *>(my_ring), yb4);
+        v1k::dgemv_cpa<RBX_SH, ST_SH2>(s_sifp8,
+                                       s_siscale,
+                                       wdn,
+                                       wdns + (size_t)(mm0 / GRP) * KG_SHDN,
+                                       SH_DN_K,
+                                       KG_SHDN,
+                                       mm0,
+                                       lane,
+                                       reinterpret_cast<uint32_t *>(my_ring),
+                                       yb4);
         if (lane == 0) {
 #pragma unroll
           for (int r = 0; r < RBX_SH; r++) {
@@ -2748,12 +2832,17 @@ __device__ __noinline__ void
         int const e = m.experts[slot];
         float const ew = m.weights[slot];
         float yb[RBLK];
-        v1k::dgemv_cpa16_h2<RBLK, ST_W2>(
-            s_ifp8 + (size_t)slot * W2_K,
-            s_iscale + slot * KG2,
-            w2 + (size_t)e * W2_N * W2_K,
-            w2s + (size_t)e * v1k::NB2 * KG2 + (size_t)(n0 / GRP) * KG2,
-            W2_K, KG2, n0, lane, my_ring, yb);
+        v1k::dgemv_cpa16_h2<RBLK, ST_W2>(s_ifp8 + (size_t)slot * W2_K,
+                                         s_iscale + slot * KG2,
+                                         w2 + (size_t)e * W2_N * W2_K,
+                                         w2s + (size_t)e * v1k::NB2 * KG2 +
+                                             (size_t)(n0 / GRP) * KG2,
+                                         W2_K,
+                                         KG2,
+                                         n0,
+                                         lane,
+                                         my_ring,
+                                         yb);
         if (lane == 0) {
 #pragma unroll
           for (int r = 0; r < RBLK; r++) {
@@ -2765,11 +2854,16 @@ __device__ __noinline__ void
       for (int sb4 = 0; sb4 < RBLK / RBX_SH; sb4++) {
         int const mm0 = n0 + sb4 * RBX_SH;
         float yb4[RBX_SH];
-        v1k::dgemv_cpa<RBX_SH, ST_SH2>(
-            s_sifp8, s_siscale, wdn,
-            wdns + (size_t)(mm0 / GRP) * KG_SHDN,
-            SH_DN_K, KG_SHDN, mm0, lane,
-            reinterpret_cast<uint32_t *>(my_ring), yb4);
+        v1k::dgemv_cpa<RBX_SH, ST_SH2>(s_sifp8,
+                                       s_siscale,
+                                       wdn,
+                                       wdns + (size_t)(mm0 / GRP) * KG_SHDN,
+                                       SH_DN_K,
+                                       KG_SHDN,
+                                       mm0,
+                                       lane,
+                                       reinterpret_cast<uint32_t *>(my_ring),
+                                       yb4);
         if (lane == 0) {
 #pragma unroll
           for (int r = 0; r < RBX_SH; r++) {
@@ -2786,7 +2880,8 @@ __device__ __noinline__ void
     }
   }
 
-  mac_task_epilogue(is_consumer, &s_flags[FG_FLAG_EPI],
+  mac_task_epilogue(is_consumer,
+                    &s_flags[FG_FLAG_EPI],
                     has_helpers ? sync_tag : 0ull); // uses [+1..3]
 }
 
