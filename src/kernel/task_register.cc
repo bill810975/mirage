@@ -8798,14 +8798,18 @@ int TaskRegister::register_rmsnorm_hopper_v2_task(
       register_task_variant(TASK_RMS_NORM_HOPPER_V2, code.to_string());
   // Phase 2: only consumer needs the dep-wait (other roles are no-ops).
   // Drop the empty role bodies — they were calling empty `run` methods.
+  TaskRoleVariantCode rms_role_code{/*init_semaphores=*/"",
+                                    /*loader=*/"",
+                                    /*launcher=*/"",
+                                    /*consumer=*/consumer_code.to_string(),
+                                    /*storer=*/""};
+  // Design E opt-in (race-2 fix): host the used-page claim on the consumer,
+  // program-ordered before the body; the loader prefix skips used pages.
+  // Validated for rmsnorm across the M1/M2 wedge windows (see
+  // v2_role_codegen.cc kConsumerPageClaim).
+  rms_role_code.consumer_owned_page_claim = true;
   register_v2_task_role_variant(
-      TASK_RMS_NORM_HOPPER_V2,
-      variant,
-      TaskRoleVariantCode{/*init_semaphores=*/"",
-                          /*loader=*/"",
-                          /*launcher=*/"",
-                          /*consumer=*/consumer_code.to_string(),
-                          /*storer=*/""});
+      TASK_RMS_NORM_HOPPER_V2, variant, rms_role_code);
 
   // SMEM layout (region count, names, sizes, alignments, release_steps) is
   // owned by include/.../tasks/blackwell_v2/rmsnorm_v2_spec.h, which is the
@@ -8864,14 +8868,14 @@ int TaskRegister::register_silu_mul_v2_task(threadblock::Graph const &bgraph,
   emit_dep_wait_consumer_prefix(consumer_code);
   emit_silu_body(consumer_code);
   int variant = register_task_variant(TASK_SILU_MUL_V2, code.to_string());
-  register_v2_task_role_variant(
-      TASK_SILU_MUL_V2,
-      variant,
-      TaskRoleVariantCode{/*init_semaphores=*/"",
-                          /*loader=*/"",
-                          /*launcher=*/"",
-                          /*consumer=*/consumer_code.to_string(),
-                          /*storer=*/""});
+  TaskRoleVariantCode silu_role_code{/*init_semaphores=*/"",
+                                     /*loader=*/"",
+                                     /*launcher=*/"",
+                                     /*consumer=*/consumer_code.to_string(),
+                                     /*storer=*/""};
+  // Design E opt-in (race-2 fix) — see the rmsnorm registration above.
+  silu_role_code.consumer_owned_page_claim = true;
+  register_v2_task_role_variant(TASK_SILU_MUL_V2, variant, silu_role_code);
   // silu_mul kernel is GMEM-only (no shared memory).
   register_variant_smem_info(
       TASK_SILU_MUL_V2, variant, ::kernel::silu_mul_v2::make_smem_info());

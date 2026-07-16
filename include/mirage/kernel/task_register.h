@@ -63,6 +63,19 @@ struct TaskRoleVariantCode {
   //     (e.g. linear's per-stage release in 3.5b).
   bool auto_loader_page_lifecycle = true;
   bool auto_consumer_finish = true;
+  // Design E (race-2 fix, 2026-07-16): EXPLICIT OPT-IN to consumer-owned
+  // page claiming — the codegen hosts the USED-page claim on the consumer
+  // (before the body) and the loader prefix skips used pages, closing the
+  // cross-warp release-before-claim race for this task. Only meaningful for
+  // auto_consumer_finish tasks whose loader/launcher/storer bodies are all
+  // empty (the emitter enforces the structural predicate on top of this
+  // flag). Opt-in rather than automatic: the DSv3 FFN GEMV chain
+  // (consumer-only at nwarps=4) wedged its page-claim wait under the
+  // automatic transform in harness validation (mechanism unresolved), so
+  // only tasks validated with the claim may set this. Currently: rmsnorm_v2
+  // and silu_mul_v2 (the tasks whose suffix races produced the observed
+  // production wedge).
+  bool consumer_owned_page_claim = false;
 };
 
 class TaskRegister {
