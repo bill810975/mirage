@@ -95,3 +95,10 @@ docs/mpk/V2_CODEBASE.md
 docs/mpk/V2_TODO.md
 demo/linear_v3_unittest.py
 *.perfetto-trace*
+
+!.claude/
+.claude/*
+!.claude/skills/
+!.claude/agents/
+!.claude/skills/**
+!.claude/agents/**

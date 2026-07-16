@@ -1437,6 +1437,55 @@ __host__ inline void fill_tma_desc_by_task(CUtensorMap *tma_desc,
       }
       break;
     }
+    case TASK_DSV3_FFN_W13_PIPE_V2:
+    case TASK_DSV3_FFN_W2_PIPE_V2: {
+      // FFN pipe per-tile tasks: fp8 e4m3 weight tiles [128 rows x bK=128],
+      // 128B swizzle, one 16 KB tile per TMA (== one SMEM W page). Same 2D
+      // GMEM_ROW expert-flattening as the v1 group GEMM (rows =
+      // (E-1)*orig_N + N; here tensors are UNPARTITIONED so orig_N == N and
+      // the row space is exactly E*N; expert e's tile row = e*N + n0).
+      // Weight param ids: W13 pipe -> [3] (w13 3D [E,N,K] routed, or wgu 2D
+      // [N,K] shared, E=1); W2 pipe -> [5] (w2 3D) and [7] (wdn 2D).
+      constexpr int FP8_BK = 128;
+      constexpr int B = 3;
+      constexpr int M = 3;
+      constexpr int S = 3;
+      constexpr int MMA_M = 128;
+      bool const is_weight_param =
+          (task_desc.task_type == TASK_DSV3_FFN_W13_PIPE_V2 && param_id == 3) ||
+          (task_desc.task_type == TASK_DSV3_FFN_W2_PIPE_V2 &&
+           (param_id == 5 || param_id == 7));
+      if (is_weight_param) {
+        int num_experts, output_size, reduction_size, orig_output_size;
+        if (tensor_desc.num_dims == 3) { // routed [E, N, K]
+          num_experts = tensor_desc.dim[0];
+          output_size = tensor_desc.dim[1];
+          reduction_size = tensor_desc.dim[2];
+          orig_output_size = tensor_desc.stride[0] / tensor_desc.stride[1];
+        } else { // shared [N, K]
+          assert(tensor_desc.num_dims == 2);
+          num_experts = 1;
+          output_size = tensor_desc.dim[0];
+          reduction_size = tensor_desc.dim[1];
+          orig_output_size = output_size;
+        }
+        uint64_t gmem_shape[2] = {
+            static_cast<uint64_t>((num_experts - 1) * orig_output_size +
+                                  output_size),
+            static_cast<uint64_t>(reduction_size)};
+        uint64_t gmem_stride[2] = {1, static_cast<uint64_t>(reduction_size)};
+        uint32_t smem_shape[2] = {static_cast<uint32_t>(MMA_M),
+                                  static_cast<uint32_t>(FP8_BK)};
+        fill_tma_desc<uint8_t, B, M, S, 2>(tma_desc,
+                                           tensor_desc.base_ptr,
+                                           gmem_shape,
+                                           gmem_stride,
+                                           smem_shape,
+                                           /*smem_repeat_row=*/1,
+                                           /*smem_repeat_col=*/1);
+      }
+      break;
+    }
     case TASK_MOE_W13_LINEAR_SM90:
     case TASK_MOE_W2_LINEAR_SM90: {
       int const cp_async_size = 64;
@@ -2426,6 +2475,19 @@ __host__ inline void create_tma_desc_by_task(FullTaskDesc &task_desc) {
               ? task_desc.inputs[param_id]
               : task_desc.outputs[param_id - task_desc.num_inputs];
       create_tma_desc_for_tensor(task_desc, tensor_desc, param_id, 0);
+      break;
+    }
+    case TASK_DSV3_FFN_W13_PIPE_V2: {
+      // only the fp8 weight (input 3: w13 [E,N,K] routed / wgu [N,K] shared)
+      // gets a tma_desc; activations/scales are raw pointers (cp.async).
+      create_tma_desc_for_tensor(task_desc, task_desc.inputs[3], 3, 0);
+      break;
+    }
+    case TASK_DSV3_FFN_W2_PIPE_V2: {
+      // two fp8 weight descs: input 5 (w2 [E,7168,512]) and input 7
+      // (wdn [7168,256]); everything else is raw pointers (cp.async).
+      create_tma_desc_for_tensor(task_desc, task_desc.inputs[5], 5, 0);
+      create_tma_desc_for_tensor(task_desc, task_desc.inputs[7], 7, 0);
       break;
     }
     case TASK_RMS_NORM_HOPPER: {

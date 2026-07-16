@@ -178,6 +178,13 @@ public:
                                            std::vector<int> const &params);
   int register_dsv3_ffn_w2_gemv_v2_task(threadblock::Graph const &bgraph,
                                         std::vector<int> const &params);
+  // DSv3 W13/W2 grouped GEMM as PER-TILE v2 PIPELINE tasks (ffn item 1;
+  // reference role pipeline, blackwell_v2/dsv3_ffn_gg_v2.cuh). W13 params:
+  // [always_active] (0 = routed 64 tasks, 1 = shared gate_up 4 tasks).
+  int register_dsv3_ffn_w13_pipe_v2_task(threadblock::Graph const &bgraph,
+                                         std::vector<int> const &params);
+  int register_dsv3_ffn_w2_pipe_v2_task(threadblock::Graph const &bgraph,
+                                        std::vector<int> const &params);
   int register_dsv3_lmhead_gemv_v2_task(threadblock::Graph const &bgraph,
                                         std::vector<int> const &params);
   // Folded 3-op variant (router_quant_rms -> w13_topk -> w2_silu).

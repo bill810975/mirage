@@ -244,18 +244,35 @@ __device__ int volatile g_v2_prof_window = 0;
   PROFILER_INIT(static_cast<uint64_t *>(config.profiler_buffer),               \
                 (grp),                                                         \
                 V2_PROF_NUM_GROUPS,                                            \
-                (pred));
+                (pred));                                                       \
+  bool const _prof_pred_base = profiler_write_thread_predicate;
 #define MPK_V2_PROF_IN_WINDOW(it)                                              \
   ((it) + V2_PROF_WINDOW_ITERS >= config.v2_max_iters)
+// BRANCHLESS wrap (2026-07-15): the window test used to be an if/else wrapped
+// around each task body's START/END events. sm100 codegen is sensitive to
+// if/else around tcgen05 waits (see the sm100_branch_ima note below at
+// MPK_V2_TIMED_WAIT_IF), and the window-gated branch shape wedged profiled
+// runs at gate density on the candidate-free reference linear chain
+// (all-role convoy jam, in-window iterations only; unprofiled passed at
+// every scale). Fold the window test into the profiler's store predicate
+// (profiler_write_thread_predicate) instead: control flow around
+// execute_task is now IDENTICAL in- and out-of-window — only the predicate
+// VALUE changes. Emitted events are unchanged (stores still fire only
+// in-window on the designated writer thread; tags/timestamps/event_no
+// counter identical: _prof_ctr advances only in-window, branch-free).
 #define MPK_V2_PROF_START(ev)                                                  \
-  if (MPK_V2_PROF_IN_WINDOW(iter_num)) {                                       \
+  do {                                                                         \
+    profiler_write_thread_predicate =                                          \
+        _prof_pred_base && MPK_V2_PROF_IN_WINDOW(iter_num);                    \
     PROFILER_EVENT_START((ev), _prof_ctr);                                     \
-  }
+  } while (0)
 #define MPK_V2_PROF_END(ev)                                                    \
-  if (MPK_V2_PROF_IN_WINDOW(iter_num)) {                                       \
+  do {                                                                         \
+    profiler_write_thread_predicate =                                          \
+        _prof_pred_base && MPK_V2_PROF_IN_WINDOW(iter_num);                    \
     PROFILER_EVENT_END((ev), _prof_ctr);                                       \
-    _prof_ctr++;                                                               \
-  }
+    _prof_ctr += (MPK_V2_PROF_IN_WINDOW(iter_num) ? 1u : 0u);                  \
+  } while (0)
 // Conditionally-timed wait: time `expr` only when `cond` (e.g. cold-start lap),
 // else run it plain. The cond/branch exists ONLY in profiling builds; the
 // non-profiling form (below) is a bare `expr`, textually identical to baseline

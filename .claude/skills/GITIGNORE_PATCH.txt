@@ -1,0 +1,41 @@
+# GITIGNORE PATCH — make .claude/skills/** and .claude/agents/** trackable on this branch
+# (prepared 2026-07-15; APPLIED 2026-07-16 as SIX lines — see correction below)
+#
+# INSTRUCTION (as applied): append the 6 pattern lines below verbatim to the END of
+# .gitignore (they must come AFTER the existing `.claude/` rule).
+#
+# Why this shape: `.claude/` excludes the whole directory and git cannot re-include a
+# file whose parent directory is excluded. So: re-include the directory itself
+# (`!.claude/`), re-exclude its direct children (`.claude/*` — this keeps
+# settings.local.json, worktrees/, and any other session-local state ignored), then
+# re-include exactly the two subtrees that should travel with the repo. Order matters
+# (later patterns win); do not reorder or interleave.
+#
+# CORRECTION vs the 2026-07-15 draft (which had only the first 4 lines): this repo's
+# .gitignore carries a GLOBAL `*.md` rule (line 12), and "last matching pattern wins"
+# is evaluated per-path — so re-including the DIRECTORIES alone still leaves every
+# *.md file inside them ignored (check-ignore attributed SKILL.md to `*.md`). The two
+# trailing `**` negations re-include the CONTENTS of the two subtrees and, coming
+# last, beat `*.md` (and any other global file rule). The draft's "sandbox-tested"
+# claim was made against a .gitignore without the `*.md` rule; refuted in-repo
+# 2026-07-16.
+
+!.claude/
+.claude/*
+!.claude/skills/
+!.claude/agents/
+!.claude/skills/**
+!.claude/agents/**
+
+# Verified behavior (in-repo, exit-code `git check-ignore -q`, 2026-07-16):
+#   .claude/skills/v2-kernel-writing/SKILL.md   -> NOT ignored (trackable)
+#   .claude/skills/v2-model-support/SKILL.md    -> NOT ignored (trackable)
+#   .claude/skills/v2-perf-iteration/SKILL.md   -> NOT ignored (trackable)
+#   .claude/skills/GITIGNORE_PATCH.txt          -> NOT ignored (trackable)
+#   .claude/agents/v2-kernel-engineer.md        -> NOT ignored (trackable)
+#   .claude/settings.local.json                 -> ignored by `.claude/*`
+#   .claude/worktrees/<any>                     -> ignored by `.claude/*`
+#
+# Note for the commit step: the mpk-commit-reviewer's NEVER-STAGE set carries a written
+# exception for these two subtrees once this patch is applied (see its `.claude/` bullet);
+# everything else under .claude/ must still never be staged.

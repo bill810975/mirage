@@ -357,7 +357,21 @@ enum TaskType {
   // linear_v3 / the FFN v2 chain — NOT merge_task_offset).
   // TASK_SM100_TASK_END shifted 354 -> 356 (placeholder only).
   TASK_DSV3_LMHEAD_GEMV_V2 = 355,
-  TASK_SM100_TASK_END = 356, // SM100 end placeholder, not a real task
+  // DSv3 W13/W2 grouped GEMM as PER-TILE v2 PIPELINE tasks (ffn item 1,
+  // spec: scratch/v2_rewrite/ffn_item1_spec.md): reference
+  // loader/launcher/consumer/storer role pipeline re-hosting the v1 swapAB
+  // block-scaled FP8 UMMA engine (fp8_group_gemm_sm100.cuh). W13 pipe serves
+  // two instances (routed 64 tasks + shared gate_up 4 tasks,
+  // always_active=1); W2 pipe is 56 tasks with internal slot segments.
+  // task_offset = the tile index (baked in runtime.cc, same as the FFN v2
+  // chain). Deliberately OUTSIDE the TMA range 231..256; the weight
+  // CUtensorMaps are created via the explicit task-type list in runtime.cc
+  // (tma.cuh create_tma_desc_by_task cases). Bodies in
+  // blackwell_v2/dsv3_ffn_gg_v2.cuh; env gate MPK_DSV3_V2_FFN_PIPE
+  // (default-OFF). TASK_SM100_TASK_END shifted 356 -> 358 (placeholder only).
+  TASK_DSV3_FFN_W13_PIPE_V2 = 356,
+  TASK_DSV3_FFN_W2_PIPE_V2 = 357,
+  TASK_SM100_TASK_END = 358, // SM100 end placeholder, not a real task
   TASK_SCHD_TASKS = 200,
   TASK_SCHD_EVENTS = 201,
   TASK_GET_EVENT = 202,

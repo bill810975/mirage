@@ -600,7 +600,11 @@ void register_mugraph(
                 task_type == TASK_DSV3_FFN_W2_SILU_V2 ||
                 task_type == TASK_DSV3_FFN_W13_RQR_TOPK_V2 ||
                 task_type == TASK_DSV3_FFN_MEGA_V2 ||
-                task_type == TASK_DSV3_FFN_MEGA_FG_V2) {
+                task_type == TASK_DSV3_FFN_MEGA_FG_V2 ||
+                // FFN pipe per-tile tasks: the tile identity IS task_offset
+                // (spec §5 — omitting this is the deadliest v2 footgun).
+                task_type == TASK_DSV3_FFN_W13_PIPE_V2 ||
+                task_type == TASK_DSV3_FFN_W2_PIPE_V2) {
               task.task_metadata.task_offset = bid.x;
             }
             // DSv3 fused DENSE-MLP megakernel v2 (M5; one task per worker): the
@@ -1451,6 +1455,12 @@ TaskGraphResult print_task_graph(
            "TASK_FP8_GROUP_GEMM_LARGEM_COMPACT_FUSED_SM100) {");
     code.e("create_tma_desc_by_task(task_desc);");
     code.e("}");
+    // FFN pipe per-tile tasks (outside the 231..256 TMA range): weight
+    // CUtensorMaps for the loader's W TMA ring.
+    code.e("if (task.at(\"task_type\") == TASK_DSV3_FFN_W13_PIPE_V2 || "
+           "task.at(\"task_type\") == TASK_DSV3_FFN_W2_PIPE_V2) {");
+    code.e("create_tma_desc_by_task(task_desc);");
+    code.e("}");
     code.e("#endif");
     code.e("all_tasks.push_back(task_desc);");
     code.e("}");
@@ -2127,6 +2137,8 @@ TaskGraphResult print_task_graph(
   task_type_to_name[TASK_DSV3_FFN_SILU_QUANT_V2] =
       "TASK_DSV3_FFN_SILU_QUANT_V2";
   task_type_to_name[TASK_DSV3_FFN_W2_GEMV_V2] = "TASK_DSV3_FFN_W2_GEMV_V2";
+  task_type_to_name[TASK_DSV3_FFN_W13_PIPE_V2] = "TASK_DSV3_FFN_W13_PIPE_V2";
+  task_type_to_name[TASK_DSV3_FFN_W2_PIPE_V2] = "TASK_DSV3_FFN_W2_PIPE_V2";
   task_type_to_name[TASK_DSV3_ATTN_P0_QKVA_V2] = "TASK_DSV3_ATTN_P0_QKVA_V2";
   task_type_to_name[TASK_DSV3_ATTN_QB_ROPE_KV_V2] =
       "TASK_DSV3_ATTN_QB_ROPE_KV_V2";

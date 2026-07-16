@@ -19,6 +19,15 @@ from mirage.mpk.v2_task_schedule import build_v2_worker_task_queues
 DEFAULT_SAVE_DIR = os.path.join("outputs", "deepseek_v3")
 MAX_SAVE_TOKENS = 100
 DEFAULT_PROFILER_BUFFER_ENTRIES = 6000 * 128
+# The v2 runtime compiles its profiler for a much larger buffer than v1 and
+# writes tail accumulators (spin/wait ns+count, page-suffix, per-track cursors,
+# dropped counter, trigger ring) at absolute indices growing back from the very
+# end of the buffer. If the host allocation is smaller than the compiled size,
+# those tail writes land PAST the end of the tensor -> live device OOB write on
+# every profiled v2 step, and the spin/wait accumulators are never captured.
+# MUST match V2_PROF_BUF_ENTRIES in
+# include/mirage/persistent_kernel/runtime_v2.cuh (currently 120000 * 128).
+V2_PROFILER_BUFFER_ENTRIES = 120000 * 128
 
 # DeepSeek V3 architecture constants
 # MLA: 128 heads, compressed KV dim 512, rope dim 64, total head dim 576
@@ -28,13 +37,42 @@ DEEPSEEK_V3_QK_ROPE_HEAD_DIM = 64
 DEEPSEEK_V3_HEAD_DIM_TOTAL = DEEPSEEK_V3_KV_LORA_RANK + DEEPSEEK_V3_QK_ROPE_HEAD_DIM  # 576
 
 
-def get_profiler_buffer_entries() -> int:
+def get_profiler_buffer_entries(use_v2: bool = False) -> int:
+    # v1 default stays 6000*128; v2 needs the larger compiled size so the tail
+    # accumulators don't write past the allocation (see V2_PROFILER_BUFFER_ENTRIES
+    # and runtime_v2.cuh). Only the v2 profiling path uses the larger default;
+    # the v1 profiling path and the non-profiling path are byte-identical.
+    default_entries = (
+        V2_PROFILER_BUFFER_ENTRIES if use_v2 else DEFAULT_PROFILER_BUFFER_ENTRIES
+    )
     raw_value = os.environ.get("MPK_PROFILER_BUFFER_ENTRIES")
     if raw_value is None:
-        return DEFAULT_PROFILER_BUFFER_ENTRIES
-    entries = int(raw_value)
-    if entries <= 0:
-        raise ValueError("MPK_PROFILER_BUFFER_ENTRIES must be positive")
+        entries = default_entries
+    else:
+        entries = int(raw_value)
+        if entries <= 0:
+            raise ValueError("MPK_PROFILER_BUFFER_ENTRIES must be positive")
+        if use_v2 and entries < V2_PROFILER_BUFFER_ENTRIES:
+            print(
+                "[profiling] WARNING: MPK_PROFILER_BUFFER_ENTRIES="
+                f"{entries} is below the v2 compiled size "
+                f"V2_PROF_BUF_ENTRIES={V2_PROFILER_BUFFER_ENTRIES} "
+                "(runtime_v2.cuh). The v2 profiler writes tail accumulators near "
+                "the buffer end; a smaller buffer causes a device OOB write.",
+                file=sys.stderr,
+            )
+    # Hard guard: under v2+profiling the buffer MUST be at least the compiled
+    # size, else the tail writes are a silent device OOB (contract: this must
+    # match V2_PROF_BUF_ENTRIES in include/mirage/persistent_kernel/runtime_v2.cuh).
+    if use_v2 and entries < V2_PROFILER_BUFFER_ENTRIES:
+        raise ValueError(
+            f"v2 profiling requires a profiler buffer of at least "
+            f"{V2_PROFILER_BUFFER_ENTRIES} uint64 entries (V2_PROF_BUF_ENTRIES in "
+            f"include/mirage/persistent_kernel/runtime_v2.cuh), but got {entries}. "
+            f"The v2 runtime writes tail accumulators near the buffer end; a "
+            f"smaller allocation is a device out-of-bounds write. Unset "
+            f"MPK_PROFILER_BUFFER_ENTRIES or set it to >= {V2_PROFILER_BUFFER_ENTRIES}."
+        )
     return entries
 
 
@@ -411,7 +449,9 @@ if __name__ == "__main__":
 
         if args.profiling:
             profiler_tensor = torch.zeros(
-                get_profiler_buffer_entries(), dtype=torch.uint64, device="cuda"
+                get_profiler_buffer_entries(use_v2=args.use_v2),
+                dtype=torch.uint64,
+                device="cuda",
             ).contiguous()
         else:
             profiler_tensor = None

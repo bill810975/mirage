@@ -20,6 +20,7 @@
 #include "mirage/persistent_kernel/tasks/blackwell_v2/attn_block_megakernel_v2_spec.h"
 #include "mirage/persistent_kernel/tasks/blackwell_v2/dsv3_attn_v2_spec.h"
 #include "mirage/persistent_kernel/tasks/blackwell_v2/dsv3_dense_mlp_fused_v2_spec.h"
+#include "mirage/persistent_kernel/tasks/blackwell_v2/dsv3_ffn_gg_v2_spec.h"
 #include "mirage/persistent_kernel/tasks/blackwell_v2/dsv3_ffn_v2_spec.h"
 #include "mirage/persistent_kernel/tasks/blackwell_v2/dsv3_lmhead_gemv_v2_spec.h"
 #include "mirage/persistent_kernel/tasks/blackwell_v2/embedding_v2_spec.h"
@@ -9339,6 +9340,307 @@ int TaskRegister::register_dsv3_ffn_w13_gemv_v2_task(
   register_variant_smem_info(TASK_DSV3_FFN_W13_GEMV_V2,
                              variant,
                              ::kernel::dsv3_ffn_v2::make_w13_smem_info(nwarps));
+  return variant;
+}
+
+namespace {
+
+// init_semaphores body shared by the two FFN pipe tasks: mbar_init all 30
+// op-private ordinals with the spec §3 counts (dsv3_ffn_gg_v2_spec.h) +
+// fence. Controller lane 0 runs this once per instruction publish; the
+// async-arrived subsets are ADDITIONALLY re-inited at task start by their
+// arriving roles (stale-arrival rule; see dsv3_ffn_gg_v2.cuh).
+inline void emit_ffn_pipe_init_semaphores(mirage::transpiler::CodeKeeper &c) {
+  c.e("{");
+  c.e("  namespace _gg = ::kernel::dsv3_ffn_gg_v2;");
+  c.e("  int const _slot = ring_slot(instruction_index);");
+  c.e("  uint64_t (*_sem)[MAX_DYNAMIC_SEMAPHORES] = "
+      "runtime_smem->dynamic_semaphores;");
+  c.e("  for (int i = 0; i < _gg::STAGES; i++) {");
+  c.e("    mbar_init(&_sem[_slot][SEM_OP_BASE + _gg::SEM_W_TMA_BASE + i], "
+      "1);");
+  c.e("    mbar_init(&_sem[_slot][SEM_OP_BASE + _gg::SEM_B_SF_BASE + i], 1);");
+  c.e("    mbar_init(&_sem[_slot][SEM_OP_BASE + _gg::SEM_MMA_BASE + i], 1);");
+  c.e("  }");
+  c.e("  for (int i = 0; i < _gg::ACC_STAGES; i++) {");
+  c.e("    mbar_init(&_sem[_slot][SEM_OP_BASE + _gg::SEM_MAINLOOP_BASE + i], "
+      "1);");
+  c.e("    mbar_init(&_sem[_slot][SEM_OP_BASE + _gg::SEM_EPILOGUE_BASE + i], "
+      "4 * _gg::WARP_SIZE);");
+  c.e("  }");
+  c.e("  mbar_init(&_sem[_slot][SEM_OP_BASE + _gg::SEM_TMEM_READY], 1);");
+  c.e("  mbar_init(&_sem[_slot][SEM_OP_BASE + _gg::SEM_CONSUMER_DONE], "
+      "4 * _gg::WARP_SIZE);");
+  c.e("  asm volatile(\"fence.mbarrier_init.release.cluster;\");");
+  c.e("}");
+}
+
+} // anonymous namespace
+
+// DSv3 W13/W2 grouped GEMM as PER-TILE v2 PIPELINE tasks (ffn item 1, spec:
+// scratch/v2_rewrite/ffn_item1_spec.md §8). Reference role pipeline
+// (loader/launcher/consumer/storer + init_semaphores), re-hosting the v1
+// swapAB block-scaled FP8 UMMA engine. Page-release ownership (Q3, linear's
+// proven combination adapted to a 10-of-14-page op): codegen loader page
+// prefix (default ON — arrives the unused pages) + launcher task-end blanket
+// over the USED pages (task_uses_page-gated, in the .cuh) +
+// auto_consumer_finish=false. §1.1: launcher/consumer/storer get the codegen
+// dep prefix; the loader does the dep-wait INLINE (before reading meta —
+// routed TMA coords depend on it).
+// params: [always_active] (0 = routed [E,N,K] weight, task = (slot, n_tile),
+// 64 tasks; 1 = shared gate_up [N,K] weight, task = n_tile, 4 tasks).
+int TaskRegister::register_dsv3_ffn_w13_pipe_v2_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  assert(params.size() == 1);
+  int const always_active = params[0];
+  assert(always_active == 0 || always_active == 1);
+  int const num_tasks = (int)bgraph.grid_dim.x;
+  std::vector<tb::TBInputOp *> input_ops, output_ops;
+  // inputs: [0] meta, [1] a_fp8, [2] a_scale, [3] w, [4] w_scale;
+  // outputs: [0] y (routed y13 f32[MAX_ACTIVE,N] / shared sg f32[N]).
+  ffn_v2_split_ops(bgraph, 5, 1, input_ops, output_ops);
+
+  // Weight geometry: routed = 3D [E, N, K]; shared = 2D [N, K].
+  kn::DTensor const &wt = input_ops[3]->dtensor;
+  int E, N, K;
+  if (wt.num_dims == 3) {
+    E = wt.dim[0];
+    N = wt.dim[1];
+    K = wt.dim[2];
+    assert(always_active == 0 &&
+           "3D [E,N,K] weight requires the routed instance (always_active=0)");
+  } else {
+    assert(wt.num_dims == 2);
+    E = 1;
+    N = wt.dim[0];
+    K = wt.dim[1];
+    assert(always_active == 1 &&
+           "2D [N,K] weight requires the shared instance (always_active=1)");
+  }
+  assert(K == ::kernel::dsv3_ffn_gg_v2::F::HIDDEN);
+  assert(N % ::kernel::dsv3_ffn_gg_v2::BLOCK_M == 0);
+  int const tiles_per_slot = N / ::kernel::dsv3_ffn_gg_v2::BLOCK_M;
+  int const expected_tasks =
+      always_active ? tiles_per_slot
+                    : ::kernel::dsv3_ffn_gg_v2::F::MAX_ACTIVE * tiles_per_slot;
+  assert(num_tasks == expected_tasks &&
+         "dsv3_ffn_w13_pipe_v2: grid.x must equal the per-tile task count");
+  (void)expected_tasks;
+  (void)E;
+
+  auto emit_loader = [&](mirage::transpiler::CodeKeeper &c) {
+    c.e("::kernel::dsv3_ffn_gg_v2::ffn_w13_pipe_loader_task<$>(",
+        always_active);
+    c.e("    task_desc,");
+    c.e("    runtime_smem,");
+    c.e("    runtime_config,");
+    c.e("    static_cast<const "
+        "CUtensorMap*>(task_desc->input_tma_desc_ptrs[3][0]),");
+    c.e("    static_cast<const int*>(task_desc->input_ptrs[0]),");
+    c.e("    static_cast<const uint8_t*>(task_desc->input_ptrs[1]),");
+    c.e("    static_cast<const float*>(task_desc->input_ptrs[2]),");
+    c.e("    static_cast<const float*>(task_desc->input_ptrs[4]),");
+    c.e("    $,", N);
+    c.e("    static_cast<int>(task_desc->task_metadata.task_offset),");
+    c.e("    instruction_index,");
+    c.e("    iter_num,");
+    c.e("    op_sem_base_addr(runtime_smem, instruction_index));");
+  };
+  auto emit_launcher = [&](mirage::transpiler::CodeKeeper &c) {
+    c.e("::kernel::dsv3_ffn_gg_v2::ffn_w13_pipe_launcher_task<$>(",
+        always_active);
+    c.e("    task_desc,");
+    c.e("    runtime_smem,");
+    c.e("    static_cast<const int*>(task_desc->input_ptrs[0]),");
+    c.e("    $,", N);
+    c.e("    static_cast<int>(task_desc->task_metadata.task_offset),");
+    c.e("    op_sem_base_addr(runtime_smem, instruction_index));");
+  };
+  auto emit_consumer = [&](mirage::transpiler::CodeKeeper &c) {
+    c.e("::kernel::dsv3_ffn_gg_v2::ffn_w13_pipe_consumer_task<$>(",
+        always_active);
+    c.e("    task_desc,");
+    c.e("    static_cast<const int*>(task_desc->input_ptrs[0]),");
+    c.e("    static_cast<const uint8_t*>(task_desc->input_ptrs[1]),");
+    c.e("    static_cast<const float*>(task_desc->input_ptrs[2]),");
+    c.e("    static_cast<const uint8_t*>(task_desc->input_ptrs[3]),");
+    c.e("    static_cast<const float*>(task_desc->input_ptrs[4]),");
+    c.e("    static_cast<float*>(task_desc->output_ptrs[0]),");
+    c.e("    $,", N);
+    c.e("    static_cast<int>(task_desc->task_metadata.task_offset),");
+    c.e("    op_sem_base_addr(runtime_smem, instruction_index));");
+  };
+  auto emit_storer = [&](mirage::transpiler::CodeKeeper &c) {
+    c.e("::kernel::dsv3_ffn_gg_v2::ffn_w13_pipe_storer_task<$>(",
+        always_active);
+    c.e("    task_desc,");
+    c.e("    runtime_smem,");
+    c.e("    static_cast<const int*>(task_desc->input_ptrs[0]),");
+    c.e("    $,", N);
+    c.e("    static_cast<int>(task_desc->task_metadata.task_offset),");
+    c.e("    op_sem_base_addr(runtime_smem, instruction_index));");
+  };
+
+  // Variant string = consumer body (always_active + N appear in it — the
+  // dedup identity distinguishes the routed and shared instances).
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  emit_consumer(code);
+  int variant =
+      register_task_variant(TASK_DSV3_FFN_W13_PIPE_V2, code.to_string());
+
+  mirage::transpiler::CodeKeeper init_code;
+  init_code.inc_indent();
+  emit_ffn_pipe_init_semaphores(init_code);
+
+  mirage::transpiler::CodeKeeper loader_code;
+  loader_code.inc_indent();
+  emit_loader(loader_code); // dep-wait INLINE (before meta), no prefix
+
+  mirage::transpiler::CodeKeeper launcher_code;
+  launcher_code.inc_indent();
+  emit_dep_wait_consumer_prefix(launcher_code);
+  emit_launcher(launcher_code);
+
+  mirage::transpiler::CodeKeeper consumer_code;
+  consumer_code.inc_indent();
+  emit_dep_wait_consumer_prefix(consumer_code);
+  emit_consumer(consumer_code);
+
+  mirage::transpiler::CodeKeeper storer_code;
+  storer_code.inc_indent();
+  emit_dep_wait_consumer_prefix(storer_code); // orders the (meta-reading)
+  emit_storer(storer_code);                   // storer after the dep
+
+  TaskRoleVariantCode role_code{/*init_semaphores=*/init_code.to_string(),
+                                /*loader=*/loader_code.to_string(),
+                                /*launcher=*/launcher_code.to_string(),
+                                /*consumer=*/consumer_code.to_string(),
+                                /*storer=*/storer_code.to_string()};
+  role_code.auto_consumer_finish = false; // launcher owns page release (Q3)
+  register_v2_task_role_variant(TASK_DSV3_FFN_W13_PIPE_V2, variant, role_code);
+  register_variant_smem_info(
+      TASK_DSV3_FFN_W13_PIPE_V2,
+      variant,
+      ::kernel::dsv3_ffn_gg_v2::make_ffn_pipe_smem_info());
+  return variant;
+}
+
+// params: none. grid.x = W2_N/128 = 56 per-tile tasks; slot segments are
+// internal (slots ascending then shared-down, Q6). Never inactive.
+int TaskRegister::register_dsv3_ffn_w2_pipe_v2_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  assert(params.size() == 0);
+  int const num_tasks = (int)bgraph.grid_dim.x;
+  std::vector<tb::TBInputOp *> input_ops, output_ops;
+  // inputs: [0] i_fp8, [1] si_fp8, [2] meta, [3] i_scale, [4] si_scale,
+  //         [5] w2, [6] w2_scale, [7] wdn, [8] wdn_scale;
+  // outputs: [0] out bf16[1, W2_N].
+  ffn_v2_split_ops(bgraph, 9, 1, input_ops, output_ops);
+
+  kn::DTensor const &w2t = input_ops[5]->dtensor;
+  assert(w2t.num_dims == 3 && w2t.dim[1] == ::kernel::dsv3_ffn_gg_v2::F::W2_N &&
+         w2t.dim[2] == ::kernel::dsv3_ffn_gg_v2::F::W2_K);
+  kn::DTensor const &wdnt = input_ops[7]->dtensor;
+  assert(wdnt.num_dims == 2 &&
+         wdnt.dim[0] == ::kernel::dsv3_ffn_gg_v2::F::W2_N &&
+         wdnt.dim[1] == ::kernel::dsv3_ffn_gg_v2::F::SH_DN_K);
+  assert(num_tasks == ::kernel::dsv3_ffn_gg_v2::W2_TILES &&
+         "dsv3_ffn_w2_pipe_v2: grid.x must be W2_N/128 = 56");
+  (void)num_tasks;
+
+  auto emit_loader = [&](mirage::transpiler::CodeKeeper &c) {
+    c.e("::kernel::dsv3_ffn_gg_v2::ffn_w2_pipe_loader_task(");
+    c.e("    task_desc,");
+    c.e("    runtime_smem,");
+    c.e("    runtime_config,");
+    c.e("    static_cast<const "
+        "CUtensorMap*>(task_desc->input_tma_desc_ptrs[5][0]),");
+    c.e("    static_cast<const "
+        "CUtensorMap*>(task_desc->input_tma_desc_ptrs[7][0]),");
+    c.e("    static_cast<const int*>(task_desc->input_ptrs[2]),");
+    c.e("    static_cast<const uint8_t*>(task_desc->input_ptrs[0]),");
+    c.e("    static_cast<const float*>(task_desc->input_ptrs[3]),");
+    c.e("    static_cast<const uint8_t*>(task_desc->input_ptrs[1]),");
+    c.e("    static_cast<const float*>(task_desc->input_ptrs[4]),");
+    c.e("    static_cast<int>(task_desc->task_metadata.task_offset),");
+    c.e("    instruction_index,");
+    c.e("    iter_num,");
+    c.e("    op_sem_base_addr(runtime_smem, instruction_index));");
+  };
+  auto emit_launcher = [&](mirage::transpiler::CodeKeeper &c) {
+    c.e("::kernel::dsv3_ffn_gg_v2::ffn_w2_pipe_launcher_task(");
+    c.e("    task_desc,");
+    c.e("    runtime_smem,");
+    c.e("    static_cast<const int*>(task_desc->input_ptrs[2]),");
+    c.e("    static_cast<int>(task_desc->task_metadata.task_offset),");
+    c.e("    op_sem_base_addr(runtime_smem, instruction_index));");
+  };
+  auto emit_consumer = [&](mirage::transpiler::CodeKeeper &c) {
+    c.e("::kernel::dsv3_ffn_gg_v2::ffn_w2_pipe_consumer_task(");
+    c.e("    task_desc,");
+    c.e("    static_cast<const int*>(task_desc->input_ptrs[2]),");
+    c.e("    static_cast<const uint8_t*>(task_desc->input_ptrs[0]),");
+    c.e("    static_cast<const float*>(task_desc->input_ptrs[3]),");
+    c.e("    static_cast<const uint8_t*>(task_desc->input_ptrs[1]),");
+    c.e("    static_cast<const float*>(task_desc->input_ptrs[4]),");
+    c.e("    static_cast<const uint8_t*>(task_desc->input_ptrs[5]),");
+    c.e("    static_cast<const float*>(task_desc->input_ptrs[6]),");
+    c.e("    static_cast<const uint8_t*>(task_desc->input_ptrs[7]),");
+    c.e("    static_cast<const float*>(task_desc->input_ptrs[8]),");
+    c.e("    static_cast<nv_bfloat16*>(task_desc->output_ptrs[0]),");
+    c.e("    static_cast<int>(task_desc->task_metadata.task_offset),");
+    c.e("    op_sem_base_addr(runtime_smem, instruction_index));");
+  };
+  auto emit_storer = [&](mirage::transpiler::CodeKeeper &c) {
+    c.e("::kernel::dsv3_ffn_gg_v2::ffn_w2_pipe_storer_task(");
+    c.e("    task_desc,");
+    c.e("    runtime_smem,");
+    c.e("    static_cast<const int*>(task_desc->input_ptrs[2]),");
+    c.e("    static_cast<int>(task_desc->task_metadata.task_offset),");
+    c.e("    op_sem_base_addr(runtime_smem, instruction_index));");
+  };
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  emit_consumer(code);
+  int variant =
+      register_task_variant(TASK_DSV3_FFN_W2_PIPE_V2, code.to_string());
+
+  mirage::transpiler::CodeKeeper init_code;
+  init_code.inc_indent();
+  emit_ffn_pipe_init_semaphores(init_code);
+
+  mirage::transpiler::CodeKeeper loader_code;
+  loader_code.inc_indent();
+  emit_loader(loader_code); // dep-wait INLINE (before meta), no prefix
+
+  mirage::transpiler::CodeKeeper launcher_code;
+  launcher_code.inc_indent();
+  emit_dep_wait_consumer_prefix(launcher_code);
+  emit_launcher(launcher_code);
+
+  mirage::transpiler::CodeKeeper consumer_code;
+  consumer_code.inc_indent();
+  emit_dep_wait_consumer_prefix(consumer_code);
+  emit_consumer(consumer_code);
+
+  mirage::transpiler::CodeKeeper storer_code;
+  storer_code.inc_indent();
+  emit_dep_wait_consumer_prefix(storer_code);
+  emit_storer(storer_code);
+
+  TaskRoleVariantCode role_code{/*init_semaphores=*/init_code.to_string(),
+                                /*loader=*/loader_code.to_string(),
+                                /*launcher=*/launcher_code.to_string(),
+                                /*consumer=*/consumer_code.to_string(),
+                                /*storer=*/storer_code.to_string()};
+  role_code.auto_consumer_finish = false; // launcher owns page release (Q3)
+  register_v2_task_role_variant(TASK_DSV3_FFN_W2_PIPE_V2, variant, role_code);
+  register_variant_smem_info(
+      TASK_DSV3_FFN_W2_PIPE_V2,
+      variant,
+      ::kernel::dsv3_ffn_gg_v2::make_ffn_pipe_smem_info());
   return variant;
 }
 

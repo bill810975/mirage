@@ -58,8 +58,39 @@ def gen_pow2_scales(shape, gen, lo_exp=-9, hi_exp=-5) -> torch.Tensor:
                        e).float().contiguous()
 
 
-def gen_block_inputs(seed: int, force_local8: bool = False) -> dict:
-    """One FFN block's weights + (for block 0) the hidden input."""
+def assert_ue8m0_pow2(name: str, t: torch.Tensor):
+    """Q2 (ffn_item1_spec.md §9): every weight-scale pack consumed by the FFN
+    pipe kernels must be positive, finite, an EXACT power of two, and inside
+    the UE8M0-representable exponent range — the pipe kernel's UE8M0
+    conversion is exact ONLY under these conditions. Failure = STOP (the
+    conversion would change math beyond rounding), never a tolerance."""
+    f = t.detach().float()
+    assert bool(torch.isfinite(f).all()) and bool((f > 0).all()), (
+        f"{name}: non-finite / non-positive scale (Q2 STOP)")
+    m, e = torch.frexp(f)
+    assert bool((m == 0.5).all()), (
+        f"{name}: scales are not exact powers of two — UE8M0 conversion "
+        "would change math beyond rounding (Q2 STOP)")
+    k = e - 1  # value = 2^k
+    assert bool((k >= -127).all()) and bool((k <= 127).all()), (
+        f"{name}: pow2 exponent outside the UE8M0-representable range "
+        "(Q2 STOP)")
+
+
+def gen_block_inputs(seed: int, force_local8: bool = False,
+                     force_active=None) -> dict:
+    """One FFN block's weights + (for block 0) the hidden input.
+
+    force_active=k (0..8, les=0/nle=128 geometry): bias experts [0,k) up by
+    +1000 (always win) and [k,128) down by -10 so EXACTLY k of the 8 global
+    winners are EP-local -> active_count == k. The demotion is -10, NOT
+    -1000: DSv3 group selection scores a group by its TOP-2 sum, so a lone
+    +1000 target whose group partner sits at -1000 nets ~0 and the group
+    LOSES (k=1 silently became active=0); at -10 the group still wins
+    (~990) while every demoted expert stays out of the top-8 (normal scores
+    are sigmoid+bias in (0,1)). Selection-only (DSv3 adds the bias
+    post-sigmoid for selection; weights use sigmoid only), and the torch ref
+    runs the same biased routing, so kernel-vs-ref stays exact."""
     gen = _gen(seed)
 
     def uni(shape, lo, hi, dtype=torch.float32):
@@ -84,6 +115,12 @@ def gen_block_inputs(seed: int, force_local8: bool = False) -> dict:
         # forced max-work arm: experts >= 128 can never win the top-8 ->
         # all 8 global winners are EP-local -> active_count == 8.
         t["bias"][128:] -= 1000.0
+    if force_active is not None:
+        k = int(force_active)
+        assert 0 <= k <= R.MAX_ACTIVE
+        if k > 0:
+            t["bias"][:k] += 1000.0
+        t["bias"][k:128] -= 10.0
     return t
 
 
@@ -358,6 +395,44 @@ def build_ffn_block(pk, prefix: str, weights: dict, bufs: dict,
             nwarps=cfg["nwarps_w2"], rblk=cfg["rblk"])
         return out
 
+    if cfg.get("pipe"):
+        # PER-TILE PIPELINE W13/W2 (ffn item 1): the chain graph with the two
+        # fat GEMV ops replaced by the reference-pipeline per-tile tasks
+        # (routed 64 + shared 4 + W2 56). Q2 scale-pack assert at load.
+        for _nm in ("w13_scale", "w2_scale", "wgu_scale", "wdn_scale"):
+            assert_ue8m0_pow2(_nm, weights[_nm])
+        # second a_fp8/a_scale alias pair for the SHARED W13 instance
+        a_fp8_al2 = at(bufs["a_fp8"], "afp8_alias_sh")
+        a_scale_al2 = at(bufs["a_scale"], "ascale_alias_sh")
+        pk.rmsnorm_layer(input=hidden_dt, weight=rms_w, output=rmsnorm_out,
+                         grid_dim=(1, 1, 1), block_dim=(128, 1, 1))
+        pk.dsv3_ffn_router_quant_layer(
+            input=rmsnorm_out, gate_weight=router_w, a_fp8=a_fp8,
+            a_scale=a_scale, inter=inter, num_tasks=cfg["nr"],
+            nwarps=cfg["nwarps"])
+        pk.dsv3_ffn_topk_sigmoid_layer(
+            inter=inter, bias=bias, logits=logits, meta=meta,
+            local_expert_start=cfg["les"], num_local_experts=cfg["nle"],
+            routed_scaling_factor=cfg["rsf"])
+        # W13 pipe: routed (slot, n_tile) tasks + shared gate_up tasks; both
+        # consume the meta edge (fan-out).
+        pk.dsv3_ffn_w13_pipe_layer(
+            meta=meta, a_fp8=a_fp8_al, a_scale=a_scale_al, w=w13,
+            w_scale=w13_s, y_out=y13, num_tasks=64, always_active=False)
+        pk.dsv3_ffn_w13_pipe_layer(
+            meta=meta, a_fp8=a_fp8_al2, a_scale=a_scale_al2, w=wgu,
+            w_scale=wgu_s, y_out=sg, num_tasks=4, always_active=True)
+        pk.dsv3_ffn_silu_quant_layer(
+            y13=y13, sg=sg, meta=meta_al_silu, i_scale=i_scale,
+            si_scale=si_scale, i_fp8=i_fp8, si_fp8=si_fp8)
+        # W2 pipe: 56 per-tile tasks, slot segments internal
+        # (slots-ascending-then-shared, Q6).
+        pk.dsv3_ffn_w2_pipe_layer(
+            i_fp8=i_fp8, si_fp8=si_fp8, meta=meta_al_w2, i_scale=i_scale_al,
+            si_scale=si_scale_al, w2=w2, w2_scale=w2_s, wdn=wdn,
+            wdn_scale=wdn_s, output=out, num_tasks=56)
+        return out
+
     # T0 rmsnorm (existing v2 task)
     pk.rmsnorm_layer(input=hidden_dt, weight=rms_w, output=rmsnorm_out,
                      grid_dim=(1, 1, 1), block_dim=(128, 1, 1))
@@ -407,6 +482,8 @@ def default_cfg(spec: dict) -> dict:
         "nle": spec.get("nle", 128),
         "rsf": spec.get("rsf", 2.5),
         "fold": spec.get("fold", False),
+        # per-tile pipeline W13/W2 (ffn item 1): chain graph with the pipe ops
+        "pipe": spec.get("pipe", False),
         # fusion-ladder rungs (scratch/v2_ffn_fuse): None | "a" | "mega"
         "rung": spec.get("rung"),
         "nta": spec.get("nta", 136),          # rung A: w13_rqr_topk tasks
@@ -438,6 +515,16 @@ def block_instances(i: int, cfg: dict):
             (i, "ffn_router_quant_rms", cfg["nr"]),
             (i, "ffn_w13_topk", cfg["nt13"]),
             (i, "ffn_w2_silu", cfg["nt2"]),
+        ]
+    if cfg.get("pipe"):
+        return [
+            (i, "rmsnorm_7168", 1),
+            (i, "ffn_router_quant", cfg["nr"]),
+            (i, "ffn_topk_sigmoid", 1),
+            (i, "ffn_w13_pipe", 64),
+            (i, "ffn_w13_pipe_sh", 4),
+            (i, "ffn_silu_quant", 1),
+            (i, "ffn_w2_pipe", 56),
         ]
     return [
         (i, "rmsnorm_7168", 1),
@@ -480,8 +567,9 @@ def dump_driver_inputs(weights: dict, dump_dir: str):
 def run_ffn_correctness_case(spec: dict, out_dir: str) -> dict:
     cfg = default_cfg(spec)
     seed = spec.get("seed", 20260702)
-    weights = gen_block_inputs(seed, force_local8=spec.get("force_local8",
-                                                           False))
+    weights = gen_block_inputs(seed,
+                               force_local8=spec.get("force_local8", False),
+                               force_active=spec.get("force_active"))
     bufs = alloc_block_buffers(cfg.get("rung"))
 
     pk = make_pk("v2", M=1, test_mode=True)
@@ -650,6 +738,11 @@ def run_ffn_correctness_case(spec: dict, out_dir: str) -> dict:
         "out": ok("out_vs_kernelinputs_ref"),
         "out_fullchain": ok("out_vs_fullchain_ref"),
     }
+    if spec.get("force_active") is not None:
+        # forced-routing case setup check: the kernel must actually see the
+        # requested active_count (the case is meaningless otherwise).
+        results["_pass"]["forced_active"] = (
+            ac_k == int(spec["force_active"]))
 
     try:
         pk.finalize()
@@ -692,7 +785,8 @@ def run_ffn_perf_case(spec: dict, out_dir: str) -> dict:
     hidden_dt = pk.attach_input(torch_tensor=x0, name="chain_x0")
     for i in range(L):
         w = gen_block_inputs(seed + 1000 * (i + 1),
-                             force_local8=spec.get("force_local8", False))
+                             force_local8=spec.get("force_local8", False),
+                             force_active=spec.get("force_active"))
         b = alloc_block_buffers(cfg.get("rung"))
         all_weights.append(w)
         all_bufs.append(b)

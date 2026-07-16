@@ -3054,6 +3054,121 @@ class DeepSeekV3Builder(GraphBuilder):
         # v1 (same DTensors reused). Default (v1) build below is untouched.
         # ================================================================
         if self.mpk.use_v2_runtime:
+            # ============================================================
+            # PER-TILE PIPELINE FFN path (ffn item 1, spec:
+            # scratch/v2_rewrite/ffn_item1_spec.md §9 Q5): env-gated
+            # MPK_DSV3_V2_FFN_PIPE=1 routes the FFN through the CHAIN graph
+            # with the W13/W2 grouped GEMMs as per-tile reference-pipeline
+            # tasks (64 routed + 4 shared + 56 tasks) instead of the mega.
+            # Default (env unset) falls through to the mega below —
+            # byte-identical build.
+            # ============================================================
+            if os.environ.get("MPK_DSV3_V2_FFN_PIPE", "0") == "1":
+                # Q2 (spec §9): ALL four weight-scale packs must be positive,
+                # finite, EXACT powers of two within the UE8M0-representable
+                # exponent range — the pipe kernel converts them to UE8M0
+                # for UTCCP, which is exact ONLY for pow2. w13/w2 are pow2 by
+                # construction (_requantize_moe_fp8_for_pow2 above); the
+                # SHARED gate_up/down scales are attached RAW — if the
+                # checkpoint's shared scale_inv are not pow2 this STOPS (do
+                # not tolerate: non-pow2 => UE8M0 changes math beyond
+                # rounding; requantize the shared weights first).
+                def _assert_ue8m0_pow2(nm, t):
+                    f = t.detach().float()
+                    assert bool(torch.isfinite(f).all()) and bool(
+                        (f > 0).all()), f"{nm}: non-finite/non-positive scale"
+                    m, e = torch.frexp(f)
+                    assert bool((m == 0.5).all()), (
+                        f"{nm}: scales are not exact powers of two — the "
+                        "UE8M0 conversion in the FFN pipe kernel would "
+                        "change math beyond rounding (spec §9 Q2: STOP)")
+                    k = e - 1  # value = 2^k
+                    assert bool((k >= -127).all()) and bool(
+                        (k <= 127).all()), (
+                        f"{nm}: pow2 exponent outside UE8M0 range")
+
+                for _nm, _t in (("w13_scale", _w13_scale_pow2),
+                                ("w2_scale", _w2_scale_pow2),
+                                ("wgu_scale", _wgu_scale_val),
+                                ("wdn_scale", _wdn_scale_val)):
+                    _assert_ue8m0_pow2(_nm, _t)
+
+                _L = layer_idx
+                _z = lambda shape, dt: torch.zeros(
+                    shape, device="cuda", dtype=dt)
+                _at = lambda t, nm: self._safe_attach(
+                    t, f"layer_{_L}_ffnpipe_{nm}")
+                # Chain intermediates (harness alloc_block_buffers shapes).
+                _t_a_fp8 = _z((7168,), torch.uint8)
+                _t_a_scale = _z((56,), torch.float32)
+                _t_inter = _z((256, 4), torch.float32)
+                _t_logits = _z((256,), torch.bfloat16)
+                _t_meta = _z((24,), torch.int32)
+                _t_y13 = _z((8, 1024), torch.float32)
+                _t_sg = _z((512,), torch.float32)
+                _t_i_fp8 = _z((8, 512), torch.uint8)
+                _t_i_scale = _z((8, 4), torch.float32)
+                _t_si_fp8 = _z((256,), torch.uint8)
+                _t_si_scale = _z((2,), torch.float32)
+
+                a_fp8 = _at(_t_a_fp8, "afp8")
+                a_scale = _at(_t_a_scale, "ascale")
+                inter = _at(_t_inter, "inter")
+                logits = _at(_t_logits, "logits")
+                meta = _at(_t_meta, "meta")
+                y13 = _at(_t_y13, "y13")
+                sg = _at(_t_sg, "sg")
+                i_fp8 = _at(_t_i_fp8, "ifp8")
+                i_scale = _at(_t_i_scale, "iscale")
+                si_fp8 = _at(_t_si_fp8, "sifp8")
+                si_scale = _at(_t_si_scale, "siscale")
+                # ALIASES (same torch tensor, fresh DTensor -> no false graph
+                # edge; ordering is transitive via the meta/y13-sg edges —
+                # same convention as the chain harness).
+                a_fp8_al = _at(_t_a_fp8, "afp8_alias")
+                a_scale_al = _at(_t_a_scale, "ascale_alias")
+                a_fp8_al2 = _at(_t_a_fp8, "afp8_alias_sh")
+                a_scale_al2 = _at(_t_a_scale, "ascale_alias_sh")
+                meta_al_silu = _at(_t_meta, "meta_alias_silu")
+                meta_al_w2 = _at(_t_meta, "meta_alias_w2")
+                i_scale_al = _at(_t_i_scale, "iscale_alias")
+                si_scale_al = _at(_t_si_scale, "siscale_alias")
+
+                # T1 router+quant (reads the LIVE post-attn rmsnorm output).
+                self.mpk.dsv3_ffn_router_quant_layer(
+                    input=self.rmsnorm_out, gate_weight=router_gate_weight,
+                    a_fp8=a_fp8, a_scale=a_scale, inter=inter,
+                    num_tasks=self.mpk.num_workers)
+                # T2 topk-sigmoid (EP-local filter -> meta).
+                self.mpk.dsv3_ffn_topk_sigmoid_layer(
+                    inter=inter, bias=bias, logits=logits, meta=meta,
+                    local_expert_start=self.local_expert_start,
+                    num_local_experts=self.num_local_experts,
+                    routed_scaling_factor=2.5)
+                # T3 W13 pipe: routed 64 per-tile tasks + shared 4 tasks
+                # (both consume the meta edge; fan-out).
+                self.mpk.dsv3_ffn_w13_pipe_layer(
+                    meta=meta, a_fp8=a_fp8_al, a_scale=a_scale_al,
+                    w=w_experts_w13, w_scale=w13_scale_fp32, y_out=y13,
+                    num_tasks=64, always_active=False)
+                self.mpk.dsv3_ffn_w13_pipe_layer(
+                    meta=meta, a_fp8=a_fp8_al2, a_scale=a_scale_al2,
+                    w=wgu_raw, w_scale=wgu_scale, y_out=sg,
+                    num_tasks=4, always_active=True)
+                # T4 silu + UE8M0 requant.
+                self.mpk.dsv3_ffn_silu_quant_layer(
+                    y13=y13, sg=sg, meta=meta_al_silu, i_scale=i_scale,
+                    si_scale=si_scale, i_fp8=i_fp8, si_fp8=si_fp8)
+                # T5 W2 pipe: 56 per-tile tasks (slot segments internal,
+                # slots-ascending-then-shared, Q6).
+                self.mpk.dsv3_ffn_w2_pipe_layer(
+                    i_fp8=i_fp8, si_fp8=si_fp8, meta=meta_al_w2,
+                    i_scale=i_scale_al, si_scale=si_scale_al,
+                    w2=w_experts_w2, w2_scale=w2_scale_fp32, wdn=wdn,
+                    wdn_scale=wdn_scale, output=moe_output, num_tasks=56)
+                self.mlp_out = moe_output
+                return
+
             # --- MEGA_* pack sizes — MUST mirror dsv3_ffn_v2_spec.h exactly
             # (cross-checked against tests/.../dsv3_ffn_harness.py). All derived
             # from the DSv3 FFN shape constants (HIDDEN=7168 etc.), so a shape

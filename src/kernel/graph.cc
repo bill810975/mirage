@@ -662,6 +662,16 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
         customized->bgraph, params);
     task_config[op] =
         std::make_tuple(9, 1, TASK_DSV3_FFN_W2_GEMV_V2, variant_id);
+  } else if (name == "dsv3_ffn_w13_pipe_v2") {
+    int variant_id = task_register->register_dsv3_ffn_w13_pipe_v2_task(
+        customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(5, 1, TASK_DSV3_FFN_W13_PIPE_V2, variant_id);
+  } else if (name == "dsv3_ffn_w2_pipe_v2") {
+    int variant_id = task_register->register_dsv3_ffn_w2_pipe_v2_task(
+        customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(9, 1, TASK_DSV3_FFN_W2_PIPE_V2, variant_id);
   } else if (name == "dsv3_lmhead_gemv_v2") {
     int variant_id = task_register->register_dsv3_lmhead_gemv_v2_task(
         customized->bgraph, params);

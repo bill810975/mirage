@@ -25,6 +25,22 @@ def build_cases(what: str, repeats: int, nwarps: int, L: int, iters: int,
                 fold: bool = False, extra: dict | None = None):
     extra = extra or {}
     cases = []
+    if what == "pipe":
+        # ffn item 1 gate matrix (ffn_item1_spec.md §7): per-tile pipeline
+        # W13/W2 correctness — active in {0,1,4,8} (forced routing), the
+        # EP-local filter case (les=128 second half), and the typical seed.
+        # n_tile edges are inherently covered: every per-tile task (first +
+        # last tile of each op instance) runs in every case.
+        base = {"mode": "ffn_correctness", "pipe": True,
+                "dump_inputs": False, "timeout_s": 2400}
+        cases.append({"name": "pipe_corr_typical", **base})
+        for k in (0, 1, 4, 8):
+            cases.append({"name": f"pipe_corr_active{k}",
+                          "force_active": k, **base})
+        cases.append({"name": "pipe_corr_filter_les128", "les": 128, **base})
+        for c in cases:
+            c.update(extra)
+        return cases
     if what in ("correctness", "all"):
         cases.append({"name": "ffn_corr_typical", "mode": "ffn_correctness",
                       "nwarps": nwarps, "fold": fold, "timeout_s": 2400})
@@ -83,7 +99,7 @@ def run_case(case, device, tag_dir):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--what", default="all",
-                    choices=["correctness", "perf", "all"])
+                    choices=["correctness", "perf", "all", "pipe"])
     ap.add_argument("--devices", default="6")
     ap.add_argument("--repeats", type=int, default=3)
     ap.add_argument("--nwarps", type=int, default=4, choices=[4, 7])

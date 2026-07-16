@@ -33,7 +33,7 @@
 //   - cta_group::1, single-CTA-per-tile, DIRECT bf16 store
 //   - ABI unchanged (drop-in replacement for mla_mtp_decode_tp8_sm100.cuh)
 //
-// Measurements (catalyst@204.12.188.88, GPU 0, B200):
+// Measurements (<BOX_USER>@<BOX_IP>, GPU 0, B200):
 //   Baseline -rdc=false: ~12.4 us KV=512 slowCTA (INVALID as verdict)
 //   Baseline -rdc=true:  ~20.86 us KV=512 slowCTA (the number to beat)
 //   v7 DEFAULT rdc=true (noinline):   ~20.80 us KV=512 (stages=3 correct, but

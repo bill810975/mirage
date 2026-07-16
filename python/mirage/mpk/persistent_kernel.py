@@ -4168,6 +4168,62 @@ class PersistentKernel:
                                     [nwarps, rblk])
 
     # ------------------------------------------------------------------
+    # PER-TILE PIPELINE variants of the W13/W2 grouped GEMM (ffn item 1,
+    # spec: scratch/v2_rewrite/ffn_item1_spec.md). Reference role pipeline
+    # (loader/launcher/consumer/storer) tasks; per-tile granularity:
+    #   W13 routed:  num_tasks = MAX_ACTIVE * (N/128) = 64  (w [E,N,K] 3D)
+    #   W13 shared:  num_tasks = N/128 = 4, always_active   (w [N,K] 2D)
+    #   W2:          num_tasks = W2_N/128 = 56 (slot segments internal)
+    # Slot into the CHAIN graph in place of the fat w13_gemv/w2_gemv ops
+    # (same edge/alias conventions). Builder gate: MPK_DSV3_V2_FFN_PIPE=1
+    # (default-OFF).
+    # ------------------------------------------------------------------
+    def dsv3_ffn_w13_pipe_layer(
+        self,
+        meta: DTensor,        # i32 (24,)     [chain edge in]
+        a_fp8: DTensor,       # u8 (7168,)    alias of router's hidden write
+        a_scale: DTensor,     # f32 (56,)     alias
+        w: DTensor,           # u8 (128,1024,7168) routed | (512,7168) shared
+        w_scale: DTensor,     # f32 (128,8,56) routed | (4,56) shared
+        y_out: DTensor,       # f32 (8,1024) y13 routed | (512,) sg shared
+        num_tasks: int,
+        always_active: bool = False,
+    ):
+        assert self.use_v2_runtime, "dsv3_ffn_* layers are v2-only"
+        tb_graph = TBGraph(CyTBGraph((num_tasks, 1, 1), (128, 1, 1), 1, 64))
+        for t in (meta, a_fp8, a_scale, w, w_scale, y_out):
+            tb_graph.new_input(t, (-1, -1, -1), -1, True)
+        self.kn_graph.customized(
+            [meta, a_fp8, a_scale, w, w_scale, y_out], tb_graph)
+        self.kn_graph.register_task(tb_graph, "dsv3_ffn_w13_pipe_v2",
+                                    [1 if always_active else 0])
+
+    def dsv3_ffn_w2_pipe_layer(
+        self,
+        i_fp8: DTensor,       # u8 (8, 512)   [chain edge in]
+        si_fp8: DTensor,      # u8 (256,)     [chain edge in]
+        meta: DTensor,        # i32 (24,)     alias
+        i_scale: DTensor,     # f32 (8, 4)    alias
+        si_scale: DTensor,    # f32 (2,)      alias
+        w2: DTensor,          # u8 (128, 7168, 512) fp8 routed down
+        w2_scale: DTensor,    # f32 (128, 56, 4)
+        wdn: DTensor,         # u8 (7168, 256) fp8 shared down
+        wdn_scale: DTensor,   # f32 (56, 2)
+        output: DTensor,      # bf16 (1, 7168) FFN block output
+        num_tasks: int,
+    ):
+        assert self.use_v2_runtime, "dsv3_ffn_* layers are v2-only"
+        assert num_tasks == 56, "W2 pipe is per-tile: num_tasks = 7168/128"
+        tb_graph = TBGraph(CyTBGraph((num_tasks, 1, 1), (128, 1, 1), 1, 64))
+        for t in (i_fp8, si_fp8, meta, i_scale, si_scale, w2, w2_scale,
+                  wdn, wdn_scale, output):
+            tb_graph.new_input(t, (-1, -1, -1), -1, True)
+        self.kn_graph.customized(
+            [i_fp8, si_fp8, meta, i_scale, si_scale, w2, w2_scale, wdn,
+             wdn_scale, output], tb_graph)
+        self.kn_graph.register_task(tb_graph, "dsv3_ffn_w2_pipe_v2", [])
+
+    # ------------------------------------------------------------------
     # FOLDED 3-op variant of the DSv3 FFN chain: the 1-task serial ops
     # (rmsnorm / topk / silu) are recomputed redundantly inside the MAC
     # tasks (v1's per-CTA trick):
@@ -6041,6 +6097,54 @@ class PersistentKernel:
             if self.use_v2_runtime:
                 from .prof import print_run_summary
                 print_run_summary(self.profiler_tensor)
+
+                # v2-only: persist the RAW v2 profiler buffer so it can be
+                # exported to a perfetto trace offline (the v1 export above
+                # parses the v2 buffer as garbage). Gated on use_v2_runtime so
+                # the v1 default path is byte-identical. Never break the run.
+                try:
+                    import numpy as _np
+
+                    _buf = self.profiler_tensor.detach().cpu().numpy()
+                    _np.save(stem + "_v2prof.npy", _buf)
+                    from .prof import Dump as _Dump
+
+                    _d = _Dump(_buf)
+                    if _d.ngroups >= 5:
+                        import os as _os
+                        import sys as _sys
+
+                        _exp = _os.path.join(
+                            _os.path.dirname(_os.path.abspath(__file__)),
+                            _os.pardir, _os.pardir, _os.pardir,
+                            "scripts", "v2_perfetto_export.py")
+                        if _os.path.exists(_exp):
+                            _sys.path.insert(0, _os.path.dirname(_exp))
+                            import v2_perfetto_export as _v2exp
+
+                            # under-sized buffer (demo default 6000*128) would
+                            # make Dump's tail-trim drop ~36% of events — the
+                            # exporter re-parses the full region in that case.
+                            if _v2exp.is_undersized(_d):
+                                _v2exp.reparse_full(_d)
+                            if _d.n_entries > 0 and _d.windows:
+                                # A full-window trace is millions of slices /
+                                # hundreds of MB and OOMs ui.perfetto.dev.
+                                # Auto-emit a LOADABLE last-2-steps trace; the
+                                # raw _v2prof.npy above keeps the full data for
+                                # offline `scripts/v2_perfetto_export.py --full`.
+                                _win, _ = _v2exp.filter_windows(
+                                    _d, last_steps=2)
+                                if not _win:
+                                    _win = None
+                                _trace = _v2exp.build_trace(_d, windows=_win)
+                                _trace.pop("_summary", None)
+                                import json as _json
+
+                                with open(stem + "_v2.json", "w") as _f:
+                                    _json.dump(_trace, _f)
+                except Exception as _e:  # noqa: BLE001
+                    print(f"[prof] v2 raw-buffer/perfetto export failed: {_e}")
 
     def __del__(self):
         if not self.__finalized__:

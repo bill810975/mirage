@@ -43,15 +43,24 @@ constexpr int A_SIZE = BLOCK_N * BLOCK_K * sizeof(nv_bfloat16); // 4096
 // TMAs can complete independently of activation TMAs (which require the
 // cross-SM dependency wait).
 //
-// Per-task SEM ordinals (relative to dyn_sem_base):
-//   [+0  ..+5 ]  W_tma_mbar      (count=1,  loader→launcher, W only)
-//   [+6  ..+11]  A_tma_mbar      (count=1,  loader→launcher, A only)
+// Per-task SEM ordinals (relative to dyn_sem_base). Re-init owner per
+// house-style §3 (async-/end-of-body-arrived mbars need a role-level
+// stale-arrival re-init; early-arrived handshakes may stay controller-only):
+//   [+0  ..+5 ]  W_tma_mbar      (count=1,  loader→launcher, W only;
+//                                 re-init: loader)
+//   [+6  ..+11]  A_tma_mbar      (count=1,  loader→launcher, A only;
+//                                 re-init: loader)
 //   [+12 ..+17]  mma_mbar        (count=1,  launcher→loader, "stage K MMA
-//   done")
-//   [+18 ..+19]  mainloop_mbar   (count=1,  launcher→consumer)
-//   [+20 ..+21]  epilogue_mbar   (count=4*WARP_SIZE, consumer→launcher)
-//   [+22      ]  tmem_ready      (count=1,  launcher→consumer)
-//   [+23      ]  consumer_done   (count=4*WARP_SIZE, consumer→launcher)
+//   done";                        re-init: loader)
+//   [+18 ..+19]  mainloop_mbar   (count=1,  launcher→consumer;
+//                                 re-init: launcher lane 0)
+//   [+20 ..+21]  epilogue_mbar   (count=4*WARP_SIZE, consumer→launcher;
+//                                 re-init: launcher lane 0)
+//   [+22      ]  tmem_ready      (count=1,  launcher→consumer; arrived EARLY
+//                                 in-task → no stale window, controller-only)
+//   [+23      ]  consumer_done   (count=4*WARP_SIZE, consumer→launcher;
+//                                 arrived at END of consumer body →
+//                                 re-init: launcher lane 0)
 constexpr int SEM_W_TMA_BASE = 0;
 constexpr int SEM_A_TMA_BASE = NUM_STAGES;            // 6
 constexpr int SEM_MMA_BASE = 2 * NUM_STAGES;          // 12
@@ -407,6 +416,23 @@ __device__ __noinline__ void
                        epilogue_mbar_addr + s * 8),
                    "r"(4 * WARP_SIZE));
     }
+    // consumer_done is arrived by all 128 consumer threads at the very END
+    // of the consumer body — immediately before the role loop's
+    // INSTRUCTION_FINISHED arrive, i.e. adjacent to the ring-slot-reuse
+    // boundary. Per the stale-arrival rule (house-style §3): 127 of those
+    // arrivals are from lanes other than the FINISHED-arriving lane 0, so
+    // they carry no release-chain ordering into the slot republish and can
+    // land AFTER the controller's per-publish re-init, flipping the fresh
+    // phase; the next occupant's launcher wait(parity 0) below then hangs
+    // with the opposite parity ready (incident: dsv3_ffn_gg_v2 2026-07-15,
+    // identical pattern). Re-init it here with the same proven timing as
+    // mainloop/epilogue above: we run after INSTRUCTION_ARRIVED (stray
+    // arrivals have landed) and before the tmem_ready arrive that gates
+    // every CURRENT-task consumer_done arrive (release→acquire, so this
+    // init cannot wipe a live arrival).
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(
+                     consumer_done_mbar_addr),
+                 "r"(4 * WARP_SIZE));
     asm volatile("fence.mbarrier_init.release.cluster;");
     mbarrier_arrive(tmem_ready_mbar_addr);
   }

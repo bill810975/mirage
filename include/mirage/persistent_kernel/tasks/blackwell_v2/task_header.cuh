@@ -16,6 +16,7 @@
 #include "attn_block_megakernel_v2.cuh" // kernel::attn_block_megakernel_v2
 #include "dsv3_attn_v2.cuh"             // kernel::dsv3_attn_v2
 #include "dsv3_dense_mlp_fused_v2.cuh"  // kernel::dsv3_dense_mlp_v2
+#include "dsv3_ffn_gg_v2.cuh"           // kernel::dsv3_ffn_gg_v2
 #include "dsv3_ffn_v2.cuh"              // kernel::dsv3_ffn_v2
 #include "dsv3_lmhead_gemv_v2.cuh"      // kernel::dsv3_lmhead_gemv_v2
 #include "embedding_v2.cuh"             // kernel::v2
