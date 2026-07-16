@@ -465,6 +465,149 @@ __device__ __forceinline__ int ring_phase(int sequence) {
   return (sequence / INSTRUCTION_RING_SIZE) & 1;
 }
 
+// ── Debug-only wedge state dump (MPK_V2_STATE_DUMP builds only) ─────────────
+// Diagnoses a pure HANG (not a fault): each role writes a WAIT-SITE word to a
+// host-mapped pinned buffer immediately BEFORE entering a potentially-blocking
+// mbarrier wait and clears it after; the controller (which stays alive during
+// a role wedge, spinning in its slot-reuse / drain / iter-sync polls)
+// periodically snapshots the worker's raw mbarrier words (instruction ring,
+// page_finished, dynamic_semaphores) into the same buffer. The hang watchdog
+// then prints, per wedged worker, WHICH wait each role is blocked in plus the
+// raw phase/count state of every mbar — pinning the desynced semaphore in one
+// wedge run. Reading an mbarrier via a plain ld.shared is outside the PTX
+// contract for mbarrier objects; it is a best-effort diagnostic snapshot
+// (worst case: a torn/stale value), never used for synchronization.
+// Default build (flag unset): compiles to nothing => byte-identical.
+#if defined(MPK_V2_STATE_DUMP)
+#ifndef MPK_V2_BREADCRUMB
+#error "MPK_V2_STATE_DUMP requires MPK_V2_BREADCRUMB=1 (shares its dump path)"
+#endif
+namespace v2sd {
+static constexpr int WORDS_PER_WORKER = 160;
+static constexpr int OFF_WS_ROLE = 0;   // [0..4]  wait-site word per role
+static constexpr int OFF_CTRL_SEQ = 5;  // controller absolute sequence
+static constexpr int OFF_HEARTBEAT = 6; // janitor snapshot counter
+static constexpr int OFF_CTRL_LOC = 7;  // controller loop location code
+static constexpr int OFF_PAGE_WS = 8;   // [8..21] per-page wait flag
+static constexpr int OFF_ARRIVED = 22;  // [22..24] raw ARRIVED mbar words
+static constexpr int OFF_FINISHED = 25; // [25..27] raw FINISHED mbar words
+static constexpr int OFF_PAGE_RAW = 28; // [28..41] raw page_finished words
+static constexpr int OFF_DYN = 48;      // [48..143] raw dyn sems [slot][32]
+// wait-site codes (word = code<<32 | arg)
+static constexpr unsigned long long WS_SEMDEP = 1;   // SEM_DEP_READY wait
+static constexpr unsigned long long WS_DEPSPIN = 2;  // cross-SM event spin
+static constexpr unsigned long long WS_MMA = 3;      // loader mma_mbar wait
+static constexpr unsigned long long WS_EPI = 4;      // launcher epilogue wait
+static constexpr unsigned long long WS_WTMA = 5;     // launcher W_tma wait
+static constexpr unsigned long long WS_ATMA = 6;     // launcher A_tma wait
+static constexpr unsigned long long WS_CDONE = 7;    // launcher consumer_done
+static constexpr unsigned long long WS_TMEM = 8;     // consumer tmem_ready
+static constexpr unsigned long long WS_MAINLOOP = 9; // consumer mainloop wait
+} // namespace v2sd
+__device__ unsigned long long *g_v2_sd_buf = nullptr;
+
+__device__ __forceinline__ unsigned long long *v2sd_worker_base() {
+  return g_v2_sd_buf + static_cast<size_t>(blockIdx.x) * v2sd::WORDS_PER_WORKER;
+}
+// Single-writer contract: each (worker, role) wait-site slot is written only
+// by that role's designated thread (consumer: threadIdx.x==0; single-warp
+// roles: their elected/lane-0 thread) — mirrors the breadcrumb rule.
+//
+// The role-path markers perturb the exact timing window the M1 race needs
+// (0/4 wedges with markers vs 3/3 without, 2026-07-16) — so they are gated
+// behind an EXTRA define MPK_V2_SD_MARKERS. The default MPK_V2_STATE_DUMP
+// build is janitor-only: zero writes from role warps, role timing untouched.
+#if defined(MPK_V2_SD_MARKERS)
+#define MPK_V2_SD_WS_SET(role, code, arg)                                      \
+  do {                                                                         \
+    if (mirage::runtime_v2::g_v2_sd_buf != nullptr) {                          \
+      mirage::runtime_v2::v2sd_worker_base()                                   \
+          [mirage::runtime_v2::v2sd::OFF_WS_ROLE + (role)] =                   \
+              (((unsigned long long)(code)) << 32) |                           \
+              (unsigned long long)(unsigned)(arg);                             \
+      __threadfence_system();                                                  \
+    }                                                                          \
+  } while (0)
+#define MPK_V2_SD_WS_CLR(role)                                                 \
+  do {                                                                         \
+    if (mirage::runtime_v2::g_v2_sd_buf != nullptr) {                          \
+      mirage::runtime_v2::v2sd_worker_base()                                   \
+          [mirage::runtime_v2::v2sd::OFF_WS_ROLE + (role)] = 0ull;             \
+    }                                                                          \
+  } while (0)
+#define MPK_V2_SD_PAGE_SET(page, instr)                                        \
+  do {                                                                         \
+    if (mirage::runtime_v2::g_v2_sd_buf != nullptr) {                          \
+      mirage::runtime_v2::v2sd_worker_base()                                   \
+          [mirage::runtime_v2::v2sd::OFF_PAGE_WS + (page)] =                   \
+              1ull | (((unsigned long long)(unsigned)(instr)) << 32);          \
+      __threadfence_system();                                                  \
+    }                                                                          \
+  } while (0)
+#define MPK_V2_SD_PAGE_CLR(page)                                               \
+  do {                                                                         \
+    if (mirage::runtime_v2::g_v2_sd_buf != nullptr) {                          \
+      mirage::runtime_v2::v2sd_worker_base()                                   \
+          [mirage::runtime_v2::v2sd::OFF_PAGE_WS + (page)] = 0ull;             \
+    }                                                                          \
+  } while (0)
+#else // MPK_V2_STATE_DUMP without MPK_V2_SD_MARKERS: janitor-only
+#define MPK_V2_SD_WS_SET(role, code, arg)
+#define MPK_V2_SD_WS_CLR(role)
+#define MPK_V2_SD_PAGE_SET(page, instr)
+#define MPK_V2_SD_PAGE_CLR(page)
+#endif
+#else
+#define MPK_V2_SD_WS_SET(role, code, arg)
+#define MPK_V2_SD_WS_CLR(role)
+#define MPK_V2_SD_PAGE_SET(page, instr)
+#define MPK_V2_SD_PAGE_CLR(page)
+#endif
+
+#if defined(MPK_V2_STATE_DUMP)
+// Controller-side janitor: snapshot this worker's raw mbarrier words into the
+// pinned buffer. Called (decimated) from the controller's spin loops — the
+// controller warp stays alive during a role wedge, so the last snapshot
+// before the watchdog fires reflects the wedged state.
+__device__ __noinline__ void v2sd_dump(RuntimeSMEM *rt, int seq, int loc) {
+  if (g_v2_sd_buf == nullptr) {
+    return;
+  }
+  unsigned long long *b = v2sd_worker_base();
+  b[v2sd::OFF_CTRL_SEQ] = static_cast<unsigned long long>(seq);
+  b[v2sd::OFF_CTRL_LOC] = static_cast<unsigned long long>(loc);
+  for (int s = 0; s < INSTRUCTION_RING_SIZE; s++) {
+    b[v2sd::OFF_ARRIVED + s] = *reinterpret_cast<unsigned long long volatile *>(
+        &rt->instruction_mbarriers[MBAR_INSTRUCTION_ARRIVED][s]);
+    b[v2sd::OFF_FINISHED + s] =
+        *reinterpret_cast<unsigned long long volatile *>(
+            &rt->instruction_mbarriers[MBAR_INSTRUCTION_FINISHED][s]);
+  }
+  for (int p = 0; p < MAX_SMEM_PAGES_PER_TASK; p++) {
+    b[v2sd::OFF_PAGE_RAW + p] =
+        *reinterpret_cast<unsigned long long volatile *>(
+            &rt->page_finished[p][0]);
+  }
+  for (int s = 0; s < INSTRUCTION_RING_SIZE; s++) {
+    for (int i = 0; i < MAX_DYNAMIC_SEMAPHORES; i++) {
+      b[v2sd::OFF_DYN + s * MAX_DYNAMIC_SEMAPHORES + i] =
+          *reinterpret_cast<unsigned long long volatile *>(
+              &rt->dynamic_semaphores[s][i]);
+    }
+  }
+  b[v2sd::OFF_HEARTBEAT] += 1;
+  __threadfence_system();
+}
+#define MPK_V2_SD_JANITOR(rt, seq, loc, ctr)                                   \
+  do {                                                                         \
+    if ((((ctr)++) & 0x3FF) == 0) {                                            \
+      mirage::runtime_v2::v2sd_dump((rt), (seq), (loc));                       \
+    }                                                                          \
+  } while (0)
+#else
+#define MPK_V2_SD_JANITOR(rt, seq, loc, ctr)
+#endif
+
 // SMEM address of the first op-private dynamic semaphore for the slot
 // owned by `instruction_index`. Tasks that need intra-task cross-warp
 // mbarriers (e.g. linear's per-stage TMA→MMA→epilogue handshakes)
@@ -489,11 +632,13 @@ __device__ __forceinline__ void init_page_state(RuntimeSMEM *rt) {
 __device__ __forceinline__ void runtime_wait_page_ready(RuntimeSMEM *rt,
                                                         int physical_page,
                                                         int instruction_index) {
+  MPK_V2_SD_PAGE_SET(physical_page, instruction_index);
 #pragma unroll
   for (int bit = 0; bit < PAGE_SEMAPHORE_BITS; bit++) {
     int const phase = (instruction_index >> bit) & 1;
     mbar_wait(&rt->page_finished[physical_page][bit], phase);
   }
+  MPK_V2_SD_PAGE_CLR(physical_page);
 }
 
 __device__ __forceinline__ void runtime_finish_page(RuntimeSMEM *rt,
@@ -630,6 +775,20 @@ __device__ __noinline__ void consumer_dep_prefix(RuntimeConfig const &config,
                                                  int iter_num) {
   int const slot = ring_slot(instruction_index);
   int const phase = ring_phase(instruction_index);
+#if defined(MPK_V2_STATE_DUMP) && defined(MPK_V2_SD_MARKERS)
+  // Wait-site markers. Prefix runs on the consumer warps AND (for linear) the
+  // loader/launcher warps; derive the breadcrumb role from the warp id and
+  // write only from that role's designated thread.
+  int const _sd_warp = threadIdx.x / 32;
+  int const _sd_role = (_sd_warp < NUM_CONSUMER_WARPS)
+                           ? 0
+                           : ((_sd_warp == LOADER_WARP)     ? 1
+                              : (_sd_warp == LAUNCHER_WARP) ? 2
+                                                            : 3);
+  bool const _sd_writer =
+      (threadIdx.x == 0) ||
+      (_sd_warp >= NUM_CONSUMER_WARPS && (threadIdx.x & 31) == 0);
+#endif
   if (threadIdx.x == 0) {
 #ifdef MPK_ENABLE_PROFILING
     bool const _in_win =
@@ -642,7 +801,9 @@ __device__ __noinline__ void consumer_dep_prefix(RuntimeConfig const &config,
                    tb::EVENT_BEGIN);
     }
 #endif
+    MPK_V2_SD_WS_SET(0, mirage::runtime_v2::v2sd::WS_DEPSPIN, 0);
     wait_task_dependency(config, task_desc, iter_num);
+    MPK_V2_SD_WS_CLR(0);
 #ifdef MPK_ENABLE_PROFILING
     if (_in_win) {
       v2_prof_emit(config.profiler_buffer,
@@ -669,7 +830,18 @@ __device__ __noinline__ void consumer_dep_prefix(RuntimeConfig const &config,
   // FINISHED arrival of warps 1-3 and the task's event with it
   // (~300us/step at bs16 after cascade; V2_TODO.md #17 has the full
   // evidence chain).
+#if defined(MPK_V2_STATE_DUMP) && defined(MPK_V2_SD_MARKERS)
+  if (_sd_writer) {
+    MPK_V2_SD_WS_SET(
+        _sd_role, v2sd::WS_SEMDEP, (unsigned)slot | ((unsigned)phase << 8));
+  }
+#endif
   mbar_wait(&rt->dynamic_semaphores[slot][SEM_DEP_READY], phase);
+#if defined(MPK_V2_STATE_DUMP) && defined(MPK_V2_SD_MARKERS)
+  if (_sd_writer) {
+    MPK_V2_SD_WS_CLR(_sd_role);
+  }
+#endif
 }
 
 __device__ __forceinline__ bool task_dependency_ready(
@@ -931,6 +1103,10 @@ __device__ __noinline__ void controller_warp_loop(RuntimeSMEM *rt,
   size_t const my_count = my_end - my_offset;
   int sequence = 0;
 
+#if defined(MPK_V2_STATE_DUMP)
+  unsigned _sd_ctr = 0; // janitor decimation counter (controller lane 0)
+#endif
+
   // profiling track (controller group): prepare/iter-barrier timing.
   MPK_V2_PROF_DECL(V2_PROF_GROUP_CONTROLLER, (lane_id == 0))
 
@@ -985,6 +1161,7 @@ __device__ __noinline__ void controller_warp_loop(RuntimeSMEM *rt,
               &rt->instruction_mbarriers[MBAR_INSTRUCTION_FINISHED][done_slot]),
           done_phase)) {
         eager_trigger_inflight();
+        MPK_V2_SD_JANITOR(rt, sequence, 1, _sd_ctr);
       }
       eager_trigger_inflight();
     }
@@ -1033,6 +1210,7 @@ __device__ __noinline__ void controller_warp_loop(RuntimeSMEM *rt,
             static_cast<unsigned long long>(iter_num + 1);
         while (ld_acquire_sys_u64(config.v2_iter_go_counter) < needed) {
           __nanosleep(50);
+          MPK_V2_SD_JANITOR(rt, sequence, 4, _sd_ctr);
         }
         MPK_V2_PROF_END(V2_PROF_GO_WAIT);
       }
@@ -1198,6 +1376,7 @@ __device__ __noinline__ void controller_warp_loop(RuntimeSMEM *rt,
                 &rt->instruction_mbarriers[MBAR_INSTRUCTION_FINISHED][slot]),
             ph)) {
           eager_trigger_inflight();
+          MPK_V2_SD_JANITOR(rt, sequence, 2, _sd_ctr);
         }
       }
       eager_trigger_inflight();
@@ -1216,6 +1395,7 @@ __device__ __noinline__ void controller_warp_loop(RuntimeSMEM *rt,
           static_cast<unsigned long long>(iter_num + 1);
       while (ld_acquire_sys_u64(config.v2_iter_sync_counter) < needed) {
         __nanosleep(50);
+        MPK_V2_SD_JANITOR(rt, sequence, 3, _sd_ctr);
       }
       MPK_V2_PROF_END(V2_PROF_ITER_SYNC);
     }

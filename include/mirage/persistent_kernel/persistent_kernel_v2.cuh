@@ -36,6 +36,110 @@ using ::mirage::runtime::EventDesc;
 using ::mirage::runtime::RuntimeConfig;
 using ::mirage::runtime::TaskId;
 
+#if defined(MPK_V2_BREADCRUMB) && defined(MPK_V2_STATE_DUMP)
+// Host-side view of the wedge state-dump buffer (see runtime_v2.cuh v2sd::).
+inline unsigned long long *g_v2_sd_host = nullptr;
+inline int g_v2_sd_num_workers = 0;
+
+// Decode + print the per-worker wedge state. `only_wedged`: print only
+// workers with a nonzero wait-site or page-wait flag (plus one healthy
+// reference worker).
+inline void dump_v2_state() {
+  if (g_v2_sd_host == nullptr || g_v2_sd_num_workers <= 0) {
+    printf("[v2][state_dump] no buffer — nothing to dump\n");
+    return;
+  }
+  char const *site_name[] = {"-",
+                             "SEM_DEP_READY",
+                             "DEP_SPIN",
+                             "LDR_MMA",
+                             "LNCH_EPILOGUE",
+                             "LNCH_W_TMA",
+                             "LNCH_A_TMA",
+                             "LNCH_CONSUMER_DONE",
+                             "CONS_TMEM_READY",
+                             "CONS_MAINLOOP"};
+  char const *role_name[5] = {
+      "consumer", "loader", "launcher", "storer", "controller"};
+  char const *loc_name[6] = {
+      "-", "slot-reuse-wait", "drain", "iter-sync", "go-wait", "?"};
+  printf("[v2][state_dump] ==== per-worker wedge state (wait-site words + "
+         "controller mbar snapshots) ====\n");
+  for (int w = 0; w < g_v2_sd_num_workers; w++) {
+    unsigned long long const *b =
+        g_v2_sd_host + static_cast<size_t>(w) * v2sd::WORDS_PER_WORKER;
+    // In janitor-only builds (no MPK_V2_SD_MARKERS) there are no wait-site
+    // flags — a wedged worker is identified by the BREADCRUMB, so print every
+    // worker's snapshot (grep by worker id afterwards).
+    bool wedged = false;
+    for (int r = 0; r < 5; r++) {
+      if (b[v2sd::OFF_WS_ROLE + r] != 0ull) {
+        wedged = true;
+      }
+    }
+    for (int p = 0; p < 14; p++) {
+      if (b[v2sd::OFF_PAGE_WS + p] != 0ull) {
+        wedged = true;
+      }
+    }
+    unsigned long long const loc = b[v2sd::OFF_CTRL_LOC];
+    printf("[v2][state_dump] worker=%d %s ctrl_seq=%llu ctrl_loc=%s "
+           "heartbeat=%llu\n",
+           w,
+           wedged ? "[WEDGED]" : "[-]",
+           b[v2sd::OFF_CTRL_SEQ],
+           loc_name[(loc < 5) ? loc : 5],
+           b[v2sd::OFF_HEARTBEAT]);
+    for (int r = 0; r < 5; r++) {
+      unsigned long long const ws = b[v2sd::OFF_WS_ROLE + r];
+      if (ws != 0ull) {
+        unsigned long long const code = ws >> 32;
+        unsigned const arg = static_cast<unsigned>(ws & 0xFFFFFFFFull);
+        printf("[v2][state_dump]   role=%s BLOCKED at %s arg=0x%x "
+               "(stage=%u phase=%u k=%u)\n",
+               role_name[r],
+               (code < 10) ? site_name[code] : "?",
+               arg,
+               arg & 0xFF,
+               (arg >> 8) & 0xFF,
+               (arg >> 16) & 0xFFFF);
+      }
+    }
+    for (int p = 0; p < 14; p++) {
+      unsigned long long const pw = b[v2sd::OFF_PAGE_WS + p];
+      if (pw != 0ull) {
+        printf("[v2][state_dump]   loader BLOCKED at PAGE_WAIT page=%d "
+               "instr=%llu (expects parity %llu)\n",
+               p,
+               pw >> 32,
+               (pw >> 32) & 1ull);
+      }
+    }
+    printf("[v2][state_dump]   ARRIVED raw:  %016llx %016llx %016llx\n",
+           b[v2sd::OFF_ARRIVED + 0],
+           b[v2sd::OFF_ARRIVED + 1],
+           b[v2sd::OFF_ARRIVED + 2]);
+    printf("[v2][state_dump]   FINISHED raw: %016llx %016llx %016llx\n",
+           b[v2sd::OFF_FINISHED + 0],
+           b[v2sd::OFF_FINISHED + 1],
+           b[v2sd::OFF_FINISHED + 2]);
+    printf("[v2][state_dump]   pages raw:");
+    for (int p = 0; p < 14; p++) {
+      printf(" %llx", b[v2sd::OFF_PAGE_RAW + p]);
+    }
+    printf("\n");
+    for (int s = 0; s < 3; s++) {
+      printf("[v2][state_dump]   dyn[slot%d]:", s);
+      for (int i = 0; i < 32; i++) {
+        printf(" %llx", b[v2sd::OFF_DYN + s * 32 + i]);
+      }
+      printf("\n");
+    }
+  }
+  printf("[v2][state_dump] ==== end per-worker wedge state ====\n");
+}
+#endif
+
 // ── Host-side: build per-SM static task plan ────────────────────────────────
 // Algorithm: walk all events in order, round-robin assign each event's task
 // range to workers. Matches v1 scheduler semantics closely enough to preserve
@@ -205,6 +309,47 @@ inline void build_v2_plan(RuntimeConfig &config) {
            bc_host,
            bc_dev,
            bc_bytes);
+  }
+#endif
+
+#if defined(MPK_V2_BREADCRUMB) && defined(MPK_V2_STATE_DUMP)
+  // Debug-only wedge state-dump buffer (see runtime_v2.cuh v2sd:: block):
+  // per-worker wait-site words + controller mbar snapshots, host-mapped pinned
+  // so the watchdog can decode a pure hang. Separate allocation (not appended
+  // to the breadcrumb span) so no other probe's offset math changes.
+  {
+    size_t const sd_bytes = static_cast<size_t>(num_workers) *
+                            v2sd::WORDS_PER_WORKER * sizeof(unsigned long long);
+    void *sd_host = nullptr;
+    cudaError_t sd_err = cudaHostAlloc(&sd_host, sd_bytes, cudaHostAllocMapped);
+    if (sd_err != cudaSuccess || sd_host == nullptr) {
+      printf("[v2][state_dump] FATAL: cudaHostAlloc(%zu) failed: %s\n",
+             sd_bytes,
+             cudaGetErrorString(sd_err));
+      abort();
+    }
+    memset(sd_host, 0, sd_bytes);
+    void *sd_dev = nullptr;
+    sd_err = cudaHostGetDevicePointer(&sd_dev, sd_host, 0);
+    if (sd_err != cudaSuccess || sd_dev == nullptr) {
+      printf("[v2][state_dump] FATAL: cudaHostGetDevicePointer failed: %s\n",
+             cudaGetErrorString(sd_err));
+      abort();
+    }
+    sd_err = cudaMemcpyToSymbol(
+        mirage::runtime_v2::g_v2_sd_buf, &sd_dev, sizeof(sd_dev));
+    if (sd_err != cudaSuccess) {
+      printf("[v2][state_dump] FATAL: cudaMemcpyToSymbol failed: %s\n",
+             cudaGetErrorString(sd_err));
+      abort();
+    }
+    g_v2_sd_host = static_cast<unsigned long long *>(sd_host);
+    g_v2_sd_num_workers = num_workers;
+    printf("[v2][state_dump] ENABLED: %d workers x %d words, host=%p dev=%p\n",
+           num_workers,
+           v2sd::WORDS_PER_WORKER,
+           sd_host,
+           sd_dev);
   }
 #endif
 
@@ -704,8 +849,8 @@ extern "C" inline void
   // only dumped on a launch *error*). This watchdog closes that gap: if the env
   // var MPK_V2_HANG_WATCHDOG_S is set to a positive integer N (and the run was
   // compiled with MPK_V2_BREADCRUMB so the pinned buffer exists), spawn a host
-  // std::thread that starts its timer HERE (kernel-launch time — so N seconds is
-  // N seconds into the actual kernel run/hang, NOT wall time since process
+  // std::thread that starts its timer HERE (kernel-launch time — so N seconds
+  // is N seconds into the actual kernel run/hang, NOT wall time since process
   // start; the ~10-15min JIT happened earlier at mpk.compile()). If the launch
   // hasn't returned after N seconds, the thread dumps the breadcrumb DIRECTLY
   // from the host-mapped pinned buffer (plain host memory — readable during a
@@ -768,6 +913,10 @@ extern "C" inline void
       mirage::runtime_v2::dump_linv3_probe(global_runtime_config);
       fflush(stdout);
 #endif
+#if defined(MPK_V2_STATE_DUMP)
+      mirage::runtime_v2::dump_v2_state();
+      fflush(stdout);
+#endif
       printf("[v2][watchdog] *** breadcrumb dumped; forcing _Exit(134) to "
              "escape the hang ***\n");
       fflush(stdout);
@@ -794,6 +943,10 @@ extern "C" inline void
     // The host-mapped pinned breadcrumb survives the context poisoning; decode
     // which task was in flight when the fault hit.
     mirage::runtime_v2::dump_breadcrumb(global_runtime_config);
+    fflush(stdout);
+#endif
+#if defined(MPK_V2_STATE_DUMP)
+    mirage::runtime_v2::dump_v2_state();
     fflush(stdout);
 #endif
 #ifdef MPK_V2_LINV3_PROBE

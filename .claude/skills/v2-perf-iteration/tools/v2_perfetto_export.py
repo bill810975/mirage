@@ -157,7 +157,8 @@ TASK_TYPE_NAMES = {
     350: "NVSHMEM_TILE_ALLREDUCE_V2",
     351: "NVSHMEM_TILE_ALLREDUCE_WITH_RESIDUAL_V2", 352: "TENSOR_INIT_V2",
     353: "ATTN_BLOCK_MEGAKERNEL_V2", 354: "DSV3_DENSE_MLP_FUSED_V2",
-    355: "DSV3_LMHEAD_GEMV_V2", 356: "SM100_TASK_END",
+    355: "DSV3_LMHEAD_GEMV_V2", 356: "DSV3_FFN_W13_PIPE_V2",
+    357: "DSV3_FFN_W2_PIPE_V2", 358: "SM100_TASK_END",
 }
 
 # ev_id -> perf bucket (mirrors prof.cmd_summary's b_of, extended to the v2
@@ -168,6 +169,7 @@ _EV_TO_BUCKET = {
     # v2 linear GEMM task types
     244: 0, 245: 0, 242: 0, 243: 0, 253: 0, 252: 0, 251: 0,
     334: 0, 336: 0, 348: 0, 349: 0, 354: 0, 355: 0,  # FFN/dense/lmhead GEMV
+    356: 0, 357: 0,  # FFN W13/W2 per-tile pipes
     # attention task types
     329: 1, 319: 1, 353: 1,
     340: 1, 341: 1, 342: 1, 343: 1, 344: 1, 345: 1, 346: 1,  # DSv3 attn stages

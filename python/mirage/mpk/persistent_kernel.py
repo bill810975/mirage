@@ -381,6 +381,20 @@ def get_compile_command(
     # feedback_mpirun_x_env_gap).
     if os.environ.get("MPK_V2_BREADCRUMB") == "1":
         flags = flags + ["-DMPK_V2_BREADCRUMB"]
+    # DEBUG (default-OFF => default build byte-identical): Runtime-V2 wedge
+    # state dump. Each role writes a WAIT-SITE word to pinned memory before
+    # every potentially-blocking mbarrier wait (cleared after), and the
+    # controller periodically snapshots the worker's raw mbarrier words; the
+    # hang watchdog prints both — pinning WHICH wait each wedged role is
+    # blocked in and the raw phase state of every mbar. Requires
+    # MPK_V2_BREADCRUMB=1 (a #error enforces the coupling).
+    if os.environ.get("MPK_V2_STATE_DUMP") == "1":
+        flags = flags + ["-DMPK_V2_STATE_DUMP"]
+    # Sub-flag: also compile the role-path wait-site markers (stores+fences
+    # before each blocking wait). These perturb the exact timing window the
+    # M1 race needs (Heisenbug) — default state-dump build is janitor-only.
+    if os.environ.get("MPK_V2_SD_MARKERS") == "1":
+        flags = flags + ["-DMPK_V2_SD_MARKERS"]
     # HANG WATCHDOG (default-OFF): MPK_V2_HANG_WATCHDOG_S=<N seconds> arms a
     # host std::thread inside launch_persistent_kernel_v2 (persistent_kernel_v2.
     # cuh) that dumps the breadcrumb + _Exit()s if the kernel launch does not

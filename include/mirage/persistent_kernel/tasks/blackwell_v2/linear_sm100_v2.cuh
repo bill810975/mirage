@@ -285,7 +285,12 @@ __device__ __noinline__ void
       // refill". For the first NUM_STAGES iters this passes immediately
       // (init parity), so weight TMAs run as soon as their pages are
       // ready cross-task.
+      MPK_V2_SD_WS_SET(1,
+                       mirage::runtime_v2::v2sd::WS_MMA,
+                       (unsigned)tma_stage | ((unsigned)mma_phase << 8) |
+                           ((unsigned)i << 16));
       mbarrier_wait(mma_mbar_addr + tma_stage * 8, mma_phase);
+      MPK_V2_SD_WS_CLR(1);
 
       int const W_mbar = W_tma_mbar_base + tma_stage * 8;
       int const A_mbar = A_tma_mbar_base + tma_stage * 8;
@@ -303,8 +308,10 @@ __device__ __noinline__ void
 
       // Activation TMA: gated by producer event.
       if (!dep_done) {
+        MPK_V2_SD_WS_SET(1, mirage::runtime_v2::v2sd::WS_DEPSPIN, 0);
         mirage::runtime_v2::wait_task_dependency(
             runtime_config, task_desc, iter_num);
+        MPK_V2_SD_WS_CLR(1);
         dep_done = true;
       }
 
@@ -444,7 +451,13 @@ __device__ __noinline__ void
     int epilogue_phase = 1;
 
     for (int t = 0; t < tiles_to_process; t++) {
+      MPK_V2_SD_WS_SET(2,
+                       mirage::runtime_v2::v2sd::WS_EPI,
+                       (unsigned)mainloop_stage |
+                           ((unsigned)epilogue_phase << 8) |
+                           ((unsigned)t << 16));
       mbarrier_wait(epilogue_mbar_addr + mainloop_stage * 8, epilogue_phase);
+      MPK_V2_SD_WS_CLR(2);
 
       for (int i = 0; i < iters_per_slice; i++) {
         int const W_smem =
@@ -459,8 +472,17 @@ __device__ __noinline__ void
         uint64_t b_desc = SMEM_DESC | (A_smem >> 4);
 
         // Phase 4.1: wait both W and A mbars (split from tma_mbar).
+        MPK_V2_SD_WS_SET(2,
+                         mirage::runtime_v2::v2sd::WS_WTMA,
+                         (unsigned)tma_stage | ((unsigned)tma_phase << 8) |
+                             ((unsigned)i << 16));
         mbarrier_wait(W_tma_mbar_base + tma_stage * 8, tma_phase);
+        MPK_V2_SD_WS_SET(2,
+                         mirage::runtime_v2::v2sd::WS_ATMA,
+                         (unsigned)tma_stage | ((unsigned)tma_phase << 8) |
+                             ((unsigned)i << 16));
         mbarrier_wait(A_tma_mbar_base + tma_stage * 8, tma_phase);
+        MPK_V2_SD_WS_CLR(2);
         asm volatile("tcgen05.fence::after_thread_sync;");
 
         tcgen05_mma(tmem, a_desc, b_desc, I_DESC, i);
@@ -496,6 +518,20 @@ __device__ __noinline__ void
     }
   }
 
+  // Reconverge BEFORE the blanket page release. The MMA loop above runs only
+  // on the elected lane; under Volta+ ITS the other 31 lanes are NOT rejoined
+  // at the if-block exit, so without this barrier lanes 1..13 release pages
+  // 1..13 while the elected lane is still blocked inside the MMA loop (its
+  // first W_tma wait). If any of those early releases beats the SAME task's
+  // loader page-prefix wait (parity instruction_index&1), the loader reads
+  // the page parity one use AHEAD and blocks forever -> it never issues the
+  // W TMAs the elected lane is waiting on -> permanent all-role wedge
+  // (observed: M1 correctness-matrix hang at M=1, state-dump fingerprint =
+  // pages 1..13 parity-flipped + page 0 untouched + tmem_ready arrived +
+  // zero TMA completions; 2026-07-16). linear_sm100_v3 carries the same
+  // barrier at this point ("Reconverge before freeing pages", :1369).
+  __syncwarp();
+
   // Task-end blanket page release, lane-parallel (launcher owns page
   // release for linear; auto_consumer_finish=false).
   if (lane_id < MAX_SMEM_PAGES_PER_TASK) {
@@ -507,7 +543,9 @@ __device__ __noinline__ void
   // TMEM is no longer in use. Init parity = 0; after 128 arrives, parity
   // flips to 1; lane 0's wait(phase=0) returns when parity != 0.
   if (lane_id == 0) {
+    MPK_V2_SD_WS_SET(2, mirage::runtime_v2::v2sd::WS_CDONE, 0);
     mbarrier_wait(consumer_done_mbar_addr, 0);
+    MPK_V2_SD_WS_CLR(2);
   }
   __syncwarp();
 
@@ -564,7 +602,17 @@ __device__ __noinline__ void
   // to 1 → wait(phase=0) returns. mbar_wait carries acquire-cluster, so
   // the scratch write made by launcher's alloc is visible after wait.
   if (lane_id == 0) {
+#if defined(MPK_V2_STATE_DUMP) && defined(MPK_V2_SD_MARKERS)
+    if (threadIdx.x == 0) {
+      MPK_V2_SD_WS_SET(0, mirage::runtime_v2::v2sd::WS_TMEM, 0);
+    }
+#endif
     mbarrier_wait(tmem_ready_mbar_addr, 0);
+#if defined(MPK_V2_STATE_DUMP) && defined(MPK_V2_SD_MARKERS)
+    if (threadIdx.x == 0) {
+      MPK_V2_SD_WS_CLR(0);
+    }
+#endif
   }
   __syncwarp();
   int const taddr = *reinterpret_cast<int *>(
@@ -580,7 +628,21 @@ __device__ __noinline__ void
     int const cur_k_slice = cur_tile_idx / num_spatial_tiles;
     int const bid_m = cur_spatial_idx;
 
+#if defined(MPK_V2_STATE_DUMP) && defined(MPK_V2_SD_MARKERS)
+    if (threadIdx.x == 0) {
+      MPK_V2_SD_WS_SET(0,
+                       mirage::runtime_v2::v2sd::WS_MAINLOOP,
+                       (unsigned)mainloop_stage |
+                           ((unsigned)mainloop_phase << 8) |
+                           ((unsigned)t << 16));
+    }
+#endif
     mbarrier_wait(mainloop_mbar_addr + mainloop_stage * 8, mainloop_phase);
+#if defined(MPK_V2_STATE_DUMP) && defined(MPK_V2_SD_MARKERS)
+    if (threadIdx.x == 0) {
+      MPK_V2_SD_WS_CLR(0);
+    }
+#endif
     asm volatile("tcgen05.fence::after_thread_sync;");
 
     int const n_real = bid_m * BLOCK_M + warp_id * 32 + lane_id;

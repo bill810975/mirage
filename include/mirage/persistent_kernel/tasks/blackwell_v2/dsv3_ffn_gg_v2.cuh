@@ -638,6 +638,14 @@ __device__ __noinline__ void
     ffngg_tcgen05_commit(mainloop_base + 0 * 8); // ACC[0] full -> consumer
   }
 
+  // Reconverge BEFORE the page release: under Volta+ ITS the non-elected
+  // lanes are not rejoined at the elect-block exit, so without this barrier
+  // they release pages while the elected lane is still inside the K-stage
+  // loop (waiting its first W_tma). An early release racing the SAME task's
+  // loader page-prefix wait flips the parity one use ahead -> loader blocks
+  // forever -> all-role wedge (same mechanism as linear_sm100_v2, fixed
+  // 2026-07-16; linear_sm100_v3 has carried this barrier all along).
+  __syncwarp();
   // Task-end page release (Q3 ownership; launcher blanket over used pages).
   ffngg_launcher_release_used_pages(task_desc, runtime_smem, lane_id);
   __syncwarp();
@@ -1112,6 +1120,9 @@ __device__ __noinline__ void
     }
   }
 
+  // Reconverge BEFORE the page release — same ITS early-release wedge as the
+  // W13 pipe / linear_sm100_v2 (see the comment at the W13 site above).
+  __syncwarp();
   // Task-end page release (Q3 ownership; launcher blanket over used pages).
   ffngg_launcher_release_used_pages(task_desc, runtime_smem, lane_id);
   __syncwarp();

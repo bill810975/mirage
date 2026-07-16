@@ -103,6 +103,29 @@ char const *kConsumerPageSuffix =
     "    _sfx_t0 = v2_prof_now_ns();\n"
     "  }\n"
     "#endif\n"
+    // KNOWN OPEN RACE — latent PRODUCTION race, currently timing-masked
+    // unprofiled (root-caused 2026-07-16, fix attempt reverted): this
+    // release has no ordering edge to the SAME task's loader page-prefix
+    // claim (different warps). A consumer that finishes while the loader
+    // warp still lags on earlier sequences releases the task's used pages
+    // BEFORE the loader's prefix waits them; the prefix then reads the page
+    // parity one use ahead and blocks forever (observed: profiled mlp-chain
+    // wedge, rmsnorm loader-prefix stuck on exactly the task's used pages at
+    // claim-count+1; state-dump fingerprint in the 2026-07-16 fix campaign).
+    // The loader lag source is structural and profiling-independent — the
+    // shared W4 loader was still draining the previous down-linear's ~96
+    // mma-gated TMA issues; profiling merely widens the window. "Unprofiled
+    // passes" is timing-masking over a handful of runs, NOT proof of absence.
+    // A repair ("suffix waits a loader-arrived pages_claimed[slot] mbarrier
+    // at ring_phase parity") was implemented and REVERTED: it deadlocked the
+    // profiled AND unprofiled L=6 mlp chains at iter 0 (4/4). Leading
+    // failure hypothesis (ablation-logic-reviewer): arriver-set/waiter-set
+    // cardinality mismatch — the loader arrives once per EVERY sequence, but
+    // only auto_consumer_finish consumers wait, so non-waited uses (e.g.
+    // linear 242/243) advance the phase between waited uses and a later
+    // waiter can face an already-advanced ring_phase. Any re-attempt MUST
+    // make the arriver set exactly equal the waiter set AND carry a
+    // ring-wraparound phase-accounting proof before landing.
     "  if (threadIdx.x < MAX_SMEM_PAGES_PER_TASK &&\n"
     "      task_uses_page(task_desc, threadIdx.x)) {\n"
     "    runtime_finish_page(runtime_smem, threadIdx.x, 1);\n"
