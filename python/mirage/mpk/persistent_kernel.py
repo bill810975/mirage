@@ -395,6 +395,16 @@ def get_compile_command(
     # M1 race needs (Heisenbug) — default state-dump build is janitor-only.
     if os.environ.get("MPK_V2_SD_MARKERS") == "1":
         flags = flags + ["-DMPK_V2_SD_MARKERS"]
+    # DEBUG A/B knobs for the race-3 iteration-barrier half-exit fix (both
+    # default-OFF => default build byte-identical). AMPLIFY injects ~5ms of
+    # post-barrier delay on a worker subset (widens the straggle window);
+    # OLD_READ restores the pre-fix racy post-barrier step read. AMPLIFY +
+    # OLD_READ wedges the race on demand; AMPLIFY alone on the fixed read
+    # must pass (the causal regression pair).
+    if os.environ.get("MPK_V2_RACE3_AMPLIFY") == "1":
+        flags = flags + ["-DMPK_V2_RACE3_AMPLIFY"]
+    if os.environ.get("MPK_V2_RACE3_OLD_READ") == "1":
+        flags = flags + ["-DMPK_V2_RACE3_OLD_READ"]
     # HANG WATCHDOG (default-OFF): MPK_V2_HANG_WATCHDOG_S=<N seconds> arms a
     # host std::thread inside launch_persistent_kernel_v2 (persistent_kernel_v2.
     # cuh) that dumps the breadcrumb + _Exit()s if the kernel launch does not

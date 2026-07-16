@@ -136,6 +136,16 @@ inline void dump_v2_state() {
       printf("\n");
     }
   }
+  // Cross-SM event counters (same GMEM values from every worker's snapshot —
+  // print once from worker 0's block).
+  {
+    unsigned long long const *b0 = g_v2_sd_host;
+    printf("[v2][state_dump] event counters [0..47]:");
+    for (int e = 0; e < 48; e++) {
+      printf(" %llu", b0[v2sd::OFF_EVENTS + e]);
+    }
+    printf("\n");
+  }
   printf("[v2][state_dump] ==== end per-worker wedge state ====\n");
 }
 #endif

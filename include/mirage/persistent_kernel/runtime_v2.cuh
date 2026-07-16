@@ -483,7 +483,7 @@ __device__ __forceinline__ int ring_phase(int sequence) {
 #error "MPK_V2_STATE_DUMP requires MPK_V2_BREADCRUMB=1 (shares its dump path)"
 #endif
 namespace v2sd {
-static constexpr int WORDS_PER_WORKER = 160;
+static constexpr int WORDS_PER_WORKER = 192;
 static constexpr int OFF_WS_ROLE = 0;   // [0..4]  wait-site word per role
 static constexpr int OFF_CTRL_SEQ = 5;  // controller absolute sequence
 static constexpr int OFF_HEARTBEAT = 6; // janitor snapshot counter
@@ -493,6 +493,7 @@ static constexpr int OFF_ARRIVED = 22;  // [22..24] raw ARRIVED mbar words
 static constexpr int OFF_FINISHED = 25; // [25..27] raw FINISHED mbar words
 static constexpr int OFF_PAGE_RAW = 28; // [28..41] raw page_finished words
 static constexpr int OFF_DYN = 48;      // [48..143] raw dyn sems [slot][32]
+static constexpr int OFF_EVENTS = 144;  // [144..191] first 48 GMEM event ctrs
 // wait-site codes (word = code<<32 | arg)
 static constexpr unsigned long long WS_SEMDEP = 1;   // SEM_DEP_READY wait
 static constexpr unsigned long long WS_DEPSPIN = 2;  // cross-SM event spin
@@ -568,12 +569,26 @@ __device__ __forceinline__ unsigned long long *v2sd_worker_base() {
 // Controller-side janitor: snapshot this worker's raw mbarrier words into the
 // pinned buffer. Called (decimated) from the controller's spin loops — the
 // controller warp stays alive during a role wedge, so the last snapshot
-// before the watchdog fires reflects the wedged state.
+// before the watchdog fires reflects the wedged state. The dump requires the
+// RuntimeConfig for the cross-SM event counters, threaded via an ambient
+// device pointer set in the kernel prologue (diagnostic-only).
+__device__ void *g_v2_sd_event_counters = nullptr;
+__device__ int g_v2_sd_num_events = 0;
 __device__ __noinline__ void v2sd_dump(RuntimeSMEM *rt, int seq, int loc) {
   if (g_v2_sd_buf == nullptr) {
     return;
   }
   unsigned long long *b = v2sd_worker_base();
+  // Cross-SM event counters (GMEM, same values every worker sees) — the
+  // discriminator for dep-spin wedges: which event is short, and by how much.
+  if (g_v2_sd_event_counters != nullptr) {
+    unsigned long long const *ec =
+        static_cast<unsigned long long const *>(g_v2_sd_event_counters);
+    int const n = (g_v2_sd_num_events < 48) ? g_v2_sd_num_events : 48;
+    for (int e = 0; e < n; e++) {
+      b[v2sd::OFF_EVENTS + e] = ec[e];
+    }
+  }
   b[v2sd::OFF_CTRL_SEQ] = static_cast<unsigned long long>(seq);
   b[v2sd::OFF_CTRL_LOC] = static_cast<unsigned long long>(loc);
   for (int s = 0; s < INSTRUCTION_RING_SIZE; s++) {
@@ -1383,6 +1398,28 @@ __device__ __noinline__ void controller_warp_loop(RuntimeSMEM *rt,
     }
     __syncwarp();
 
+    // RACE-3 FIX (2026-07-16): snapshot the loop-exit step value BEFORE this
+    // worker's iter-sync arrival — and BEFORE the fence below, so the load
+    // is ordered ahead of the (relaxed) arrival atomic on weakly-ordered
+    // hardware. config.step[0] is mutated only by worker 0's
+    // prepare_next_batch at the NEXT iteration's head, which cannot run
+    // until EVERY worker has arrived this barrier — so a pre-arrival
+    // snapshot reads THIS iteration's value on every worker and the break
+    // decision below is UNIFORM. The old post-barrier read raced
+    // prepare(M+1): a straggler waking late from the barrier spin read the
+    // already-advanced step and broke one iteration early, publishing
+    // TERMINATE while the other workers entered the next iteration and
+    // waited forever on its never-published tasks' events (observed:
+    // 6/136 workers exited at iter 30 of 32; the gateup event counter came
+    // up short by exactly their iteration-31 task population; the split can
+    // only fire when step == max_seq_length-2, i.e. at the final boundary —
+    // matching every observed end-of-run wedge; profiled builds pin
+    // g_v2_gen_done to 0, making this check the sole loop exit there).
+    int step0 = 0;
+    if (lane_id == 0) {
+      step0 = *reinterpret_cast<int volatile *>(&config.step[0]);
+    }
+
     // All workers must finish the current iteration before any worker starts
     // the next prepare_next_batch. The system fence orders this worker's event
     // updates before it increments the cross-worker iteration counter.
@@ -1401,12 +1438,34 @@ __device__ __noinline__ void controller_warp_loop(RuntimeSMEM *rt,
     }
     __syncwarp();
 
-    // Step is updated by prepare_next_batch. Broadcast lane 0's read so the
-    // controller warp exits the loop uniformly.
-    int step0 = 0;
-    if (lane_id == 0) {
-      step0 = config.step[0];
+    // RACE-3 AMPLIFIER (debug, env-gated default-OFF): widen the
+    // barrier-exit straggle window on a worker subset so the half-exit race
+    // below (now fixed — see the snapshot note at the barrier) can be
+    // reproduced on demand against the OLD read placement, and proven
+    // closed against the new one. ~5 ms of post-barrier delay.
+#ifdef MPK_V2_RACE3_AMPLIFY
+    if ((worker_id & 15) == 3) {
+      for (int _d = 0; _d < 5000; _d++) {
+        __nanosleep(1000);
+      }
     }
+#endif
+#ifdef MPK_V2_RACE3_OLD_READ
+    // A/B arm (debug, default-OFF): reproduce the PRE-FIX racy post-barrier
+    // read. Combined with MPK_V2_RACE3_AMPLIFY this wedges the half-exit
+    // race on demand (the delayed workers read step AFTER worker 0's
+    // next-iteration prepare advanced it); the fixed build under the same
+    // amplifier must pass.
+    if (lane_id == 0) {
+      step0 = *reinterpret_cast<int volatile *>(&config.step[0]);
+    }
+#endif
+
+    // Step is updated by prepare_next_batch. Broadcast lane 0's PRE-ARRIVAL
+    // snapshot (taken above, before the iter-sync fence+arrival) so the
+    // controller warp exits the loop uniformly. Do NOT re-read step here:
+    // the post-barrier value races worker 0's NEXT-iteration
+    // prepare_next_batch (see the RACE-3 note at the snapshot site).
     step0 = __shfl_sync(0xffffffff, step0, 0);
     if (step0 >= config.max_seq_length - 1) {
       break;
@@ -1450,6 +1509,13 @@ __global__ __launch_bounds__(MPK_LAUNCH_THREADS,
   if (threadIdx.x == 0) {
     // same value from every block — benign race, long before first use.
     g_v2_prof_buf = config.profiler_buffer;
+  }
+#endif
+#if defined(MPK_V2_STATE_DUMP)
+  if (threadIdx.x == 0) {
+    // same value from every block — benign race, diagnostic-only.
+    g_v2_sd_event_counters = config.all_event_counters;
+    g_v2_sd_num_events = config.num_events;
   }
 #endif
 
