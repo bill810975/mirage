@@ -69,13 +69,28 @@ struct TaskRoleVariantCode {
   // cross-warp release-before-claim race for this task. Only meaningful for
   // auto_consumer_finish tasks whose loader/launcher/storer bodies are all
   // empty (the emitter enforces the structural predicate on top of this
-  // flag). Opt-in rather than automatic: the DSv3 FFN GEMV chain
-  // (consumer-only at nwarps=4) wedged its page-claim wait under the
-  // automatic transform in harness validation (mechanism unresolved), so
-  // only tasks validated with the claim may set this. Currently: rmsnorm_v2
-  // and silu_mul_v2 (the tasks whose suffix races produced the observed
-  // production wedge).
+  // flag). Currently: rmsnorm_v2 and silu_mul_v2 (the tasks whose suffix
+  // races produced the observed production wedge). NOTE the SkipUsed loader
+  // prefix makes the loader's observation of USED pages sparse — safe only
+  // while such tasks are never queued so that a page goes unobserved for
+  // two consecutive sequences before a page-waiting task (the plan-time
+  // window assertion in build_v2_plan enforces exactly this).
   bool consumer_owned_page_claim = false;
+  // Consumer-TOTAL page lifecycle (race-2 closure hardening, 2026-07-17):
+  // the consumer claims its used pages AND its suffix releases ALL pages;
+  // the loader emits NO page code for this task. Closes the SkipUsed mod-2
+  // sparse-observation alias (the nwarps=4 FFN GEMV chain wedge — see
+  // v2_role_codegen.cc kConsumerPageClaim) for chains made entirely of such
+  // tasks (all page ops become warp-0 program-ordered). Same structural
+  // predicate as consumer_owned_page_claim; takes precedence over it.
+  // Currently: the DSv3 FFN GEMV chain + folded chain registrations
+  // (active at nwarps=4 only — multi_role voids the structural gate).
+  // NOT for tasks queued adjacent to wait-all/SkipUsed tasks in mixed
+  // chains (rmsnorm/silu stay on consumer_owned_page_claim: the qwen3 plan
+  // packs [silu, rmsnorm, linear] on one worker queue, where suffix-all
+  // would widen the two-pending-release alias window to every page — the
+  // plan assertion caught exactly this during validation).
+  bool consumer_total_page_lifecycle = false;
 };
 
 class TaskRegister {

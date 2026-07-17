@@ -9239,6 +9239,10 @@ int TaskRegister::register_dsv3_ffn_router_quant_v2_task(
     role_code.launcher = helper_code.to_string();
     role_code.storer = helper_code.to_string();
   }
+  // Consumer-TOTAL page lifecycle opt-in (race-2 window closure).
+  // Active only at nwarps=4 (the structural gate in v2_role_codegen.cc
+  // requires empty helper bodies; the multi_role branch above voids it).
+  role_code.consumer_total_page_lifecycle = true;
   register_v2_task_role_variant(
       TASK_DSV3_FFN_ROUTER_QUANT_V2, variant, role_code);
   register_variant_smem_info(
@@ -9275,14 +9279,16 @@ int TaskRegister::register_dsv3_ffn_topk_sigmoid_v2_task(
   consumer_code.inc_indent();
   emit_dep_wait_consumer_prefix(consumer_code);
   emit_body(consumer_code);
+  TaskRoleVariantCode topk_role_code{/*init_semaphores=*/"",
+                                     /*loader=*/"",
+                                     /*launcher=*/"",
+                                     /*consumer=*/consumer_code.to_string(),
+                                     /*storer=*/""};
+  // Consumer-TOTAL page lifecycle opt-in — see the router_quant
+  // registration above.
+  topk_role_code.consumer_total_page_lifecycle = true;
   register_v2_task_role_variant(
-      TASK_DSV3_FFN_TOPK_SIGMOID_V2,
-      variant,
-      TaskRoleVariantCode{/*init_semaphores=*/"",
-                          /*loader=*/"",
-                          /*launcher=*/"",
-                          /*consumer=*/consumer_code.to_string(),
-                          /*storer=*/""});
+      TASK_DSV3_FFN_TOPK_SIGMOID_V2, variant, topk_role_code);
   register_variant_smem_info(TASK_DSV3_FFN_TOPK_SIGMOID_V2,
                              variant,
                              ::kernel::dsv3_ffn_v2::make_topk_smem_info());
@@ -9340,6 +9346,9 @@ int TaskRegister::register_dsv3_ffn_w13_gemv_v2_task(
     role_code.launcher = helper_code.to_string();
     role_code.storer = helper_code.to_string();
   }
+  // Consumer-TOTAL page lifecycle opt-in — see the router_quant
+  // registration above. nwarps=7 stays excluded by the structural gate.
+  role_code.consumer_total_page_lifecycle = true;
   register_v2_task_role_variant(TASK_DSV3_FFN_W13_GEMV_V2, variant, role_code);
   register_variant_smem_info(TASK_DSV3_FFN_W13_GEMV_V2,
                              variant,
@@ -9669,14 +9678,18 @@ int TaskRegister::register_dsv3_ffn_silu_quant_v2_task(
   consumer_code.inc_indent();
   emit_dep_wait_consumer_prefix(consumer_code);
   emit_body(consumer_code);
+  TaskRoleVariantCode siluq_role_code{/*init_semaphores=*/"",
+                                      /*loader=*/"",
+                                      /*launcher=*/"",
+                                      /*consumer=*/consumer_code.to_string(),
+                                      /*storer=*/""};
+  // Consumer-TOTAL page lifecycle opt-in — see the router_quant
+  // registration above. silu_quant declares no SMEM regions, so the claim
+  // degenerates to the 128-thread barrier and the loader prefix is
+  // behavior-identical to the wait-all form (every page is unused).
+  siluq_role_code.consumer_total_page_lifecycle = true;
   register_v2_task_role_variant(
-      TASK_DSV3_FFN_SILU_QUANT_V2,
-      variant,
-      TaskRoleVariantCode{/*init_semaphores=*/"",
-                          /*loader=*/"",
-                          /*launcher=*/"",
-                          /*consumer=*/consumer_code.to_string(),
-                          /*storer=*/""});
+      TASK_DSV3_FFN_SILU_QUANT_V2, variant, siluq_role_code);
   register_variant_smem_info(
       TASK_DSV3_FFN_SILU_QUANT_V2,
       variant,
@@ -9737,6 +9750,9 @@ int TaskRegister::register_dsv3_ffn_w2_gemv_v2_task(
     role_code.launcher = helper_code.to_string();
     role_code.storer = helper_code.to_string();
   }
+  // Consumer-TOTAL page lifecycle opt-in — see the router_quant
+  // registration above. nwarps=7 stays excluded by the structural gate.
+  role_code.consumer_total_page_lifecycle = true;
   register_v2_task_role_variant(TASK_DSV3_FFN_W2_GEMV_V2, variant, role_code);
   register_variant_smem_info(TASK_DSV3_FFN_W2_GEMV_V2,
                              variant,
@@ -9903,6 +9919,9 @@ int TaskRegister::register_dsv3_ffn_router_quant_rms_v2_task(
     role_code.launcher = helper_code.to_string();
     role_code.storer = helper_code.to_string();
   }
+  // Consumer-TOTAL page lifecycle opt-in — see the router_quant
+  // registration above. nwarps=7 stays excluded by the structural gate.
+  role_code.consumer_total_page_lifecycle = true;
   register_v2_task_role_variant(
       TASK_DSV3_FFN_ROUTER_QUANT_RMS_V2, variant, role_code);
   register_variant_smem_info(
@@ -9969,6 +9988,9 @@ int TaskRegister::register_dsv3_ffn_w13_topk_v2_task(
     role_code.launcher = helper_code.to_string();
     role_code.storer = helper_code.to_string();
   }
+  // Consumer-TOTAL page lifecycle opt-in — see the router_quant
+  // registration above. nwarps=7 stays excluded by the structural gate.
+  role_code.consumer_total_page_lifecycle = true;
   register_v2_task_role_variant(TASK_DSV3_FFN_W13_TOPK_V2, variant, role_code);
   register_variant_smem_info(
       TASK_DSV3_FFN_W13_TOPK_V2,
@@ -10031,6 +10053,9 @@ int TaskRegister::register_dsv3_ffn_w2_silu_v2_task(
     role_code.launcher = helper_code.to_string();
     role_code.storer = helper_code.to_string();
   }
+  // Consumer-TOTAL page lifecycle opt-in — see the router_quant
+  // registration above. nwarps=7 stays excluded by the structural gate.
+  role_code.consumer_total_page_lifecycle = true;
   register_v2_task_role_variant(TASK_DSV3_FFN_W2_SILU_V2, variant, role_code);
   register_variant_smem_info(
       TASK_DSV3_FFN_W2_SILU_V2,

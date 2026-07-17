@@ -209,6 +209,112 @@ inline void build_v2_plan(RuntimeConfig &config) {
   // it so SM 0 runs it first each iter.
   per_sm[0].insert(per_sm[0].begin(), 1);
 
+  // Page-lifecycle mixed-chain window assertion (race-2 closure boundary,
+  // 2026-07-17; see v2_role_codegen.cc kConsumerPageClaim). A page-parity
+  // wait is mod-2, so a page-waiting warp aliases TWO-EARLY iff some page
+  // carries two pending releases when it checks — reachable iff a page p
+  // goes unobserved by page-waiting warps for the TWO sequences preceding
+  // the wait on the same worker queue:
+  //   exists p: p in miss(a) AND p in miss(b) AND p in waits(c)
+  // for a consecutive window [a, b, c], where
+  //   miss(t)  = pages t's loader does NOT wait (consumer-total: all;
+  //              consumer-owned/SkipUsed: t's used pages; wait-all: none)
+  //   waits(t) = pages t's loader waits (wait-all: all; SkipUsed: t's
+  //              UNUSED pages; consumer-total: none).
+  // The window is exactly 3 wide: the FINISHED-gated ring bounds pending
+  // releases to the last 2 sequences. Checked WITHIN one iteration only —
+  // the controller's end-of-iteration drain + barrier require every
+  // sequence FINISHED (a consumer warp's FINISHED arrive is program-ordered
+  // after its suffix), so no release pends across the boundary. This
+  // caught a REAL shape during validation: qwen3 packs [silu, rmsnorm,
+  // linear] on one worker queue, which is safe under rmsnorm/silu's
+  // shipped SkipUsed mode (miss(silu) is empty — zero regions) but would
+  // be unsafe under consumer-total — hence the mode scoping.
+  {
+    size_t max_task_pos = 2; // covers the prepended begin task (pos 1)
+    for (int s = 0; s < num_workers; s++) {
+      for (size_t p : per_sm[s]) {
+        max_task_pos = (p + 1 > max_task_pos) ? p + 1 : max_task_pos;
+      }
+    }
+    std::vector<TaskDesc> h_tasks(max_task_pos);
+    cudaMemcpy(h_tasks.data(),
+               config.all_tasks,
+               max_task_pos * sizeof(TaskDesc),
+               cudaMemcpyDeviceToHost);
+    auto used_mask_of = [&](size_t pos) {
+      unsigned mask = 0;
+      TaskDesc const &t = h_tasks[pos];
+      for (int r = 0; r < t.num_smem_regions; r++) {
+        int const start = t.smem_regions[r].physical_page_start;
+        int const cnt = t.smem_regions[r].page_count;
+        for (int p = start; p < start + cnt && p < MAX_SMEM_PAGES_PER_TASK;
+             p++) {
+          if (p >= 0) {
+            mask |= 1u << p;
+          }
+        }
+      }
+      return mask;
+    };
+    unsigned const all_mask = (1u << MAX_SMEM_PAGES_PER_TASK) - 1u;
+    auto miss_mask_of = [&](size_t pos) -> unsigned {
+      int const mode =
+          _v2_variant_page_mode(static_cast<int>(h_tasks[pos].task_type),
+                                static_cast<int>(h_tasks[pos].variant_id));
+      if (mode == 3) {
+        return all_mask;
+      }
+      if (mode == 2) {
+        return used_mask_of(pos);
+      }
+      return 0u; // wait-all observes everything; mode 0 has no page role
+    };
+    auto waits_mask_of = [&](size_t pos) -> unsigned {
+      int const mode =
+          _v2_variant_page_mode(static_cast<int>(h_tasks[pos].task_type),
+                                static_cast<int>(h_tasks[pos].variant_id));
+      if (mode == 1) {
+        return all_mask;
+      }
+      if (mode == 2) {
+        return all_mask & ~used_mask_of(pos);
+      }
+      return 0u; // consumer-total loaders wait nothing
+    };
+    for (int s = 0; s < num_workers; s++) {
+      size_t const n = per_sm[s].size();
+      if (n < 3) {
+        continue;
+      }
+      for (size_t i = 0; i + 2 < n; i++) {
+        size_t const a = per_sm[s][i];
+        size_t const b = per_sm[s][i + 1];
+        size_t const c = per_sm[s][i + 2];
+        unsigned const bad =
+            miss_mask_of(a) & miss_mask_of(b) & waits_mask_of(c);
+        if (bad != 0u) {
+          printf("[v2][page-plan] FATAL: worker %d queue window (pos %zu "
+                 "type %d, pos %zu type %d, pos %zu type %d) leaves page "
+                 "mask 0x%x unobserved for two consecutive sequences before "
+                 "a page wait — the mod-2 parity wait could alias two-early "
+                 "through the two pending releases. Re-plan the chain or "
+                 "change the offending task's page-lifecycle mode.\n",
+                 s,
+                 a,
+                 static_cast<int>(h_tasks[a].task_type),
+                 b,
+                 static_cast<int>(h_tasks[b].task_type),
+                 c,
+                 static_cast<int>(h_tasks[c].task_type),
+                 bad);
+          fflush(stdout);
+          abort();
+        }
+      }
+    }
+  }
+
   // Flatten into offsets + positions
   std::vector<size_t> h_offsets(num_workers + 1);
   size_t total = 0;

@@ -935,6 +935,15 @@ __device__ __forceinline__ void
                             int instruction_index,
                             int iter_num);
 
+// Host-side per-(task_type, variant) page-lifecycle mode, defined by the
+// generated role-dispatch code (v2_role_codegen.cc emit_page_mode_fn):
+// 0 = none/unregistered, 1 = wait-all loader prefix (dense observation),
+// 2 = consumer-owned + SkipUsed loader (loader misses the USED pages),
+// 3 = consumer-total (loader misses EVERY page; waits none). Consumed by
+// build_v2_plan's mixed-chain window assertion (persistent_kernel_v2.cuh)
+// — see the mixed-chain boundary note in v2_role_codegen.cc.
+int _v2_variant_page_mode(int task_type, int variant_id);
+
 // ── Debug-only per-worker task breadcrumb (MPK_V2_BREADCRUMB builds only) ────
 // Localizes a context-poisoning cudaErrorIllegalAddress that only reproduces
 // in the full multi-rank megakernel (memcheck can't attribute it under
