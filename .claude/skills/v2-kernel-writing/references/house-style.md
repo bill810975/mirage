@@ -61,9 +61,12 @@ Controller (runtime-owned) fetches TaskDesc into a 3-slot ring, runs the op's
 - Elected lane MMA loop: wait W_tma + A_tma mbars, `tcgen05.fence::after_thread_sync`, then
   `tcgen05_mma` over MMA_K sub-tiles with SMEM-descriptor increments (:436-455),
   `tcgen05_commit(mma_mbar[stage])` per K-stage, `tcgen05_commit(mainloop_mbar[slot])` per tile.
-- Task-end: lane-parallel blanket page release (`runtime_finish_page`, :475-477 — pairs with
-  `auto_consumer_finish=false` in registration), lane-0 wait `consumer_done`, then
-  `tcgen05.dealloc` using the taddr CACHED at :387 (scratch page may already be freed).
+- Task-end: `__syncwarp()` reconverge after the elect block FIRST — ITS does not rejoin lanes
+  at the if-exit; runaway lanes 1..13 once released pages while elected lane 0 was still in
+  the MMA loop (race 1, fixed `689dadc5`) — then lane-parallel blanket page release
+  (`runtime_finish_page`, :475-477 — pairs with `auto_consumer_finish=false` in registration),
+  lane-0 wait `consumer_done`, then `tcgen05.dealloc` using the taddr CACHED at :387 (scratch
+  page may already be freed).
 
 **Consumer (W0-3)** — `linear_consumer_task` (:497-628)
 - Lane 0 waits `tmem_ready` (+`__syncwarp`), read taddr from scratch region (:540-546).
@@ -149,6 +152,24 @@ dsv3_ffn_gg_v2 v008 incident class. Two C++ gotchas when going table-driven (lin
 fence vs surrounding TMA/MMA issue, re-exposing the stale-arrival race), and device code cannot
 runtime-iterate a host `constexpr` table (odr-use → "undefined in device code") — extract fields
 only via constexpr-indexed macro expansion.
+
+**Race-fix protocol rules (2026-07-16 — durable; enforce on every new/ported kernel):**
+- **Arriver-set == waiter-set.** Every lane performing a lane-parallel mbar/page arrive must
+  be reconverged with the work it publishes: after any `elect_sync()`/divergent block,
+  `__syncwarp()` BEFORE the arrives — ITS does not rejoin lanes at an if-exit, and runaway
+  lanes releasing early advance parity one use ahead (race 1, `689dadc5`).
+- **Dense-observer-or-full-owner for mod-2 parity mbars.** A parity wait (`releases(p) ≡ s
+  mod 2`) is sound ONLY if the waiting warp observes EVERY sequence of that page (wait-all
+  dense observation) or one warp-group owns claim→body→release program-ordered
+  (consumer-TOTAL). Sparse observation (SkipUsed across a chain reusing pages) cannot
+  distinguish 0 releases from 2 and passes two occurrences early (race 2 + residual,
+  `7d271a01` + `7b6ae2bb`).
+- **Exit-reads snapshot BEFORE barrier arrival.** Any value deciding loop exit/termination
+  must be read before arriving the iteration/end barrier; reading after races the next
+  iteration's producer, and a straggler exits one iteration early (race 3, `025029a1`).
+- **Protocol invariants become plan-time assertions.** If safety depends on a plan shape
+  (page-window, chain interleave), assert it in `build_v2_plan` — the mixed-chain
+  page-window assertion caught a real qwen3 shape at build time (`7b6ae2bb`).
 
 ## 4. SMEM: spec.h is the single source of truth
 

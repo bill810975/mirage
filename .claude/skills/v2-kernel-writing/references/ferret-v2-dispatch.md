@@ -105,30 +105,21 @@ guidance, not as live state. The run's deliverable pair is working-tree-only, no
    one TU.** They define the SAME `kernel::sm100::` symbols; the megakernel test.cu already
    pulls the v1 header transitively → include the v1 header only (`#pragma once` makes it
    idempotent). The byte-identical v2 copy is a redefinition error, not a convenience.
-3. **Profiled-scoring fragility (TIER-2 `body_span` gates).** The scoring build's
-   `-DMPK_ENABLE_PROFILING` can wedge (100% GPU spin, byte-static, watchdog-named broad
-   all-role jam) INDEPENDENT of the candidate: proven 2026-07-15 by the candidate-free
-   REFERENCE chain (linear_sm100_v2 mlp) wedging profiled at gate density (L=6/iters=32,
-   seizes mid-window at iter 14; L=4/iters=32 passes; window opens at
-   `iters − V2_PROF_WINDOW_ITERS(25)`). It is a timing/codegen Heisenbug — instrumented waits
-   dissolve it; candidate-side ordering changes (page-release after consumer_done) do NOT; the
-   in-tree warning is runtime_v2.cuh:259-263 (sm100 codegen sensitive to if/else around
-   tcgen05 waits — the profiled-only `MPK_V2_PROF_START/END` window branches wrap every task).
-   **Gate-design guidance:** (a) pre-flight the gate's exact profiled L/iters on the
-   reference-only chain BEFORE freezing — if it wedges, the geometry cannot score ANY
-   candidate; (b) a profiled wedge with correctness-green unprofiled runs at every scale is
-   INFRA, not a candidate FAIL — do not burn optimizer rounds on it (friction escape, hand to
-   the orchestrator); (c) fallback scoring while the infra bug lives: score from the UNPROFILED
-   iteration wall (already the gate's cross-check arm) or hold for TIER-1 in-MPK slowCTA —
-   never lower `iters` below the window (untested) or ship an unscored PASS.
-   **Status 2026-07-15:** fallback (c) is now the ACTIVE scoring path in the ws7 gate
-   (unprofiled iteration-wall attribution, gate re-frozen rev b — see
-   `workspace7/gate/gate.md`). **Update 2026-07-15 (user-authorized fix attempt): the
-   runtime-side branchless profiling wrap + reference `consumer_done` re-init LANDED but
-   did NOT dissolve the wedge (reference repro re-wedges @iter6-8 across builds; see
-   `gate_runs/refreeze_userfix_20260715.log`) — profiled `body_span` scoring is NOT
-   eligible to resume for run-3; fallback (c) unprofiled iteration-wall stays the
-   measurement of record.**
+3. **Profiled `body_span` scoring (TIER-2 gates) — RE-ELIGIBLE (2026-07-16).** The 2026-07-15
+   "profiled-scoring fragility" that SUSPENDED profiled scoring is resolved: the wedges were
+   never a profiler×tcgen05 codegen Heisenbug — they were the v2 runtime races, root-caused +
+   fixed 2026-07-16 (`689dadc5`, `7d271a01`+`7b6ae2bb`, `025029a1`; mechanisms in
+   `validation-debug.md` §5.1). Race 3 (iteration-barrier half-exit) explains the profiled
+   BIAS specifically: profiled builds force iterations, making the racy loop-exit read the
+   sole exit — that is why only profiled/gate-density runs wedged while unprofiled passed.
+   Former wedge windows (reference mlp L=6/iters=32 profiled; L=4) PASS post-fix, so the ws7
+   gate's fallback-(c) unprofiled iteration-wall scoring is no longer forced.
+   **Re-verify note (one-time per gate freeze): run the reference-profiled pre-flight once at
+   the gate's exact L/iters on a ≥`7b6ae2bb` tree before trusting profiled `body_span`** — a
+   wedge there is now a NEW bug (triage per validation-debug.md §5), not the old infra class.
+   Still-valid gate-design guidance: (a) that reference-only pre-flight remains the
+   infra-vs-candidate discriminator; (b) a candidate wedge = round FAIL + protocol audit;
+   (c) never lower `iters` below the profiling window or ship an unscored PASS.
 
 ## Friction escape (mandatory)
 

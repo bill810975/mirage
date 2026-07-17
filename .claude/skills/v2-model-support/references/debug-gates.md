@@ -80,6 +80,12 @@ identical runs diverge ~token 10). Token-identity A/B is INCONCLUSIVE there.
 
 ## D. Hang / crash triage (v2-specific)
 
+> The three historical v2 runtime races are FIXED (2026-07-16: `689dadc5` launcher-ITS early
+> page release, `7d271a01`+`7b6ae2bb` consumer-suffix/page-parity alias, `025029a1`
+> iteration-barrier half-exit). A hang matching an old signature on a ≥`7b6ae2bb` tree is a
+> NEW bug — read those commit messages + `v2-kernel-writing/references/validation-debug.md`
+> §5.1 (fingerprint method + durable rules) before instrumenting.
+
 **D1 — iter-0 fine, iter-1 hang ⇒ re-init of PERSISTENT state, not a missing event.**
 The signature of re-zeroing monotonic barrier scratch: `count ≥ num_tasks*(iter+1)`
 holds at iter 0 only. Check every `tensor_init_layer` on barrier scratch has
@@ -127,9 +133,10 @@ crash-loop the megakernel; a wedged box needs reboot, not retries.
   non-trivial conclusion (root cause, "structurally impossible", lever verdicts)
   BEFORE acting on it. Over-claims have repeatedly been wrong here.
 - `mpk-profiler` — perf ground truth only AFTER correctness is green.
-- Validation assets to reuse: `tests/runtime_python/blackwell_v2/` (per-op harness,
-  README documents metrics + trust gates + the profiled-sparse-chain wedge caveat),
-  per-kernel `tests/runtime_python/blackwell/sm100_*/` test-mode dirs, TP2 micrograph
+- Validation assets to reuse: `tests/runtime_python/blackwell_v2/` (per-op harness; README
+  documents metrics + trust gates — its "profiled-sparse-chain wedge" caveat is HISTORICAL:
+  those wedges were the v2 races fixed 2026-07-16, see the note atop §D), per-kernel
+  `tests/runtime_python/blackwell/sm100_*/` test-mode dirs, TP2 micrograph
   pattern for collectives.
 
 ## F. Checklist to close Phase (c) for a milestone

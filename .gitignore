@@ -84,8 +84,7 @@ ncu_tmp
 .claude/
 .humanize/
 
-# Local-only Claude docs / scratch PR description — never push
-/CLAUDE.md
+# Local-only scratch PR description / logs — never push
 /pr.md
 *.log
 
@@ -102,3 +101,7 @@ demo/linear_v3_unittest.py
 !.claude/agents/
 !.claude/skills/**
 !.claude/agents/**
+
+# Root CLAUDE.md is tracked (agent context travels with the repo). Only this one
+# file — WORKFLOW.md and other local root docs stay under the global `*.md` rule.
+!/CLAUDE.md

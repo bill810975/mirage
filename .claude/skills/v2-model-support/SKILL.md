@@ -200,7 +200,7 @@ math-changing commit.
 (`.claude/skills/v2-perf-iteration/`) — load it to run this phase; the summary below is
 orientation only.**
 
-The multi-agent loop from `WORKFLOW.md`, unchanged: profiler → (analyzer) → planner →
+The multi-agent loop, unchanged: profiler → (analyzer) → planner →
 iterator → [ablation-logic-reviewer] → implement → correctness-gate → profiler →
 commit-reviewer → commit → memory-keeper → decide. Standing disciplines:
 - EVERY non-trivial conclusion through `ablation-logic-reviewer` + a Codex MCP
@@ -297,4 +297,4 @@ scoped workers (per-op kernel authors, harness writers, reviewers). Hard rules:
 | `references/box-orchestration.md` | remote-box session playbook (setup/poll split, rsync, retries, safety) — §1-2 site-specific, §3-8 transfer |
 | `references/V2_DSV3_DECODE_MASTER_PLAN.md` | the real M0→M5 plan this skill generalizes (archived worked example) |
 | `FUSED_KERNEL_DEBUG_METHODOLOGY.md` (repo root) | the original debug order-of-operations |
-| `WORKFLOW.md` (repo root) | the full multi-agent loop |
+| `../v2-perf-iteration/SKILL.md` + its `references/loop-agents.md` | the full multi-agent loop (repo-root `WORKFLOW.md` is a superseded stub) |

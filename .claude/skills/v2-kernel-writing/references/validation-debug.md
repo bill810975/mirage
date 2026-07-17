@@ -59,7 +59,7 @@ tensor_init (M3, 2026-07-07: attn task 353 + ffn task 348;
 | Symptom | Tool | Notes |
 |---|---|---|
 | HANG (0 tokens, SMs pegged, log frozen) | **watchdog**: compile `-DMPK_V2_BREADCRUMB` + env `MPK_V2_HANG_WATCHDOG_S=<sec>` | Host thread dumps the pinned breadcrumb + `_Exit(134)` on no-progress (persistent_kernel_v2.cuh:~705-728). PROVEN: named TASK_ATTN_BLOCK_MEGAKERNEL_V2(353)/consumer/iter-1. Without it `cudaStreamSynchronize` blocks forever — breadcrumb alone is CRASH-only (dump only runs when sync RETURNS an error, :698-706) |
-| HANG only under `profiled=true` (`-DMPK_ENABLE_PROFILING`); unprofiled passes at EVERY scale; adding instrumented waits (debug print/force-return around the same waits) makes it VANISH (Heisenbug) | **discriminator = reference-kernel-profiled test**: run the candidate-free reference chain (`{"mode":"perf","runtime":"v2","chain":"mlp","linvar":"v2","M":1,...}`) profiled at the SAME L/iters, watchdog armed | Suspect the profiler×tcgen05-wait codegen/timing interaction, NOT the candidate: `MPK_V2_PROF_START/END` wrap every task in window-gated if/else (window = last `V2_PROF_WINDOW_ITERS=25` iters) and runtime_v2.cuh:259-263 explicitly warns sm100 codegen is branch-sensitive around tcgen05 waits. Reference wedges too ⇒ PURE INFRA, candidate exonerated (PROVEN 2026-07-15: reference wedged L=6/iters=32 @iter14 — in-window — broad 408-slot all-role convoy jam, 100% util byte-static; L=4/iters=32 passed; candidate page-release-after-consumer_done reorder did NOT dissolve its wedge @iter31). Wedges observed ONLY while the window is ON. Budget ≤3 wedge repros, short timeouts, never re-run unchanged. **FIX ATTEMPT REFUTED 2026-07-15 (user-authorized)**: branchless wrap (window folded into `profiler_write_thread_predicate`, CFG uniform in/out of window) + reference `consumer_done` launcher re-init both landed — reference repro STILL wedges (fix1+fix2 @iter8, fix2-only @iter6; wedge-iter drifts per binary) ⇒ the window-if/else wrap is NOT the (sole) mechanism; remaining in-window suspects = `consumer_dep_prefix` `v2_prof_emit` wrap, `trigger_task_event` TRIG-ring atomics, the in-window profiler store traffic itself. Profiled arm stays SUSPENDED. NEW pre-existing baseline break found same day: v2 correctness matrix (`{"mode":"correctness","runtime":"v2","M":1}`) wedges UNPROFILED @iter0 (tasks 242/243) at HEAD headers too (reverted-control proven — not the edits) |
+| HANG matching a HISTORICAL signature — profiled-only mlp-chain wedge, unprofiled correctness-matrix iter-0 wedge (tasks 242/243), or end-of-run iter-31 wedge | **RESOLVED 2026-07-16 — all three were v2 runtime RACES, root-caused + fixed (§5.1)**: `689dadc5` / `7d271a01`+`7b6ae2bb` / `025029a1`. Former wedge windows PASS post-fix (mlp L=6/iters=32 profiled, L=4; the profiled correctness matrix) | The 2026-07-15 era's "profiler×tcgen05-wait codegen Heisenbug" framing and its "FIX ATTEMPT REFUTED / profiled arm SUSPENDED / root cause OPEN" status are **SUPERSEDED** — the branchless-wrap fix attempt was refuted because the wrap was never the mechanism; the profiled BIAS was race 3's forced-iteration exposure (profiled builds pin `g_v2_gen_done=0`, making the racy exit read the sole loop exit). The reference-kernel-profiled discriminator (run the candidate-free reference chain at the same L/iters, watchdog armed) remains the right FIRST move on any new profiled-only hang — but on a tree ≥ `7b6ae2bb` such a hang is a NEW bug: read the four race commits' messages first, then apply the §5.1 fingerprint method. Budget ≤3 wedge repros, short timeouts, never re-run unchanged |
 | CRASH (cudaErrorIllegalAddress / Misaligned) | **compute-sanitizer memcheck under mpirun = GROUND TRUTH** | Exact instruction+block+line. The breadcrumb IN-FLIGHT count is a BASE-RATE ARTIFACT — dominant count = widest terminal consumer (argmax), not the faulter (linear_v3 loader, 49/49 records, workers 70-131). Never derive culpability from count dominance; SKIP-N probes keyed on breadcrumb false-confirm bystanders (`feedback_breadcrumb_inflight_base_rate_artifact`) |
 | Post-fix ablation | sanitizer records → 0 | Crash-elimination alone can be a shifted tile, not a fix |
 | Xid 145/45 at first NVSHMEM barrier | box stop→start reboot | Fabric fault, NOT code |
@@ -67,6 +67,41 @@ tensor_init (M3, 2026-07-07: attn task 353 + ffn task 348;
 Breadcrumb wiring: readback helper `demo/deepseek_v3/v2_breadcrumb_readback.py`; role ids must
 match `MPK_V2_BREADCRUMB_ROLES` (runtime_v2.cuh:756-763); STARTED≠COMPLETED = in-flight
 candidate SET, not proof.
+
+### 5.1 The three fixed v2 runtime races (2026-07-16) — mechanisms, method, durable rules
+
+All of §5's historical wedge signatures were these; each is FIXED, kept here for the lesson:
+
+- **Race 1 (`689dadc5`) — launcher ITS early page release.** The task-end blanket page
+  release ran with no warp reconvergence after the `if (elect_sync()) { MMA loop }` block;
+  under sm_100a Independent Thread Scheduling lanes 1..13 released pages while elected lane 0
+  was still inside the loop, so a release beat the SAME task's loader-prefix claim (parity one
+  use ahead → all-role wedge). Fix: `__syncwarp()` between the elect block and the release.
+- **Race 2 (`7d271a01`, residual closed by `7b6ae2bb`) — consumer suffix vs loader claim.**
+  The codegen consumer page-release SUFFIX could overtake the same task's lagging-loader
+  prefix CLAIM (different warps, no ordering edge). Fix: Design E consumer-owned claim
+  (program-ordered claim→body→release; opt-in rmsnorm/silu). Residual: Design E's SkipUsed
+  loader made page observation SPARSE — a mod-2 parity wait cannot distinguish 0 releases
+  from 2, so the FFN GEMV chain aliased two-early. Fix: consumer-TOTAL page lifecycle for the
+  FFN chain + a plan-time page-window assertion (which caught a real qwen3 plan shape);
+  nwarps=7 forms proven structurally excluded.
+- **Race 3 (`025029a1`) — iteration-barrier half-exit.** The loop-exit `config.step[0]` read
+  sat AFTER the end-of-iteration barrier, racing worker 0's next-iteration prepare; straggler
+  workers TERMINATEd one iteration early while everyone else waited on their never-published
+  tasks. This was the "profiled bias": profiled builds force iterations, making that read the
+  sole loop exit. Fix: snapshot exit reads BEFORE barrier arrival.
+
+**The fingerprint method that cracked all three (reuse on any NEW wedge):** zero-perturbation
+pinned-memory state dump on the live wedge → match role positions + page-parity arithmetic +
+raw mbar words against the plan's ground-truth tables with ZERO free parameters (+ wait-site
+markers); for timing races, a reviewer-required amplifier arm (injected delay) that reproduces
+the wedge on demand with a population-scaled signature.
+
+**Durable protocol rules (also in house-style.md §3):** (1) arriver-set == waiter-set —
+reconverge (`__syncwarp()`) before any lane-parallel mbar arrive after a divergent block;
+(2) dense-observer-or-full-owner for mod-2 parity mbars — sparse observation aliases;
+(3) exit-reads snapshot BEFORE barrier arrival; (4) protocol invariants become plan-time
+assertions (`build_v2_plan` aborts loudly beat silent wedges).
 
 ## 6. Two-build trap (before ANY hypothesis from box artifacts)
 

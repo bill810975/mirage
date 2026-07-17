@@ -39,3 +39,13 @@
 # Note for the commit step: the mpk-commit-reviewer's NEVER-STAGE set carries a written
 # exception for these two subtrees once this patch is applied (see its `.claude/` bullet);
 # everything else under .claude/ must still never be staged.
+#
+# ADDENDUM (2026-07-16, applied in the docs cleanup commit): one further root-level
+# negation was appended to .gitignore —
+#   !/CLAUDE.md
+# Root CLAUDE.md is now TRACKED (user-directed: the rewritten evergreen agent context
+# travels with the repo). Scope is exactly that one file: WORKFLOW.md, /pr.md, and all
+# other local root docs stay ignored (the global `*.md` rule / their explicit rules).
+# Verified via `git check-ignore -v`: CLAUDE.md -> matches the negation (trackable);
+# WORKFLOW.md -> `*.md`; pr.md -> `/pr.md`. STATUS: both this patch's six lines and the
+# addendum line are APPLIED in the committed .gitignore.

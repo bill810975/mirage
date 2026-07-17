@@ -5,8 +5,9 @@ description: Runtime-V2 performance-iteration workflow. Use when running a perf-
 
 # V2 Perf Iteration — the measurement-driven optimization loop
 
-This is the perf-optimization loop from `WORKFLOW.md` (the v1 multi-agent campaign that ran
-for months), upgraded for Runtime-V2's measurement reality. Siblings: **`v2-model-support`**
+This is the perf-optimization loop of the v1 multi-agent campaign that ran for months
+(the old repo-root `WORKFLOW.md` is now a superseded stub pointing here), upgraded for
+Runtime-V2's measurement reality. Siblings: **`v2-model-support`**
 (bring-up; its Phase (d) is this skill), **`v2-kernel-writing`** (the per-KERNEL inner loop
 this skill dispatches into when a lever is kernel-body work). The main thread (or one lead
 orchestrator) runs the loop and does all edits/commits/box-ops; subagents measure-parse /
@@ -15,8 +16,8 @@ operations never go inside a subagent** (`v2-model-support/references/box-orches
 
 **Goal + verdict metric — pin ONE per campaign, then do not drift.** The loop is
 metric-agnostic; what is non-negotiable is that a single PRODUCTION verdict config is
-declared up front and every lever's verdict-grade Δ is measured there. **The DSv3 campaign's
-instance (CLAUDE.md-locked):** e2e decode tpot, **bs=1, TP8 EP2, MTP off**, toward
+declared up front and every lever's verdict-grade Δ is measured there. **Worked example —
+the concluded 2026-06/07 DSv3 campaign's instance:** e2e decode tpot, **bs=1, TP8 EP2, MTP off**, toward
 **8 ms/token** (SGLang 7.99 on the same box proves it reachable); v2 clean baseline
 2026-07-07: 12.069 ms/tok vs v1 ~9.787; TP<8/local runs are triage only. **A new campaign
 (e.g. Qwen3-8B single-GPU bs=1024 throughput) writes its own goal line in this exact shape**
@@ -205,10 +206,13 @@ Never average the role tracks. Headline = e2e tpot + the per-task-type decomposi
 (52+14)µs × 58 MoE layers ≈ 30%; AR ≈ 6% → the attn consumer body is the dominant axis,
 AR is not — that ranking IS the plan input.
 
-**Hang/crash during a profiled run:** watchdog `-DMPK_V2_BREADCRUMB` +
-`MPK_V2_HANG_WATCHDOG_S=<s>` names the hung task; crash → compute-sanitizer memcheck is
-ground truth (breadcrumb in-flight counts are base-rate artifacts). Full triage table:
-`v2-kernel-writing/references/validation-debug.md` §5. Remember: instrumentation changes
+**Hang/crash during a profiled run:** the historical profiled-only wedges were the v2 runtime
+races, ALL FIXED 2026-07-16 (`689dadc5`/`7d271a01`/`025029a1`/`7b6ae2bb`; former wedge windows
+pass post-fix — see `v2-kernel-writing/references/validation-debug.md` §5.1), so profiled
+measurement is first-class again; a hang on a ≥`7b6ae2bb` tree is a NEW bug. Watchdog
+`-DMPK_V2_BREADCRUMB` + `MPK_V2_HANG_WATCHDOG_S=<s>` names the hung task; crash →
+compute-sanitizer memcheck is ground truth (breadcrumb in-flight counts are base-rate
+artifacts). Full triage table: validation-debug.md §5. Remember: instrumentation changes
 tpot (breadcrumb cost ~5.3ms on full-61L) — never quote an instrumented run as the baseline.
 
 ## References
@@ -217,7 +221,6 @@ tpot (breadcrumb cost ~5.3ms on full-61L) — never quote an instrumented run as
 |---|---|
 | `references/loop-agents.md` | Roster card: every loop agent + the kernel-perf engines + routing |
 | `tools/` | Archived copies of the untracked v2 perfetto toolchain (`v2_perfetto_export.py`, `perfetto_analyze.py`, `perfetto_depgraph.py`) — the clone-safe way to run them |
-| `WORKFLOW.md` (repo root) | The original v1 loop this upgrades (phase diagram + rationale) |
 | `../v2-kernel-writing/references/validation-debug.md` | TIER hierarchy §8, profiler contract §9, hang/crash triage §5 |
 | `../v2-kernel-writing/references/m1-decode-evidence.md` | The DEAD/WIN/UNTESTED anti-loop map for kernel levers |
 | `../v2-model-support/references/box-orchestration.md` | Box session playbook (TP8 runs live here) |
